@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+jobs:
+  native-tests:
+    name: Native tests (float path)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build --parallel
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  native-q15:
+    name: Native build (forced Q15 path)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure (PR32_APU_HAS_FPU=0 on the library)
+        run: >
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_CXX_FLAGS="-DPR32_APU_HAS_FPU=0"
+      - name: Build
+        run: cmake --build build --parallel
+      - name: Q15 smoke test
+        run: ctest --test-dir build -R test_q15_smoke --output-on-failure
+
+  esp32-builds:
+    name: ESP32 compile checks (FPU + no-FPU)
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        board: [esp32dev, esp32-c3-devkitm-1]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install PlatformIO
+        run: pip install platformio
+      - name: Create harness project
+        run: |
+          mkdir -p ci_harness/src ci_harness/lib
+          ln -s "$GITHUB_WORKSPACE" ci_harness/lib/PixelRoot32-APU
+          cat > ci_harness/platformio.ini <<EOF
+          [env:${{ matrix.board }}]
+          platform = espressif32
+          board = ${{ matrix.board }}
+          framework = arduino
+          build_flags = -std=gnu++17
+          build_unflags = -std=gnu++11
+          EOF
+          cat > ci_harness/src/main.cpp <<'EOF'
+          #include <Arduino.h>
+          #include <pixelroot32/apu/ApuCore.h>
+          static pixelroot32::audio::ApuCore apu;
+          static int16_t buf[128];
+          void setup() { apu.init(22050); }
+          void loop() { apu.generateSamples(buf, 128); }
+          EOF
+      - name: Build
+        run: pio run -d ci_harness

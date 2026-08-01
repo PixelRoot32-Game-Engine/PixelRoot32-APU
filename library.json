@@ -1,0 +1,22 @@
+{
+  "name": "PixelRoot32-APU",
+  "version": "1.0.0",
+  "description": "Shared NES-style APU (Audio Processing Unit): 8-voice synthesis core, music sequencer, mixer and command queue used by the PixelRoot32 Game Engine and the PixelRoot32 Tool Suite.",
+  "keywords": ["audio", "apu", "chiptune", "nes", "synthesis", "esp32", "pixelroot32"],
+  "license": "MIT",
+  "authors": [
+    {
+      "name": "PixelRoot32"
+    }
+  ],
+  "build": {
+    "srcDir": "src",
+    "includeDir": "include",
+    "flags": ["-std=gnu++17"]
+  },
+  "frameworks": [],
+  "platforms": ["espressif32", "native"],
+  "export": {
+    "exclude": ["test", "docs", ".github"]
+  }
+}

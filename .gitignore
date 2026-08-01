@@ -1,0 +1,9 @@
+build/
+.pio/
+*.o
+*.obj
+*.exe
+*.gcda
+*.gcno
+compile_commands.json
+.cache/
