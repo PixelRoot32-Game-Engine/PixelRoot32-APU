@@ -1,75 +1,75 @@
-# ABI y contratos de la librería PixelRoot32-APU
+# ABI and Library Contracts — PixelRoot32-APU
 
-Versión de referencia: **v1.0.0** (derivada del Game Engine `a3ac998`, rama `refac/extract-apu`, tras la convergencia de la Fase 0 con el Tool Suite `fc763b8`).
+Reference version: **v1.0.0** (derived from Game Engine `a3ac998`, branch `refac/extract-apu`, after Phase 0 convergence with the Tool Suite `fc763b8`).
 
-Este documento consolida los contratos que antes vivían repartidos entre `docs/MUSIC_ENGINE_ABI_REFERENCE.md`, `docs/SFX_ENGINE_ABI_REFERENCE.md` (Tool Suite) y los comentarios del engine. Ante conflicto, el código de esta librería es la autoridad.
+This document consolidates the contracts that previously lived scattered across `docs/MUSIC_ENGINE_ABI_REFERENCE.md`, `docs/SFX_ENGINE_ABI_REFERENCE.md` (Tool Suite) and the engine's comments. In case of conflict, the code in this library is the authority.
 
-## 1. Contratos de memoria (punteros no-owning)
+## 1. Memory Contracts (Non-Owning Pointers)
 
-El hot path (`generateSamples` / `generateSampleForVoice`) es *pointer-walk* puro, sin asignaciones ni copias al heap. Consecuencia: **todo puntero entregado en un comando debe sobrevivir a la reproducción**.
+The hot path (`generateSamples` / `generateSampleForVoice`) is pure *pointer-walk*, with no heap allocations or copies. Consequence: **every pointer passed in a command must outlive playback**.
 
-| Puntero | Entregado en | Debe vivir hasta |
+| Pointer | Passed in | Must live until |
 |---|---|---|
-| `const MusicTrack*` (+ subTracks) | `MUSIC_PLAY`, `MUSIC_UPDATE_TRACKS` | `MUSIC_STOP` o sustitución |
-| `const MusicNote*` (`MusicTrack::notes`) | vía track | ídem |
-| `const InstrumentPreset*` (`MusicNote::preset`, `AudioEvent::preset`) | eventos/notas | fin de la voz (incluida cola de release) |
-| `const SfxBreakpoint*` (`dutySteps`, `pitchEnvelope`) | `AudioEvent` | fin de la voz |
+| `const MusicTrack*` (+ subTracks) | `MUSIC_PLAY`, `MUSIC_UPDATE_TRACKS` | `MUSIC_STOP` or replacement |
+| `const MusicNote*` (`MusicTrack::notes`) | via track | same |
+| `const InstrumentPreset*` (`MusicNote::preset`, `AudioEvent::preset`) | events/notes | end of the voice (including release tail) |
+| `const SfxBreakpoint*` (`dutySteps`, `pitchEnvelope`) | `AudioEvent` | end of the voice |
 
-Los consumidores con presets dinámicos deben garantizar estabilidad de direcciones (el Tool Suite usa `std::deque<InstrumentPreset>`).
+Consumers with dynamic presets must guarantee address stability (the Tool Suite uses `std::deque<InstrumentPreset>`).
 
-## 2. Particionado de voces y robo
+## 2. Voice Partitioning and Stealing
 
-- `MAX_VOICES = 8`: slots **0–3** reservados al secuenciador (track ↔ slot 1:1); slots **4–7** para `PLAY_EVENT`/SFX y percusión del secuenciador.
-- El robo de voces está confinado a 4–7; **nunca** roba slots de música.
-- Ranking de robo: `remainingSamples` menor primero; las voces en loop puntúan **0** (anti-inanición) y son las primeras candidatas.
+- `MAX_VOICES = 8`: slots **0–3** reserved for the sequencer (track ↔ slot 1:1); slots **4–7** for `PLAY_EVENT`/SFX and sequencer percussion.
+- Voice stealing is confined to 4–7; **never** steals music slots.
+- Stealing ranking: lowest `remainingSamples` first; voices in loop score **0** (anti-starvation) and are the first candidates.
 
-## 3. Automatización y precedencias
+## 3. Automation and Precedences
 
-- **Duty stepped** (`dutySteps`, count 1–4): *hold* sin interpolación; mientras está activo se ignora `InstrumentPreset::dutySweep`.
-- **Pitch envelope** (`pitchEnvelope`, count 2–4): multi-segmento; con ≥ 2 puntos **sustituye** al sweep de un solo tramo.
-- `SfxBreakpoint.timeSec` no decreciente; `value` = duty [0,1] o Hz > 0 según tabla.
-- `SweepCurve::Exponential` degrada a `Linear` si los Hz inicial/final no son ambos > 0.
-- En NOISE el sweep interpola el reloj/periodo del LFSR, no el pitch melódico.
-- Reloj compartido `automationAgeSamples`: un incremento por muestra alimenta duty y pitch.
+- **Duty stepped** (`dutySteps`, count 1–4): *hold* without interpolation; while active, `InstrumentPreset::dutySweep` is ignored.
+- **Pitch envelope** (`pitchEnvelope`, count 2–4): multi-segment; with ≥ 2 points it **replaces** the single-segment sweep.
+- `SfxBreakpoint.timeSec` must be non-decreasing; `value` = duty [0,1] or Hz > 0 according to the table.
+- `SweepCurve::Exponential` degrades to `Linear` if both initial/final Hz are not > 0.
+- In NOISE, the sweep interpolates the LFSR clock/period, not melodic pitch.
+- Shared clock `automationAgeSamples`: one increment per sample feeds both duty and pitch.
 
-## 4. Loop y duración
+## 4. Loop and Duration
 
-- `loop == true` ⇒ `remainingSamples = UINT64_MAX` (centinela); solo termina por `STOP_CHANNEL` o robo.
-- `loop == false && duration <= 0` ⇒ la voz se desactiva de inmediato (garantía anti-cuelgue).
-- Secuenciador: `MusicNote.duration == 0` = disparo apilado sin avance temporal (drums en el mismo step). Duración de fallback de presets: `max(duration, 0.05) / tempoFactor`.
+- `loop == true` ⇒ `remainingSamples = UINT64_MAX` (sentinel); only terminates via `STOP_CHANNEL` or stealing.
+- `loop == false && duration <= 0` ⇒ the voice is deactivated immediately (anti-stall guarantee).
+- Sequencer: `MusicNote.duration == 0` = stacked trigger with no time advance (drums on the same step). Preset fallback duration: `max(duration, 0.05) / tempoFactor`.
 
-## 5. Cola de comandos
+## 5. Command Queue
 
-`AudioCommandQueue` es **SPSC**: un productor (hilo de UI/juego) y un consumidor (hilo de audio). No soporta múltiples productores concurrentes. Cola llena ⇒ el comando más nuevo se descarta y se incrementa `droppedCommands`.
+`AudioCommandQueue` is **SPSC**: one producer (UI/game thread) and one consumer (audio thread). Does not support multiple concurrent producers. Full queue ⇒ newest command is dropped and `droppedCommands` is incremented.
 
-## 6. Rutas de render
+## 6. Render Paths
 
-| Ruta | Guard | Targets |
+| Path | Guard | Targets |
 |---|---|---|
-| Float | `PR32_APU_HAS_FPU == 1` | Escritorio, ESP32 clásico, ESP32-S3 |
-| Entera Q15 + `audio_mixer_lut` | `PR32_APU_HAS_FPU == 0` | ESP32-C3, RISC-V sin FPU (y tests nativos forzados) |
+| Float | `PR32_APU_HAS_FPU == 1` | Desktop, classic ESP32, ESP32-S3 |
+| Integer Q15 + `audio_mixer_lut` | `PR32_APU_HAS_FPU == 0` | ESP32-C3, RISC-V without FPU (and forced native tests) |
 
-Cadena float: `Σ(voz · MIXER_SCALE=0.4) · masterVolume → soft-clip 1/(1+|x|·0.5) → HPF R=0.995 → ±32767 → bitcrush`. La ruta Q15 replica la misma cadena con la LUT pre-ajustada y el volumen maestro aplicado **antes** del compresor (paridad de orden desde v1.0.0).
+Float chain: `Σ(voice · MIXER_SCALE=0.4) · masterVolume → soft-clip 1/(1+|x|·0.5) → HPF R=0.995 → ±32767 → bitcrush`. The Q15 path replicates the same chain with the pre-adjusted LUT and master volume applied **before** the compressor (order parity since v1.0.0).
 
-**Divergencia conocida y deliberada**: la ruta Q15 aplica un pad fijo de −6 dB (`>>1`, Q15→Q14) sin equivalente float, heredado del engine; se conserva para no alterar el volumen de los targets sin FPU. Pendiente de unificación en una versión mayor.
+**Known and deliberate divergence**: the Q15 path applies a fixed −6 dB pad (`>>1`, Q15→Q14) with no float equivalent, inherited from the engine; preserved to avoid altering the volume of FPU-less targets. Pending unification in a major version.
 
-## 7. Presets canónicos de percusión
+## 7. Canonical Percussion Presets
 
-`noisePeriod` es el **periodo del LFSR en samples**: mayor periodo ⇒ reloj más lento ⇒ sonido más grave.
+`noisePeriod` is the **LFSR period in samples**: larger period ⇒ slower clock ⇒ deeper sound.
 
-| Preset | noisePeriod | Carácter |
+| Preset | noisePeriod | Character |
 |---|---|---|
-| `INSTR_KICK` | 60 | grave, con cuerpo |
-| `INSTR_SNARE` | 15 | brillante, chasquido |
-| `INSTR_HIHAT` | 12 | metálico (short mode) |
+| `INSTR_KICK` | 60 | deep, with body |
+| `INSTR_SNARE` | 15 | bright, snap |
+| `INSTR_HIHAT` | 12 | metallic (short mode) |
 
-## 8. Transporte musical
+## 8. Music Transport
 
-- `MUSIC_PLAY` ancla `musicPlayStartTick`; `MUSIC_SEEK` (`seekOffsetTicks` = ticks transcurridos desde el inicio de la pieza) reposiciona reconstruyendo los índices por pista (`resyncTrackSequencerToTick`), con soporte de loop y notas apiladas.
-- `MUSIC_UPDATE_TRACKS` sustituye las pistas en caliente sin resetear el transporte.
-- Observación thread-safe: `getMusicGlobalTick()`, `getMusicPlayStartTick()`, `isMusicPlaying()`, `isMusicPaused()`.
-- `TICKS_PER_BEAT = 4`; `MusicNote.duration` en beats (negra = 1.0).
+- `MUSIC_PLAY` anchors `musicPlayStartTick`; `MUSIC_SEEK` (`seekOffsetTicks` = ticks elapsed since the piece start) repositions by rebuilding per-track indices (`resyncTrackSequencerToTick`), with loop and stacked-note support.
+- `MUSIC_UPDATE_TRACKS` replaces tracks on the fly without resetting the transport.
+- Thread-safe observation: `getMusicGlobalTick()`, `getMusicPlayStartTick()`, `isMusicPlaying()`, `isMusicPaused()`.
+- `TICKS_PER_BEAT = 4`; `MusicNote.duration` in beats (quarter note = 1.0).
 
-## 9. Verificación
+## 9. Verification
 
-La suite (`ctest`) incluye `test_apu_mirror` con un **golden PCM** (`test/golden/fixtures/apu_mirror_canonical_s16le_44100.pcm`): la pista canónica renderizada debe coincidir byte a byte. Regenerarlo **solo** cuando la salida cambie de forma intencional y documentada en el CHANGELOG.
+The suite (`ctest`) includes `test_apu_mirror` with a **golden PCM** (`test/golden/fixtures/apu_mirror_canonical_s16le_44100.pcm`): the canonical rendered track must match byte-for-byte. Regenerate it **only** when the output changes intentionally and is documented in the CHANGELOG.

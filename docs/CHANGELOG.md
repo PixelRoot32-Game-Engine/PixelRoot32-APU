@@ -1,20 +1,20 @@
 # Changelog — PixelRoot32-APU
 
-Formato: [semver](https://semver.org/). Cambios que alteren el PCM renderizado o el ABI de structs requieren bump mayor o minor con nota explícita.
+Format: [semver](https://semver.org/). Changes that alter rendered PCM or struct ABI require a major or minor bump with an explicit note.
 
 ## v1.0.0 — 2026-08-01
 
-Primera versión como librería independiente. Origen: PixelRoot32 Game Engine commit `a3ac998` (rama `refac/extract-apu`), que a su vez incorpora la convergencia de la Fase 0 con el mirror FPU del Tool Suite (`fc763b8`).
+First version as a standalone library. Origin: PixelRoot32 Game Engine commit `a3ac998` (branch `refac/extract-apu`), which in turn incorporates Phase 0 convergence with the Tool Suite FPU mirror (`fc763b8`).
 
-### Extraído del engine
-- `ApuCore` completo (síntesis, secuenciador, mezclador, transporte) con ambas rutas de render (float y Q15+LUT).
-- Tipos: `AudioTypes.h`, `AudioMusicTypes.h`, `AudioCommandQueue.h`, `AudioOscLUT.h`, `AudioMixerLUT.h`.
+### Extracted from the engine
+- Complete `ApuCore` (synthesis, sequencer, mixer, transport) with both render paths (float and Q15+LUT).
+- Types: `AudioTypes.h`, `AudioMusicTypes.h`, `AudioCommandQueue.h`, `AudioOscLUT.h`, `AudioMixerLUT.h`.
 
-### Nuevo
-- `ApuConfig.h`: detección de FPU unificada (`PR32_APU_HAS_FPU`, sustituye al par desalineado `SOC_CPU_HAS_FPU` / `config::HasFPU`), hook de logging inyectable (`apuSetLogHandler`, sustituye a `core/Log.h`) y profiling configurable (`PR32_APU_ENABLE_PROFILING`, sustituye a `platforms::config::EnableProfiling`).
-- Empaquetado dual: `library.json` (PlatformIO) + `CMakeLists.txt` (target `PixelRoot32::APU`).
-- Suite de tests propia (150 casos): suites del engine (`test_apu_core` 68, `test_audio_command_queue` 7, `test_audio_music_types` 31), suite de paridad del Tool Suite (`test_apu_mirror` 37, con golden PCM) y `test_q15_smoke` (7) — primera cobertura de la ruta Q15, ejecutada en nativo con `-DPR32_APU_HAS_FPU=0`.
+### New
+- `ApuConfig.h`: unified FPU detection (`PR32_APU_HAS_FPU`, replaces the misaligned pair `SOC_CPU_HAS_FPU` / `config::HasFPU`), injectable logging hook (`apuSetLogHandler`, replaces `core/Log.h`) and configurable profiling (`PR32_APU_ENABLE_PROFILING`, replaces `platforms::config::EnableProfiling`).
+- Dual packaging: `library.json` (PlatformIO) + `CMakeLists.txt` (target `PixelRoot32::APU`).
+- Own test suite (150 cases): engine suites (`test_apu_core` 68, `test_audio_command_queue` 7, `test_audio_music_types` 31), Tool Suite parity suite (`test_apu_mirror` 37, with golden PCM) and `test_q15_smoke` (7) — first Q15 path coverage, run natively with `-DPR32_APU_HAS_FPU=0`.
 
-### Sin cambios de comportamiento
-- El golden PCM canónico del Tool Suite pasa byte a byte contra esta librería.
-- Divergencia documentada que se conserva: pad −6 dB de la ruta Q15 (ver `docs/ABI.md §6`).
+### No Behavioral Changes
+- The Tool Suite canonical golden PCM passes byte-for-byte against this library.
+- Documented divergence preserved: −6 dB pad in the Q15 path (see `docs/ABI.md §6`).
