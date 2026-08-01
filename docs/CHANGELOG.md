@@ -2,6 +2,15 @@
 
 Format: [semver](https://semver.org/). Changes that alter rendered PCM or struct ABI require a major or minor bump with an explicit note.
 
+## v1.0.1 — 2026-08-01
+
+Packaging/metadata release for the first PlatformIO Registry publish. No source, ABI or PCM changes.
+
+- `library.json`: author/maintainer info, `repository` and `homepage` fields.
+- Documentation translated to English.
+- CI: `publish.yml` workflow (pack validation + PlatformIO Registry publish, gated by a `release` PR label or manual dispatch with dry-run).
+- `requirements.txt` for reproducible PlatformIO installs in CI.
+
 ## v1.0.0 — 2026-08-01
 
 First version as a standalone library. Origin: PixelRoot32 Game Engine commit `a3ac998` (branch `refac/extract-apu`), which in turn incorporates Phase 0 convergence with the Tool Suite FPU mirror (`fc763b8`).
