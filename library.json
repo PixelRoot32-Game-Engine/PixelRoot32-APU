@@ -6,7 +6,10 @@
   "license": "MIT",
   "authors": [
     {
-      "name": "PixelRoot32"
+      "name": "Gabriel Perez",
+      "email": "perezgabriel89@gmail.com",
+      "url": "https://github.com/gperez88",
+      "maintainer": true
     }
   ],
   "build": {
