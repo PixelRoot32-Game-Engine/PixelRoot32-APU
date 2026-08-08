@@ -21,12 +21,42 @@ namespace pixelroot32::audio {
     // ========================================================================================================
     // Wave generator lambdas (moved to file scope for branch-free dispatch)
     // ========================================================================================================
+    // NES PULSE duty patterns (8-step, 1=high, 0=low). Mirrors the canonical
+    // table on https://www.nesdev.org/wiki/APU_Pulse. Index 0..3 maps to
+    // 12.5% / 25% / 50% / 75% high time respectively. Hito 1 M2.
+    static const uint8_t kNesPulseDuty[4][8] = {
+        {1,0,0,0,0,0,0,0},  // 12.5%  (1/8 high)
+        {0,1,1,0,0,0,0,0},  // 25%    (2/8 high)
+        {0,1,1,1,1,0,0,0},  // 50%    (4/8 high)
+        {1,0,1,1,1,1,1,0},  // 75%    (6/8 high)
+    };
+
     static auto generatePulseSampleQ15 = [](AudioChannel& ch) -> int32_t {
+        if (ch.pulseDutyIndex < 4) {
+            // phaseQ32 ranges [0, 2^32); the high 3 bits form the 8-step index
+            // (top bit cleared at 2^32 so values map to 0..7).
+            const uint32_t step = (ch.phaseQ32 >> 29) & 7u;
+            return kNesPulseDuty[ch.pulseDutyIndex][step] ? 32767 : -32767;
+        }
         return (ch.phaseQ32 < ch.dutyCycleQ32) ? 32767 : -32767;
     };
     static auto generateTriangleSampleQ15 = [](AudioChannel& ch) -> int32_t {
         const uint32_t p16 = ch.phaseQ32 >> 16;
-        return (p16 < 32768u) ? ((int32_t)(p16 * 2) - 32768) : (32768 - (int32_t)((p16 - 32768u) * 2));
+        int32_t tri_q15 = (p16 < 32768u)
+            ? ((int32_t)(p16 << 1) - 32768)
+            : (32768 - (int32_t)((p16 - 32768u) << 1));
+        if (ch.triangleQuantize4Bit) {
+            // NES TRIANGLE: 16 levels on each side. Q15 step = 2 * 32768 / 15.
+            // Rounding pattern matches the float path (banker's-style +0.5*step).
+            constexpr int32_t kStep = (2 * 32768) / 15;   // = 4369
+            constexpr int32_t kHalf = kStep / 2;          // = 2184
+            int32_t shifted = tri_q15 + 32768 + kHalf;    // [0..65536+kHalf]
+            int32_t idx = shifted / kStep;
+            if (idx < 0) idx = 0;
+            if (idx > 15) idx = 15;
+            tri_q15 = idx * kStep - 32768;
+        }
+        return tri_q15;
     };
     static auto generateSawSampleQ15 = [](AudioChannel& ch) -> int32_t {
         const int64_t v = ((int64_t)ch.phaseQ32 << 1) - (1LL << 32);
@@ -62,6 +92,133 @@ namespace pixelroot32::audio {
         if (inc < 0.0) return 0u;
         if (inc >= 4294967295.0) return 0xFFFFFFFFu;
         return (uint32_t)inc;
+    }
+
+    /**
+     * Hito 2 M6: re-sync a voice's float / Q32 phase increments to match
+     * the current NES PULSE timer period. Used by `setVoiceNesTimer`
+     * (immediate) and the half-clock dispatch (when the timer is updated).
+     * No-op when the timer is 0 (no sweep active) or the sample rate is
+     * invalid.
+     */
+    static inline void syncNesTimerToPhaseIncQ32(Voice& v, int sr) {
+        if (sr <= 0) return;
+        if (v.nesSweepUnit.timer == 0) return;
+        const float hz = nes_apu::nesTimerToHz(v.nesSweepUnit.timer);
+        v.frequency = hz;
+        v.phaseIncrement = hz / static_cast<float>(sr);
+        v.phaseIncQ32 = frequency_hz_to_phase_inc_q32(hz, sr);
+        v.basePhaseIncQ32 = v.phaseIncQ32;
+    }
+
+    /**
+     * Hito 2 M6: recompute the continuously-evaluated `muted` flag for a
+     * voice's sweep unit. Called by both `setVoiceNesSweep` (after
+     * updating E/P/N/SSS) and `setVoiceNesTimer` (after updating the
+     * timer), so the per-sample output gate sees the correct value
+     * before the next half-clock tick.
+     *
+     * The target is checked for > 0x7FF BEFORE clamping (matches the NES
+     * algorithm — the overflow is the signal for muting).
+     *
+     * Voices that have not opted into the sweep unit are forced to
+     * `muted = false`: the default `timer == 0` would otherwise satisfy
+     * the "current period < 8" rule and silence a voice that never asked
+     * for NES sweep behaviour.
+     */
+    static inline void recomputeSweepMuted(Voice& v) {
+        const NesSweepUnit& sw = v.nesSweepUnit;
+        if (!sw.unitEnabled) {
+            v.nesSweepUnit.muted = false;
+            return;
+        }
+        const uint16_t period = sw.timer;
+        const int32_t change = (sw.shift > 0) ? (period >> sw.shift) : 0;
+        int32_t target = sw.negate
+            ? (sw.isPulse2
+                ? (int32_t)period - change
+                : (int32_t)period - change - 1)
+            : (int32_t)period + change;
+        if (target < 0) target = 0;
+        v.nesSweepUnit.muted = (period < 8) || (target > 0x7FF);
+    }
+
+    /**
+     * Hito 2 M17: reset a voice's NES sub-unit fields to the canonical
+     * silent state, replicating the `@regs` array from
+     * https://www.nesdev.org/wiki/APU_basics:
+     *
+     *   PULSE     $4000=$30  $4001=$08  $4002=$00  $4003=$00
+     *   TRIANGLE  $4008=$80  $400A=$00  $400B=$00
+     *   NOISE     $400C=$30  $400E=$00  $400F=$00
+     *
+     * Decoding the shared byte $30 (DDLC VVVV) gives L=1, C=1, VVVV=0 —
+     * length counter halted, constant volume selected, volume zero. So the
+     * voice is silent and nothing counts down on its own. $08 (EPPP NSSS)
+     * gives E=0, P=0, N=1, SSS=0. $80 sets the TRIANGLE control bit, which
+     * is the same shared halt flag this codebase stores once on the length
+     * counter.
+     *
+     * On NES the $4003/$400B/$400F write also raises the envelope start
+     * flag and the linear counter reload flag; `setVoiceNesLength` models
+     * the same pair. Here the start flag is raised but the linear reload
+     * flag is explicitly cleared, because $400B is written with a zero
+     * reload value: reloading from 0 is what the safe state wants, and
+     * leaving the flag set would make the counter reload every quarter
+     * clock instead of once.
+     *
+     * This is a clean slate, NOT an enable. The per-voice opt-in flags
+     * (`nesLengthCounter.enabled`, `nesEnvelope.envelopeEnabled`,
+     * `nesSweepUnit.unitEnabled`, `nesLinearCounter.linearEnabled`) are all
+     * cleared; callers arm what they need afterwards.
+     *
+     * SINE and SAW have no NES counterpart and are left untouched.
+     */
+    static void initNesSafe(Voice& ch, WaveType type) {
+        const bool isPulse = (type == WaveType::PULSE);
+        const bool isTriangle = (type == WaveType::TRIANGLE);
+        const bool isNoise = (type == WaveType::NOISE);
+        if (!isPulse && !isTriangle && !isNoise) {
+            return;
+        }
+
+        // $4015 = $00: the channel starts silenced/unarmed.
+        NesLengthCounter& lc = ch.nesLengthCounter;
+        lc.enabled = false;
+        lc.counter = 0;
+        lc.index = 0;
+        lc.halt = true;  // L bit of $30 / control bit of $80
+
+        // $4000 / $400C = $30, and $4008 = $80 for the triangle: constant
+        // volume selected at level 0. The triangle has no envelope, but the
+        // fields are zeroed anyway so introspection is deterministic.
+        NesEnvelope& env = ch.nesEnvelope;
+        env.envelopeEnabled = false;
+        env.constVolume = true;
+        env.volume = 0;
+        env.decayLevel = 0;
+        env.dividerCounter = 0;
+        env.output = 0;
+        env.startFlag = true;  // side effect of the $4003 / $400B / $400F write
+
+        NesSweepUnit& sw = ch.nesSweepUnit;
+        sw.unitEnabled = false;
+        sw.sweepEnabled = false;
+        sw.period = 0;
+        sw.shift = 0;
+        sw.dividerCounter = 0;
+        sw.reloadFlag = false;
+        sw.timer = 0;
+        sw.muted = false;
+        // $4001 = $08 sets N. Only the pulse channels have a sweep unit, so
+        // the bit is meaningless (and misleading) on the others.
+        sw.negate = isPulse;
+
+        NesLinearCounter& linc = ch.nesLinearCounter;
+        linc.linearEnabled = false;
+        linc.counter = 0;
+        linc.reloadValue = 0;
+        linc.reloadFlag = false;
     }
 
     /** NOISE LFSR period from clock Hz (minimum 1 sample). */
@@ -525,6 +682,97 @@ namespace pixelroot32::audio {
         sampleRate = (sr > 0) ? sr : 44100;
         tickDurationSamples =
             (uint64_t)((float)sampleRate * 60.0f / (tempoBPM * (float)TICKS_PER_BEAT));
+        // Hito 4 M10: a configured corner is expressed in Hz, so it has to
+        // follow the new rate. No-op while the legacy coefficient is in use.
+        recomputeHpfCoefficients();
+    }
+
+    // Hito 4 M10: master HPF configuration.
+    void ApuCore::recomputeHpfCoefficients() {
+        if (hpfCutoffHz_ < 0.0f) {
+            // Legacy: pin the historical coefficient exactly, so the
+            // canonical golden PCM stays byte-for-byte identical.
+            hpfR_ = kHpfLegacyR;
+            hpfRQ15_ = kHpfLegacyRQ15;
+            return;
+        }
+        if (hpfCutoffHz_ == 0.0f || sampleRate <= 0) {
+            // Bypassed; the coefficient is unused but kept sane.
+            hpfR_ = kHpfLegacyR;
+            hpfRQ15_ = kHpfLegacyRQ15;
+            return;
+        }
+        // R = exp(-2*pi*fc/fs). Computed here rather than per sample: this
+        // runs on configuration changes only, so the transcendental is fine
+        // even on soft-float targets.
+        const double r = std::exp(-6.283185307179586
+                                  * (double)hpfCutoffHz_ / (double)sampleRate);
+        // Clamp strictly inside (0, 1): R >= 1 makes the recursion unstable,
+        // and R <= 0 is not a meaningful single-pole coefficient. A corner
+        // above Nyquist lands near 0 and is effectively "block everything".
+        double clamped = r;
+        if (!(clamped > 0.0)) clamped = 0.0;          // also catches NaN
+        if (clamped > 0.99999) clamped = 0.99999;
+        hpfR_ = (float)clamped;
+        hpfRQ15_ = (int32_t)(clamped * 32768.0 + 0.5);
+        if (hpfRQ15_ > 32767) hpfRQ15_ = 32767;
+        if (hpfRQ15_ < 0) hpfRQ15_ = 0;
+    }
+
+    // Hito 4 M14: bundled per-voice NES options.
+    void ApuCore::setVoiceNesOptions(int slot, const VoiceNesOptions& opts) {
+        if (slot < 0 || slot >= MAX_VOICES) {
+            return;
+        }
+        // Delegate to the dedicated setters so their validation and side
+        // effects apply unchanged — notably the index clamping and the
+        // immediate retune a live NOISE voice gets from the LUT setter.
+        setVoiceNesChannelEnabled(slot, opts.lengthCounterEnabled);
+        setVoiceNesLinearEnabled(slot, opts.linearCounterEnabled);
+        setVoiceNesEnvelopeEnabled(slot, opts.envelopeEnabled);
+        setVoiceNesSweepUnitEnabled(slot, opts.sweepUnitEnabled);
+        setVoicePulseDutyMode(slot, opts.pulseDutyIndex);
+        setVoiceNesNoiseLutMode(slot, opts.noiseLutIndex);
+    }
+
+    VoiceNesOptions ApuCore::getVoiceNesOptions(int slot) const {
+        VoiceNesOptions opts{};
+        if (slot < 0 || slot >= MAX_VOICES) {
+            return opts;
+        }
+        const Voice& v = voices[slot];
+        opts.lengthCounterEnabled = v.nesLengthCounter.enabled;
+        opts.linearCounterEnabled = v.nesLinearCounter.linearEnabled;
+        opts.envelopeEnabled = v.nesEnvelope.envelopeEnabled;
+        opts.sweepUnitEnabled = v.nesSweepUnit.unitEnabled;
+        opts.pulseDutyIndex = v.pulseDutyIndex;
+        opts.noiseLutIndex = v.nesNoiseLutIndex;
+        return opts;
+    }
+
+    // Hito 4 M11: master output shaping curve.
+    void ApuCore::setSoftClipMode(SoftClipMode mode) {
+        switch (mode) {
+            case SoftClipMode::None:
+            case SoftClipMode::Rational:
+            case SoftClipMode::Tanh:
+            case SoftClipMode::HardClip:
+                softClipMode_ = mode;
+                break;
+            default:
+                break;  // unknown value: leave the current curve alone
+        }
+    }
+
+    void ApuCore::setHpfCutoffHz(float cutoffHz) {
+        if (!(cutoffHz > 0.0f)) {   // <= 0 or NaN: bypass
+            hpfCutoffHz_ = 0.0f;
+            hpfEnabled_ = false;
+        } else {
+            hpfCutoffHz_ = cutoffHz;
+            hpfEnabled_ = true;
+        }
+        recomputeHpfCoefficients();
     }
 
     void ApuCore::reset() {
@@ -537,6 +785,12 @@ namespace pixelroot32::audio {
         masterBitcrushBits_ = 0;
         hpfPrevIn = hpfPrevOut = 0.0f;
         hpfPrevInQ15 = hpfPrevOutQ15 = 0;  // Q15 state for no-FPU path
+        // Hito 4 M10: reset() restores configuration as well as state, the
+        // same way it restores masterVolume and the bitcrush depth.
+        hpfCutoffHz_ = -1.0f;
+        hpfEnabled_ = true;
+        recomputeHpfCoefficients();
+        softClipMode_ = SoftClipMode::Rational;  // Hito 4 M11
         currentPeak = 0.0f;
         samplesSinceLog = 0;
         audioTimeSamples = 0;
@@ -557,6 +811,21 @@ namespace pixelroot32::audio {
         droppedCommands.store(0, std::memory_order_release);
         firstSequencerCallAfterPlay_ = false;
         clearMusicTrackVoiceState();
+        // Hito 2 M3: reset the NES frame counter to its default state.
+        // mode/irqInhibit are deliberately kept (consumer-owned); the rest
+        // is zeroed and the counter is disabled.
+        frameCounter_.enabled = false;
+        frameCounter_.currentStep = 0;
+        frameCounter_.apuCycles = 0.0;
+        frameCounter_.irqFlag = false;
+        frameCounter_.resetPending = false;
+#if defined(UNIT_TEST)
+        nesQuarterTickCountForTesting_ = 0;
+        nesHalfTickCountForTesting_ = 0;
+        nesLinearCounterTickCountForTesting_ = 0;
+        nesSweepTickCountForTesting_ = 0;
+        nesIrqSetCountForTesting_ = 0;
+#endif
     }
 
 #if defined(UNIT_TEST)
@@ -661,6 +930,745 @@ namespace pixelroot32::audio {
         }
         return voices[slot].dutySweep;
     }
+
+    float ApuCore::getVoicePhaseForTesting(int slot) const {
+        if (slot < 0 || slot >= MAX_VOICES) {
+            return 0.0f;
+        }
+        return voices[slot].phase;
+    }
+#endif  // UNIT_TEST — the test-only accessors end here.
+
+    // =====================================================================
+    // NES sub-units (Hito 2 M3-M7). PRODUCTION CODE — everything from here
+    // to the end of tickNesFrameCounter is public API and MUST stay outside
+    // the UNIT_TEST guard. It once sat inside it, which compiled fine in
+    // every suite (they all recompile this file with UNIT_TEST=1) while the
+    // shipped library lost the symbols and no consumer could link. See
+    // test_library_link, which exists to catch exactly that.
+    // =====================================================================
+
+    // -- NES frame counter (Hito 2 M3) -----------------------------------
+    void ApuCore::setNesFrameCounterMode(int mode) {
+        if (mode != 0 && mode != 1) {
+            // Out-of-range values are silently ignored (no state change).
+            return;
+        }
+        // Idempotent: same mode does not schedule another reset.
+        if (frameCounter_.mode == mode && frameCounter_.enabled) {
+            return;
+        }
+        frameCounter_.mode = mode;
+        frameCounter_.enabled = true;
+        // $4017 side effect: timer reset on the next step entry.
+        frameCounter_.resetPending = true;
+        // Mode change also clears the IRQ flag (mirrors hardware).
+        frameCounter_.irqFlag = false;
+    }
+
+    void ApuCore::setNesFrameCounterInhibit(bool inhibit) {
+        frameCounter_.irqInhibit = inhibit;
+        if (inhibit) {
+            // $4017 I=1 clears the IRQ flag immediately.
+            frameCounter_.irqFlag = false;
+        }
+    }
+
+    bool ApuCore::getNesFrameCounterIrq() const {
+        return frameCounter_.irqFlag;
+    }
+
+    void ApuCore::tickAllNesEnvelopes() {
+        // Hito 2 M7: NES envelope unit dispatch (quarter-frame consumer).
+        //
+        // Iterates the voice pool and ticks the envelope of every voice
+        // that has `envelopeEnabled == true` and is a PULSE or NOISE
+        // voice (TRIANGLE / SINE / SAW are skipped; the NES hardware
+        // has no envelope for them). The algorithm mirrors
+        // https://www.nesdev.org/wiki/APU_Envelope exactly:
+        //
+        //   if (startFlag) {
+        //       startFlag = false;
+        //       decayLevel = 15;
+        //       dividerCounter = volume;   // immediate reload
+        //   } else if (dividerCounter == 0) {
+        //       dividerCounter = volume;
+        //       if (decayLevel > 0) {
+        //           --decayLevel;
+        //       } else if (loop) {         // loop = lengthCounter->halt
+        //           decayLevel = 15;
+        //       } else {
+        //           silence the channel    // v.enabled = false, ADSR off
+        //       }
+        //   } else {
+        //       --dividerCounter;
+        //   }
+        //   output = constVolume ? volume : decayLevel;
+        //
+        // The `loop` flag is read from `nesLengthCounter.halt` (the
+        // shared bit; matches M5's pattern for the linear counter).
+        for (int slot = 0; slot < MAX_VOICES; ++slot) {
+            Voice& v = voices[slot];
+            if (v.type != WaveType::PULSE && v.type != WaveType::NOISE) continue;
+            NesEnvelope& env = v.nesEnvelope;
+            if (!env.envelopeEnabled) continue;
+            if (env.lengthCounter == nullptr) continue;  // safety: pointer must be bound in reset()
+            const bool loop = env.lengthCounter->halt;    // shared with length counter
+
+            if (env.startFlag) {
+                env.startFlag = false;
+                env.decayLevel = 15;
+                env.dividerCounter = env.volume;
+            } else {
+                if (env.dividerCounter == 0) {
+                    env.dividerCounter = env.volume;
+                    if (env.decayLevel > 0) {
+                        --env.decayLevel;
+                    } else {
+                        if (loop) {
+                            env.decayLevel = 15;
+                        } else {
+                            // Silence the channel. Matches the M4 / M5
+                            // pattern: disable the voice, zero the
+                            // ADSR envelope so the per-sample gate sees
+                            // 0 immediately. The triangle voice is
+                            // untouched (it has no envelope).
+                            v.enabled = false;
+                            v.envelope.stage = EnvelopeState::Stage::OFF;
+                            v.envelope.currentLevel = 0.0f;
+                            v.envelope.currentLevelQ15 = 0;
+                        }
+                    }
+                } else {
+                    --env.dividerCounter;
+                }
+            }
+
+            env.output = env.constVolume ? env.volume : env.decayLevel;
+        }
+#if defined(UNIT_TEST)
+#if defined(UNIT_TEST)
+        ++nesQuarterTickCountForTesting_;
+#endif
+#endif
+    }
+
+    void ApuCore::tickAllNesLinearCounters() {
+        // Hito 2 M5: NES linear counter dispatch.
+        //
+        // Iterates the voice pool. Voices with `linearEnabled == false`
+        // (the default for everything except TRIANGLE-in-NES-mode) are
+        // skipped silently. For the opted-in voices:
+        //   - if `reloadFlag` is set, the counter is loaded from `reloadValue`;
+        //   - else if the counter is > 0, it is decremented;
+        //   - if the shared `halt`/control flag is clear, `reloadFlag` is cleared.
+        //
+        // The order matters: reload/decrement FIRST, then clear reloadFlag.
+        // This matches the canonical nesdev wiki algorithm exactly.
+        //
+        // This method is called by the existing `tickNesFrameCounter`
+        // from M3, on the quarter-frame step. It is NOT called per sample.
+        for (int slot = 0; slot < MAX_VOICES; ++slot) {
+            Voice& v = voices[slot];
+            NesLinearCounter& lc = v.nesLinearCounter;
+            if (!lc.linearEnabled) continue;
+            if (lc.lengthCounter == nullptr) continue;  // safety: pointer must be bound in reset()
+            const bool control = lc.lengthCounter->halt;  // shared with length counter
+
+            if (lc.reloadFlag) {
+                lc.counter = lc.reloadValue;
+            } else if (lc.counter > 0) {
+                --lc.counter;
+            }
+            if (!control) {
+                lc.reloadFlag = false;
+            }
+        }
+#if defined(UNIT_TEST)
+        ++nesLinearCounterTickCountForTesting_;
+#endif
+    }
+
+    void ApuCore::tickAllNesLengthCounters() {
+        // Hito 2 M4: NES length counter dispatch.
+        //
+        // Iterates the voice pool. SINE/SAW voices keep
+        // `nesLengthCounter.enabled == false` and are silently skipped.
+        // NES voices (PULSE/TRIANGLE/NOISE) decrement their counter on
+        // each half-clock (skipping when `halt` is set or the counter is
+        // already 0), and silence the voice when the counter hits 0.
+        //
+        // Hito 2 M5 surgical fix: TRIANGLE voices are NOT disabled when
+        // the length counter reaches 0. The M5 per-sample gate
+        // (lengthOk && linearOk) handles the silence path, and the voice
+        // stays enabled so it can be re-armed by a fresh $400B write.
+        // PULSE and NOISE keep the legacy M4 behaviour.
+        //
+        // This method is called by the existing `tickNesFrameCounter`
+        // from M3, on the half-frame step. It is NOT called per sample.
+        for (int slot = 0; slot < MAX_VOICES; ++slot) {
+            Voice& v = voices[slot];
+            NesLengthCounter& lc = v.nesLengthCounter;
+            if (!lc.enabled) continue;
+            if (lc.halt) continue;
+            if (lc.counter == 0) continue;
+            --lc.counter;
+            if (lc.counter == 0) {
+                if (v.type != WaveType::TRIANGLE) {
+                    // Silence the voice. Do NOT touch remainingSamples
+                    // (M4 is orthogonal to the pre-Hito-2 duration mechanism;
+                    // the caller's plan stays intact, but the voice is
+                    // disabled so it will not produce audio).
+                    v.enabled = false;
+                    v.envelope.stage = EnvelopeState::Stage::OFF;
+                    v.envelope.currentLevel = 0.0f;
+                    v.envelope.currentLevelQ15 = 0;
+                }
+                // TRIANGLE: stay enabled; M5 per-sample gate handles silence.
+            }
+        }
+#if defined(UNIT_TEST)
+        ++nesHalfTickCountForTesting_;
+#endif
+    }
+
+    // Hito 2 M4: NES length counter public API.
+    void ApuCore::setVoiceNesLength(int slot, uint8_t lengthIndex, bool halt) {
+        if (slot < 0 || slot >= MAX_VOICES) {
+            return;
+        }
+        NesLengthCounter& lc = voices[slot].nesLengthCounter;
+        // Writes to a disabled NES channel are silently lost (mirrors NES
+        // hardware: the channel is muted, so length loads are ignored).
+        if (!lc.enabled) {
+            return;
+        }
+        if (lengthIndex > 31) {
+            lengthIndex = 31;
+        }
+        lc.index = lengthIndex;
+        lc.counter = nes_apu::kNesLengthLut[lengthIndex];
+        lc.halt = halt;
+        // Hito 2 M7 surgical fix: NES $4003 / $4007 / $400F writes set the
+        // envelope start flag as a side effect. The flag is consumed by
+        // the next quarter-clock tick (the M7 `tickAllNesEnvelopes()`
+        // dispatcher reloads `decayLevel = 15` and the divider from VVVV).
+        // It is set even if the envelope is not opted in (matches NES
+        // hardware: the bit is set independently of the envelope enable).
+        voices[slot].nesEnvelope.startFlag = true;
+        // Hito 2 M13: the other documented side effect of the same write.
+        // On $400B (TRIANGLE) the length load raises the linear counter's
+        // reload flag, consumed by the next quarter-clock in
+        // `tickAllNesLinearCounters()`. Set unconditionally for the same
+        // reason as the envelope start flag above: the dispatchers already
+        // gate on type and on their own opt-in flag, so a voice that is
+        // not a NES-mode TRIANGLE never observes it.
+        voices[slot].nesLinearCounter.reloadFlag = true;
+    }
+
+    void ApuCore::setVoiceNesChannelEnabled(int slot, bool enabled) {
+        if (slot < 0 || slot >= MAX_VOICES) {
+            return;
+        }
+        NesLengthCounter& lc = voices[slot].nesLengthCounter;
+        Voice& v = voices[slot];
+        lc.enabled = enabled;
+        if (enabled) {
+            // NES: "There is no immediate effect when enabled is set."
+            return;
+        }
+        // Cleared: force the counter to 0 and silence the voice.
+        lc.counter = 0;
+        v.enabled = false;
+        v.envelope.stage = EnvelopeState::Stage::OFF;
+        v.envelope.currentLevel = 0.0f;
+        v.envelope.currentLevelQ15 = 0;
+        // Note: remainingSamples is intentionally NOT touched here.
+        // M4 is orthogonal to the pre-Hito-2 duration mechanism (§2.4 of
+        // the M4 design doc).
+    }
+
+    // Hito 2 M5: NES linear counter public API.
+    void ApuCore::setVoiceNesLinearCounter(int slot, uint8_t reloadValue, bool reloadFlag) {
+        if (slot < 0 || slot >= MAX_VOICES) {
+            return;
+        }
+        NesLinearCounter& lc = voices[slot].nesLinearCounter;
+        // Mirror the M4 pattern: always store, effect only at the next
+        // quarter-clock tick. This means writes to a voice that has not
+        // yet enabled NES mode are kept and acted on later when the voice
+        // is opted in.
+        lc.reloadValue = (reloadValue & 0x7F);
+        lc.reloadFlag = reloadFlag;
+    }
+
+    void ApuCore::setVoiceNesLinearEnabled(int slot, bool enabled) {
+        if (slot < 0 || slot >= MAX_VOICES) {
+            return;
+        }
+        voices[slot].nesLinearCounter.linearEnabled = enabled;
+    }
+
+    // Hito 2 M7: NES envelope unit public API.
+    void ApuCore::setVoiceNesEnvelope(int slot, bool loop, bool constVolume, uint8_t volume) {
+        if (slot < 0 || slot >= MAX_VOICES) {
+            return;
+        }
+        NesEnvelope& env = voices[slot].nesEnvelope;
+        env.volume = (volume & 0x0F);
+        env.constVolume = constVolume;
+        // The `loop` arg is stored for introspection, but the live read
+        // at quarter-clock time comes from `nesLengthCounter.halt`
+        // (shared bit, bound via pointer in AudioChannel::reset()).
+        // This matches the M5 linear counter pattern.
+        // We do NOT change `nesLengthCounter.halt` here — that is owned
+        // by `setVoiceNesLength`. A test that wants the envelope loop
+        // set must call `setVoiceNesLength(slot, idx, true)` first.
+        // The "loop" arg on this method is therefore a stored hint
+        // mirrored into the envelope struct for symmetry with the
+        // wiki register layout, but the dispatch loop reads `halt`.
+        (void)loop;
+        // Mirrors the NES hardware: the envelope write does NOT set the
+        // start flag. The start flag is set exclusively by the length
+        // load (`setVoiceNesLength`).
+    }
+
+    void ApuCore::setVoiceNesEnvelopeEnabled(int slot, bool enabled) {
+        if (slot < 0 || slot >= MAX_VOICES) {
+            return;
+        }
+        voices[slot].nesEnvelope.envelopeEnabled = enabled;
+    }
+
+    void ApuCore::tickAllNesSweepUnits() {
+        // Hito 2 M6: NES sweep unit dispatch (half-clock consumer).
+        //
+        // Iterates the voice pool and ticks the sweep unit of every PULSE
+        // voice. Non-PULSE voices are skipped (their nesSweepUnit is
+        // configured by callers but never updated by the dispatcher).
+        //
+        // Per https://www.nesdev.org/wiki/APU_Sweep, the half-clock logic is:
+        //   1. Compute the target period using the CURRENT timer, shift, negate,
+        //      and isPulse2. The target is checked for > 0x7FF BEFORE clamping
+        //      — overflow is the signal for muting, so it must be observed.
+        //   2. Update the `muted` flag from (current period < 8) OR (target > 0x7FF).
+        //      This is evaluated CONTINUOUSLY, even when the sweep is "disabled"
+        //      (E=0 or SSS=0). That's the "NES bug": the muting logic always runs,
+        //      the timer-update path doesn't.
+        //   3. If `dividerCounter == 0` and the sweep is enabled, shift > 0, and
+        //      the channel isn't muted, update `timer` from the (clamped) target.
+        //   4. Reload the divider: if `dividerCounter == 0` OR `reloadFlag` is
+        //      set, `dividerCounter = period + 1`; else decrement.
+        for (int slot = 0; slot < MAX_VOICES; ++slot) {
+            Voice& v = voices[slot];
+            if (v.type != WaveType::PULSE) continue;
+            NesSweepUnit& sw = v.nesSweepUnit;
+            // Opt-in gate. Without it the muting rule below would fire on
+            // the default `timer == 0` and silence every PULSE voice that
+            // is still driven by the legacy float frequency path.
+            if (!sw.unitEnabled) continue;
+
+            // Step 1: compute the raw target period.
+            const uint16_t period = sw.timer;
+            const int32_t change = (sw.shift > 0) ? (period >> sw.shift) : 0;
+            int32_t target;
+            if (sw.negate) {
+                target = sw.isPulse2
+                    ? ((int32_t)period - change)
+                    : ((int32_t)period - change - 1);
+            } else {
+                target = (int32_t)period + change;
+            }
+            if (target < 0) target = 0;
+            // NOTE: do NOT clamp target to 0x7FF here — the muting check
+            // needs the raw value. Clamp only happens when the timer is
+            // actually updated in step 3.
+
+            // Step 2: update the muting flag (always).
+            sw.muted = (period < 8) || (target > 0x7FF);
+
+            // Step 3: timer update (only on the divider==0 boundary, with
+            // the three "sweep is active" guards: E=1, SSS>0, !muted).
+            if (sw.dividerCounter == 0) {
+                if (sw.sweepEnabled && sw.shift > 0 && !sw.muted) {
+                    int32_t clamped = (target > 0x7FF) ? 0x7FF : target;
+                    sw.timer = (uint16_t)clamped;
+                    // Re-sync the per-voice phase increments so the hot
+                    // path sees the new frequency immediately (no need
+                    // to wait for the next setVoiceNesTimer call).
+                    syncNesTimerToPhaseIncQ32(v, sampleRate);
+                }
+            }
+
+            // Step 4: reload or decrement the divider.
+            if (sw.dividerCounter == 0 || sw.reloadFlag) {
+                sw.dividerCounter = sw.period + 1;
+                sw.reloadFlag = false;
+            } else {
+                --sw.dividerCounter;
+            }
+        }
+#if defined(UNIT_TEST)
+        ++nesSweepTickCountForTesting_;
+#endif
+    }
+
+    // Hito 2 M6: NES sweep unit public API.
+    void ApuCore::setVoiceNesSweep(int slot, bool enabled, uint8_t period, bool negate,
+                                   uint8_t shift, bool isPulse2) {
+        if (slot < 0 || slot >= MAX_VOICES) {
+            return;
+        }
+        NesSweepUnit& sw = voices[slot].nesSweepUnit;
+        sw.sweepEnabled = enabled;
+        sw.period = (period & 0x07);
+        sw.negate = negate;
+        sw.shift = (shift & 0x07);
+        sw.isPulse2 = isPulse2;
+        // $4001 / $4005 write side effect: schedule a divider reload.
+        sw.reloadFlag = true;
+        // The muting flag is continuously evaluated (the "NES bug"),
+        // so any change to E/P/N/SSS must re-trigger the check, even
+        // before the next half-clock. This matches the spec test
+        // `test_sweep_muting_target_overflow`: the caller sets the
+        // timer, then the sweep fields, and expects `muted` to be
+        // observable immediately.
+        recomputeSweepMuted(voices[slot]);
+    }
+
+    void ApuCore::setVoiceNesSweepUnitEnabled(int slot, bool enabled) {
+        if (slot < 0 || slot >= MAX_VOICES) {
+            return;
+        }
+        voices[slot].nesSweepUnit.unitEnabled = enabled;
+        // Re-evaluate immediately in both directions: arming must apply
+        // the muting rule to the register state already written, and
+        // disarming must clear `muted` so the per-sample gate stops
+        // silencing a voice that left NES sweep control.
+        recomputeSweepMuted(voices[slot]);
+    }
+
+    void ApuCore::setVoiceNesTimer(int slot, uint16_t timer11) {
+        if (slot < 0 || slot >= MAX_VOICES) {
+            return;
+        }
+        timer11 &= 0x07FF;
+        voices[slot].nesSweepUnit.timer = timer11;
+        // Re-sync the per-voice phase increments so the oscillator
+        // frequency matches the new NES timer period immediately
+        // (the hot path does NOT need to wait for the next half-clock).
+        syncNesTimerToPhaseIncQ32(voices[slot], sampleRate);
+        // Recompute the muting flag right now so the per-sample
+        // gate sees the correct value before the next half-clock.
+        recomputeSweepMuted(voices[slot]);
+    }
+
+    // Hito 2 M3: per-sample tick of the NES frame counter.
+    // `apuCyclesPerSample` is computed once per generateSamples() call and
+    // passed in to keep the inner loop free of division by sampleRate.
+    void ApuCore::tickNesFrameCounter(double apuCyclesPerSample) {
+        // Default OFF: the canonical track never enables the frame counter,
+        // so its PCM must stay byte-for-byte identical (no accumulator
+        // update, no clock dispatches).
+        if (!frameCounter_.enabled) {
+            return;
+        }
+        // Apply $4017 write reset side-effect: zero the cycle counter on
+        // the first sample after the mode was set.
+        if (frameCounter_.resetPending) {
+            frameCounter_.apuCycles = 0.0;
+            frameCounter_.currentStep = 0;
+            frameCounter_.resetPending = false;
+            // Per nesdev wiki, $4017 M=1 also fires quarter+half on the reset
+            // sample. Mode 0 does not (it just resets the timer).
+            if (frameCounter_.mode == 1) {
+                tickAllNesEnvelopes();
+                tickAllNesLinearCounters();
+                tickAllNesLengthCounters();
+                tickAllNesSweepUnits();
+            }
+        }
+
+        frameCounter_.apuCycles += apuCyclesPerSample;
+
+        const double* steps = (frameCounter_.mode == 0)
+            ? nes_apu::kMode0ApuCyclesPerStep
+            : nes_apu::kMode1ApuCyclesPerStep;
+        const int maxStep = (frameCounter_.mode == 0) ? 4 : 5;
+
+        // Fire every step the accumulator has crossed (could be > 1 at low
+        // sample rates). The step fired is the new `currentStep` (1-indexed).
+        while (frameCounter_.apuCycles >= steps[frameCounter_.currentStep + 1]) {
+            ++frameCounter_.currentStep;
+
+            const bool isQuarter = (frameCounter_.mode == 0)
+                ? (frameCounter_.currentStep == 1
+                    || frameCounter_.currentStep == 2
+                    || frameCounter_.currentStep == 3)
+                : (frameCounter_.currentStep == 1
+                    || frameCounter_.currentStep == 2
+                    || frameCounter_.currentStep == 3
+                    || frameCounter_.currentStep == 5);
+            const bool isHalf = (frameCounter_.mode == 0)
+                ? (frameCounter_.currentStep == 2
+                    || frameCounter_.currentStep == 4)
+                : (frameCounter_.currentStep == 2
+                    || frameCounter_.currentStep == 4);
+
+            if (isQuarter) {
+                tickAllNesEnvelopes();
+                tickAllNesLinearCounters();
+            }
+            if (isHalf) {
+                tickAllNesLengthCounters();
+                tickAllNesSweepUnits();
+            }
+
+            if (frameCounter_.currentStep >= maxStep) {
+                // Wrap. Subtract the cycle count of the last step so
+                // `apuCycles` represents time since wrap. The wrap is
+                // itself a "step 0 entry" of the next cycle:
+                //   - Mode 0: fires one extra quarter + IRQ set. Half was
+                //     already fired at step 4 entry (designed doc, table
+                //     "→ 0" row). This matches the canonical 240/120/60 Hz
+                //     rate: 4 quarters, 2 halves, 1 IRQ per cycle.
+                //   - Mode 1: no clocks on wrap (designed doc, table "→ 0"
+                //     row is empty). Matches 192/~96 Hz rate.
+                if (frameCounter_.mode == 0) {
+                    tickAllNesEnvelopes();
+                    tickAllNesLinearCounters();
+                    if (!frameCounter_.irqInhibit) {
+                        // The visible flag is sticky (no $4015 read
+                        // modeled), but we still flip false→true to
+                        // reflect the actual edge. The test-only counter
+                        // also tracks the *generation* rate (60 Hz) so
+                        // the test can observe the configured cadence
+                        // without the flag oscillating.
+                        if (!frameCounter_.irqFlag) {
+                            frameCounter_.irqFlag = true;
+                        }
+#if defined(UNIT_TEST)
+                        ++nesIrqSetCountForTesting_;
+#endif
+                    }
+                }
+                frameCounter_.apuCycles -= steps[maxStep];
+                frameCounter_.currentStep = 0;
+            }
+        }
+    }
+
+#if defined(UNIT_TEST)
+    // Test-only accessors resume here.
+    void ApuCore::resetNesFrameCounterForTesting() {
+        frameCounter_.apuCycles = 0.0;
+        frameCounter_.currentStep = 0;
+        frameCounter_.irqFlag = false;
+        frameCounter_.resetPending = false;
+        // mode and irqInhibit are deliberately left untouched.
+    }
+
+    int ApuCore::getNesFrameCounterQuarterTickCountForTesting() const {
+        return nesQuarterTickCountForTesting_;
+    }
+
+    int ApuCore::getNesFrameCounterHalfTickCountForTesting() const {
+        return nesHalfTickCountForTesting_;
+    }
+
+    int ApuCore::getNesFrameCounterLinearTickCountForTesting() const {
+        return nesLinearCounterTickCountForTesting_;
+    }
+
+    int ApuCore::getNesFrameCounterSweepTickCountForTesting() const {
+        return nesSweepTickCountForTesting_;
+    }
+
+    int ApuCore::getNesFrameCounterIrqSetCountForTesting() const {
+        return nesIrqSetCountForTesting_;
+    }
+
+    double ApuCore::getNesFrameCounterApuCyclesForTesting() const {
+        return frameCounter_.apuCycles;
+    }
+
+    int ApuCore::getNesFrameCounterCurrentStepForTesting() const {
+        return frameCounter_.currentStep;
+    }
+
+    // Hito 2 M4: NES length counter test-only accessors.
+    uint16_t ApuCore::getVoiceNesLengthCounterForTesting(int slot) const {
+        if (slot < 0 || slot >= MAX_VOICES) {
+            return 0u;
+        }
+        return voices[slot].nesLengthCounter.counter;
+    }
+
+    uint8_t ApuCore::getVoiceNesLengthIndexForTesting(int slot) const {
+        if (slot < 0 || slot >= MAX_VOICES) {
+            return 0u;
+        }
+        return voices[slot].nesLengthCounter.index;
+    }
+
+    bool ApuCore::getVoiceNesLengthHaltForTesting(int slot) const {
+        if (slot < 0 || slot >= MAX_VOICES) {
+            return false;
+        }
+        return voices[slot].nesLengthCounter.halt;
+    }
+
+    bool ApuCore::getVoiceNesChannelEnabledForTesting(int slot) const {
+        if (slot < 0 || slot >= MAX_VOICES) {
+            return false;
+        }
+        return voices[slot].nesLengthCounter.enabled;
+    }
+
+    // Hito 2 M5: NES linear counter test-only accessors.
+    uint8_t ApuCore::getVoiceNesLinearCounterForTesting(int slot) const {
+        if (slot < 0 || slot >= MAX_VOICES) {
+            return 0u;
+        }
+        return voices[slot].nesLinearCounter.counter;
+    }
+
+    uint8_t ApuCore::getVoiceNesLinearReloadValueForTesting(int slot) const {
+        if (slot < 0 || slot >= MAX_VOICES) {
+            return 0u;
+        }
+        return voices[slot].nesLinearCounter.reloadValue;
+    }
+
+    bool ApuCore::getVoiceNesLinearReloadFlagForTesting(int slot) const {
+        if (slot < 0 || slot >= MAX_VOICES) {
+            return false;
+        }
+        return voices[slot].nesLinearCounter.reloadFlag;
+    }
+
+    bool ApuCore::getVoiceNesLinearEnabledForTesting(int slot) const {
+        if (slot < 0 || slot >= MAX_VOICES) {
+            return false;
+        }
+        return voices[slot].nesLinearCounter.linearEnabled;
+    }
+
+    // Hito 2 M6: NES sweep unit test-only accessors.
+    uint16_t ApuCore::getVoiceNesSweepTimerForTesting(int slot) const {
+        if (slot < 0 || slot >= MAX_VOICES) {
+            return 0u;
+        }
+        return voices[slot].nesSweepUnit.timer;
+    }
+
+    uint8_t ApuCore::getVoiceNesSweepDividerForTesting(int slot) const {
+        if (slot < 0 || slot >= MAX_VOICES) {
+            return 0u;
+        }
+        return voices[slot].nesSweepUnit.dividerCounter;
+    }
+
+    bool ApuCore::getVoiceNesSweepEnabledForTesting(int slot) const {
+        if (slot < 0 || slot >= MAX_VOICES) {
+            return false;
+        }
+        return voices[slot].nesSweepUnit.sweepEnabled;
+    }
+
+    bool ApuCore::getVoiceNesSweepNegateForTesting(int slot) const {
+        if (slot < 0 || slot >= MAX_VOICES) {
+            return false;
+        }
+        return voices[slot].nesSweepUnit.negate;
+    }
+
+    uint8_t ApuCore::getVoiceNesSweepShiftForTesting(int slot) const {
+        if (slot < 0 || slot >= MAX_VOICES) {
+            return 0u;
+        }
+        return voices[slot].nesSweepUnit.shift;
+    }
+
+    bool ApuCore::getVoiceNesSweepUnitEnabledForTesting(int slot) const {
+        if (slot < 0 || slot >= MAX_VOICES) {
+            return false;
+        }
+        return voices[slot].nesSweepUnit.unitEnabled;
+    }
+
+    bool ApuCore::getVoiceNesSweepMutedForTesting(int slot) const {
+        if (slot < 0 || slot >= MAX_VOICES) {
+            return false;
+        }
+        return voices[slot].nesSweepUnit.muted;
+    }
+
+    // Hito 2 M7: NES envelope unit test-only accessors.
+    uint8_t ApuCore::getVoiceNesEnvelopeOutputForTesting(int slot) const {
+        if (slot < 0 || slot >= MAX_VOICES) {
+            return 0u;
+        }
+        return voices[slot].nesEnvelope.output;
+    }
+
+    uint8_t ApuCore::getVoiceNesEnvelopeDecayLevelForTesting(int slot) const {
+        if (slot < 0 || slot >= MAX_VOICES) {
+            return 0u;
+        }
+        return voices[slot].nesEnvelope.decayLevel;
+    }
+
+    uint8_t ApuCore::getVoiceNesEnvelopeDividerForTesting(int slot) const {
+        if (slot < 0 || slot >= MAX_VOICES) {
+            return 0u;
+        }
+        return voices[slot].nesEnvelope.dividerCounter;
+    }
+
+    bool ApuCore::getVoiceNesEnvelopeStartFlagForTesting(int slot) const {
+        if (slot < 0 || slot >= MAX_VOICES) {
+            return false;
+        }
+        return voices[slot].nesEnvelope.startFlag;
+    }
+
+    bool ApuCore::getVoiceNesEnvelopeEnabledForTesting(int slot) const {
+        if (slot < 0 || slot >= MAX_VOICES) {
+            return false;
+        }
+        return voices[slot].nesEnvelope.envelopeEnabled;
+    }
+
+    bool ApuCore::getVoiceNesEnvelopeConstVolumeForTesting(int slot) const {
+        if (slot < 0 || slot >= MAX_VOICES) {
+            return false;
+        }
+        return voices[slot].nesEnvelope.constVolume;
+    }
+
+    uint8_t ApuCore::getVoiceNesEnvelopeVolumeForTesting(int slot) const {
+        if (slot < 0 || slot >= MAX_VOICES) {
+            return 0u;
+        }
+        return voices[slot].nesEnvelope.volume;
+    }
+
+    uint8_t ApuCore::getVoiceNesNoiseLutIndexForTesting(int slot) const {
+        if (slot < 0 || slot >= MAX_VOICES) {
+            return 255u;
+        }
+        return voices[slot].nesNoiseLutIndex;
+    }
+
+    // Hito 4 M10: master HPF test-only accessors.
+    float ApuCore::getHpfRForTesting() const { return hpfR_; }
+    int32_t ApuCore::getHpfRQ15ForTesting() const { return hpfRQ15_; }
+    bool ApuCore::getHpfEnabledForTesting() const { return hpfEnabled_; }
+    float ApuCore::getHpfCutoffHzForTesting() const { return hpfCutoffHz_; }
+
+    // Hito 4 M11.
+    SoftClipMode ApuCore::getSoftClipModeForTesting() const { return softClipMode_; }
 #endif
 
     void ApuCore::clearMusicTrackVoiceState() {
@@ -732,6 +1740,26 @@ namespace pixelroot32::audio {
                 case AudioCommandType::STOP_CHANNEL:
                     if (cmd.channelIndex < MAX_VOICES) {
                         voices[cmd.channelIndex].reset();
+                    }
+                    break;
+
+                case AudioCommandType::SET_NES_OPTIONS:
+                    // Bounds-checked inside the setter, but keep the guard
+                    // here too so the intent is visible next to the others.
+                    if (cmd.channelIndex < MAX_VOICES) {
+                        setVoiceNesOptions(cmd.channelIndex, cmd.nesOptions);
+                    }
+                    break;
+
+                case AudioCommandType::TRIGGER_NES_LENGTH:
+                    if (cmd.channelIndex < MAX_VOICES) {
+                        // Arm the channel first: `setVoiceNesLength` drops
+                        // writes to a disabled NES channel, and the enable
+                        // setter is not reachable from the game thread, so
+                        // without this the queued path could never fire.
+                        setVoiceNesChannelEnabled(cmd.channelIndex, true);
+                        setVoiceNesLength(cmd.channelIndex, cmd.nesLengthIndex,
+                                          cmd.nesLengthHalt);
                     }
                     break;
 
@@ -1321,11 +2349,22 @@ namespace pixelroot32::audio {
                 if (noiseHz < 1.0f) noiseHz = 1000.0f;
                 period = noise_clock_hz_to_period(noiseHz, sampleRate);
             }
+            // Hito 3 M8: an armed NOISE LUT index wins over both the direct
+            // `noisePeriod` and the frequency-derived period. Like M2's duty
+            // mode this is a per-slot setting, so it survives new notes.
+            if (ch->nesNoiseLutIndex < 16u) {
+                period = nes_apu::nesNoisePeriodToSamples(ch->nesNoiseLutIndex,
+                                                          sampleRate);
+            }
             ch->frequency = noiseHz;
             ch->noisePeriodSamples = period;
             ch->noiseCountdown = 1u;
-            ch->lfsrState = 0x4000;
-            ch->noiseShortMode = (event.preset) ? event.preset->noiseShortMode : false;
+            // Hito 1 M9: NES-equivalent seed (all 1s in the 15-bit LFSR) —
+            // matches the state after a write to register $400F.
+            ch->lfsrState = 0x7FFF;
+            const bool lfsrShort = (event.preset) ? event.preset->noiseLfsrShort : false;
+            ch->noiseLfsrShort = lfsrShort;
+            ch->noiseShortMode = lfsrShort; // keep deprecated alias in sync
             ch->phase = 0.0f;
             ch->phaseIncrement = 0.0f;
             ch->dutySweep = 0.0f;
@@ -1353,6 +2392,24 @@ namespace pixelroot32::audio {
             ch->dutyStepIndex = 0;
             ch->dutyNextBoundarySamples = 0xFFFFFFFFu;
             ch->automationAgeSamples = 0;
+        }
+
+        // Hito 1 M16: NES TRIANGLE is one octave below PULSE for the same
+        // period. When the application opts in, double the effective
+        // frequency and rebuild both the float and Q32 phase increments so
+        // the inner-loop arithmetic sees the doubled rate immediately.
+        if (event.type == WaveType::TRIANGLE && ch->triangleOctaveUp) {
+            ch->frequency *= 2.0f;
+            ch->phaseIncrement = ch->frequency / (float)sampleRate;
+            if (sampleRate > 0) {
+                const double inc = (double)ch->frequency * 4294967296.0 / (double)sampleRate;
+                ch->phaseIncQ32 = (inc < 0.0) ? 0u
+                                : (inc >= 4294967295.0) ? 0xFFFFFFFFu
+                                : (uint32_t)inc;
+            } else {
+                ch->phaseIncQ32 = 0u;
+            }
+            ch->basePhaseIncQ32 = ch->phaseIncQ32;
         }
 
         init_pitch_envelope(*ch, event, sampleRate);
@@ -1418,6 +2475,13 @@ namespace pixelroot32::audio {
                     ch->sweepCurve = SweepCurve::Linear;
                 }
             }
+        }
+
+        // Hito 2 M17: last, so no earlier branch can leave stale NES state
+        // behind. Off unless the preset opts in, which keeps the default
+        // render path and the canonical golden PCM untouched.
+        if (event.preset && event.preset->nesAccurate) {
+            initNesSafe(*ch, event.type);
         }
     }
 
@@ -1655,15 +2719,65 @@ namespace pixelroot32::audio {
 
         float sample = 0.0f;
         switch (ch.type) {
-            case WaveType::PULSE:
-                sample = (ch.phase < ch.dutyCycle) ? 1.0f : -1.0f;
+            case WaveType::PULSE: {
+                if (ch.pulseDutyIndex < 4) {
+                    // Hito 1 M2: NES discrete duty (12.5/25/50/75%).
+                    // phaseQ32 top 3 bits = current 8-step index (matches Q15 path).
+                    const uint32_t step = (ch.phaseQ32 >> 29) & 7u;
+                    sample = kNesPulseDuty[ch.pulseDutyIndex][step] ? 1.0f : -1.0f;
+                } else {
+                    sample = (ch.phase < ch.dutyCycle) ? 1.0f : -1.0f;
+                }
+                // Hito 2 M6: NES sweep muting. The `muted` flag is
+                // continuously evaluated by the half-clock dispatch
+                // (and by `setVoiceNesTimer`), even when the sweep is
+                // "disabled" (E=0 or SSS=0). When set, the PULSE output
+                // is forced to 0 (the phase still advances below).
+                if (ch.nesSweepUnit.muted) {
+                    sample = 0.0f;
+                }
                 break;
-            case WaveType::TRIANGLE:
-                // TODO: future NES-accurate 4-bit quantization (deferred)
-                sample = (ch.phase < 0.5f)
-                       ? (4.0f * ch.phase - 1.0f)
-                       : (3.0f - 4.0f * ch.phase);
+            }
+            case WaveType::TRIANGLE: {
+                // Hito 2 M5: per-sample NES gate. The TRIANGLE channel is
+                // ANDed by (length counter open) AND (linear counter open).
+                // Either sub-unit, when its respective `enabled` flag is
+                // false, is treated as always-open. When the gate is
+                // closed the output is 0 and the phase does NOT advance —
+                // re-loading via a $4008 / $400B write resumes the voice.
+                const bool lengthOk =
+                    (!ch.nesLengthCounter.enabled) || (ch.nesLengthCounter.counter > 0);
+                const bool linearOk =
+                    (!ch.nesLinearCounter.linearEnabled) || (ch.nesLinearCounter.counter > 0);
+                const bool gate = lengthOk && linearOk;
+
+                if (gate) {
+                    float tri = (ch.phase < 0.5f)
+                              ? (4.0f * ch.phase - 1.0f)
+                              : (3.0f - 4.0f * ch.phase);
+                    if (ch.triangleQuantize4Bit) {
+                        // Hito 1 M1: NES 4-bit quantisation.
+                        // 32 levels = 16 positive + 16 negative, step = 2/15, range
+                        // [-1, +1]. The duty counter's 5-bit value 0..15 maps to
+                        // 2*counter/15 with the counter not reaching "0" (apex
+                        // duplicates at phase 0 and 0.5). We snap to the nearest
+                        // of {-1, -13/15, -11/15, ..., 11/15, 13/15, 1}.
+                        const float step = 2.0f / 15.0f;
+                        const int idx = (int)std::floor((tri + 1.0f) / step + 0.5f);
+                        const int clamped = (idx < 0) ? 0 : (idx > 15 ? 15 : idx);
+                        tri = ((float)clamped * step) - 1.0f;
+                    }
+                    sample = tri;
+                    ch.phase += ch.phaseIncrement;
+                    if (ch.phase >= 1.0f) ch.phase -= 1.0f;
+                    ch.phaseQ32 += ch.phaseIncQ32;
+                } else {
+                    // Gate closed: silent, no phase advance. Voice stays
+                    // enabled so it can resume when a counter reloads.
+                    sample = 0.0f;
+                }
                 break;
+            }
             case WaveType::SINE: {
                 const unsigned i = (unsigned)(ch.phase * 256.0f) & 255u;
                 sample = (float)SINE_LUT_Q15[i] / 32768.0f;
@@ -1677,7 +2791,7 @@ namespace pixelroot32::audio {
                 // timbre is identical in simulator and hardware.
                 if (ch.noiseCountdown > 0u) ch.noiseCountdown--;
                 if (ch.noiseCountdown == 0u) {
-                    const uint16_t bitToXor = ch.noiseShortMode ? ((ch.lfsrState >> 6) & 1u) : ((ch.lfsrState >> 1) & 1u);
+                    const uint16_t bitToXor = ch.noiseLfsrShort ? ((ch.lfsrState >> 6) & 1u) : ((ch.lfsrState >> 1) & 1u);
                     const uint16_t fb = (uint16_t)(((ch.lfsrState & 1u) ^ bitToXor) & 1u);
                     ch.lfsrState = (uint16_t)((ch.lfsrState >> 1) | (fb << 14));
                     ch.noiseCountdown = ch.noisePeriodSamples;
@@ -1690,10 +2804,13 @@ namespace pixelroot32::audio {
                 break;
         }
 
-        if (ch.type != WaveType::NOISE) {
+        if (ch.type != WaveType::NOISE && ch.type != WaveType::TRIANGLE) {
             ch.phase += ch.phaseIncrement;
             if (ch.phase >= 1.0f) ch.phase -= 1.0f;
-            
+            // Hito 1 M2: keep phaseQ32 in sync with the float phase on the
+            // FPU path so the NES discrete duty lookup (which uses the
+            // top 3 bits of phaseQ32) tracks the same step as the Q15 path.
+            ch.phaseQ32 += ch.phaseIncQ32;
             if (ch.type == WaveType::PULSE && ch.dutySweep != 0.0f) {
                 ch.dutyCycle += ch.dutySweep;
                 if (ch.dutyCycle > 1.0f) ch.dutyCycle -= 1.0f;
@@ -1737,7 +2854,20 @@ namespace pixelroot32::audio {
             }
         }
 
-        return sample * ch.volume * ch.envelope.currentLevel * lfoVolMod;
+        // Hito 2 M7: when the NES envelope is enabled for this voice
+        // (PULSE / NOISE only), the envelope's `output` (0..15) replaces
+        // the ADSR `envelope.currentLevel` as the per-sample volume
+        // source. The NES envelope's `output` is the const-volume level
+        // (VVVV) or the current decay level, both 0..15. Scaling by
+        // 1/15.0 maps output=15 to 1.0 (output=0 → 0.0). Matches NES.
+        float envLevel;
+        if ((ch.type == WaveType::PULSE || ch.type == WaveType::NOISE)
+            && ch.nesEnvelope.envelopeEnabled) {
+            envLevel = (float)ch.nesEnvelope.output / 15.0f;
+        } else {
+            envLevel = ch.envelope.currentLevel;
+        }
+        return sample * ch.volume * envLevel * lfoVolMod;
     }
 
     // ------------------------------------------------------------------
@@ -1750,16 +2880,25 @@ namespace pixelroot32::audio {
         updateMusicSequencer();
 
         constexpr float FINAL_SCALE = 32767.0f;
-        // HPF coefficient: y[n] = x[n] - x[n-1] + R*y[n-1]
-        // R = 0.995 at 22050 Hz -> ~35 Hz -3dB
-        constexpr float HPF_R = 0.995f;
+        // HPF is `y[n] = x[n] - x[n-1] + R*y[n-1]`; R now lives in `hpfR_`
+        // (Hito 4 M10) so the corner can be configured in Hz.
 
 #if PR32_APU_HAS_FPU
         // ---- Float path (native, ESP32 classic, ESP32-S3) ---------------
         // Single float branch for every FPU-capable or desktop target; the
         // integer/LUT branch below is reserved for no-FPU cores (and for
         // native builds that force -DPR32_APU_HAS_FPU=0 in tests).
+
+        // Hito 2 M3: APU cycles per render sample. Computed once per
+        // generateSamples() call. When the frame counter is OFF (default)
+        // the tick is a no-op, so this is just a cheap set-up cost.
+        const double apuCyclesPerSample =
+            (sampleRate > 0) ? (nes_apu::kNesApuHzNtsc / (double)sampleRate) : 0.0;
+
         for (int i = 0; i < length; ++i) {
+            // Hito 2 M3: tick the NES frame counter before voice mixing so
+            // any future sub-units (M4-M7) see a consistent clock state.
+            tickNesFrameCounter(apuCyclesPerSample);
             float acc = 0.0f;
             for (int c = 0; c < MAX_VOICES; ++c) {
                 if (voices[c].enabled) {
@@ -1767,12 +2906,43 @@ namespace pixelroot32::audio {
                 }
             }
             acc *= masterVolume;
-            float mixed = acc / (1.0f + std::fabs(acc) * MIXER_K);
+            // Hito 4 M11: master shaping curve, applied before the DC
+            // blocker so the filter sees whatever the curve produced.
+            float mixed;
+            switch (softClipMode_) {
+                case SoftClipMode::None:
+                    mixed = acc;
+                    break;
+                case SoftClipMode::Tanh: {
+                    // Rational tanh approximation: x*(27+x^2)/(27+9x^2).
+                    const float x2 = acc * acc;
+                    mixed = acc * (27.0f + x2) / (27.0f + 9.0f * x2);
+                    break;
+                }
+                case SoftClipMode::HardClip:
+                    // The NES DAC saturates rather than compressing.
+                    mixed = (acc > 1.0f) ? 1.0f : ((acc < -1.0f) ? -1.0f : acc);
+                    break;
+                case SoftClipMode::Rational:
+                default:
+                    mixed = acc / (1.0f + std::fabs(acc) * MIXER_K);
+                    break;
+            }
 
             // DC-blocker: removes duty-asymmetry DC and softens retrigger pops.
-            const float hpfOut = mixed - hpfPrevIn + HPF_R * hpfPrevOut;
-            hpfPrevIn = mixed;
-            hpfPrevOut = hpfOut;
+            // Hito 4 M10: coefficient comes from the configured corner.
+            float hpfOut;
+            if (hpfEnabled_) {
+                hpfOut = mixed - hpfPrevIn + hpfR_ * hpfPrevOut;
+                hpfPrevIn = mixed;
+                hpfPrevOut = hpfOut;
+            } else {
+                hpfOut = mixed;
+                // Keep the state coherent so re-enabling starts the
+                // recursion cleanly instead of stepping from a stale value.
+                hpfPrevIn = mixed;
+                hpfPrevOut = 0.0f;
+            }
 
             float finalSample = hpfOut * FINAL_SCALE;
             const float absSample = std::fabs(finalSample);
@@ -1801,14 +2971,35 @@ namespace pixelroot32::audio {
             volQ15[c] = (int32_t)(voices[c].volume * 32768.0f);
         }
 
+        // Hito 2 M3: APU cycles per render sample (same as FPU path).
+        const double apuCyclesPerSample =
+            (sampleRate > 0) ? (nes_apu::kNesApuHzNtsc / (double)sampleRate) : 0.0;
+
         // Hoisted wave type dispatch - compute sample once before inner loop
         // using inline branch-free operations instead of switch
         auto generatePulseSampleQ15 = [](AudioChannel& ch) -> int32_t {
+            if (ch.pulseDutyIndex < 4) {
+                const uint32_t step = (ch.phaseQ32 >> 29) & 7u;
+                return kNesPulseDuty[ch.pulseDutyIndex][step] ? 32767 : -32767;
+            }
             return (ch.phaseQ32 < ch.dutyCycleQ32) ? 32767 : -32767;
         };
         auto generateTriangleSampleQ15 = [](AudioChannel& ch) -> int32_t {
             const uint32_t p16 = ch.phaseQ32 >> 16;
-            return (p16 < 32768u) ? ((int32_t)(p16 * 2) - 32768) : (32768 - (int32_t)((p16 - 32768u) * 2));
+            int32_t tri_q15 = (p16 < 32768u)
+                ? ((int32_t)(p16 << 1) - 32768)
+                : (32768 - (int32_t)((p16 - 32768u) << 1));
+            if (ch.triangleQuantize4Bit) {
+                // NES 4-bit quantisation (same as the file-scope lambda).
+                constexpr int32_t kStep = (2 * 32768) / 15;
+                constexpr int32_t kHalf = kStep / 2;
+                int32_t shifted = tri_q15 + 32768 + kHalf;
+                int32_t idx = shifted / kStep;
+                if (idx < 0) idx = 0;
+                if (idx > 15) idx = 15;
+                tri_q15 = idx * kStep - 32768;
+            }
+            return tri_q15;
         };
         auto generateNoiseSampleQ15 = [](AudioChannel& ch) -> int32_t {
             return (ch.lfsrState & 1u) ? 32767 : -32767;
@@ -1817,6 +3008,8 @@ namespace pixelroot32::audio {
         // Process channels by type - hoisted from inner loop
         // This eliminates the switch(ch.type) branch misprediction
         for (int i = 0; i < length; ++i) {
+            // Hito 2 M3: tick the NES frame counter before voice mixing.
+            tickNesFrameCounter(apuCyclesPerSample);
             int32_t sum = 0;
 
             for (int c = 0; c < MAX_VOICES; ++c) {
@@ -1830,7 +3023,7 @@ namespace pixelroot32::audio {
                     // NOISE: inline state update (required for LFSR mutation)
                     if (ch.noiseCountdown > 0u) ch.noiseCountdown--;
                     if (ch.noiseCountdown == 0u) {
-                        const uint16_t bitToXor = ch.noiseShortMode ? ((ch.lfsrState >> 6) & 1u) : ((ch.lfsrState >> 1) & 1u);
+                        const uint16_t bitToXor = ch.noiseLfsrShort ? ((ch.lfsrState >> 6) & 1u) : ((ch.lfsrState >> 1) & 1u);
                         const uint16_t fb = (uint16_t)(((ch.lfsrState & 1u) ^ bitToXor) & 1u);
                         ch.lfsrState = (uint16_t)((ch.lfsrState >> 1) | (fb << 14));
                         ch.noiseCountdown = ch.noisePeriodSamples;
@@ -1839,8 +3032,35 @@ namespace pixelroot32::audio {
                 } else if (ch.type == WaveType::SINE) {
                     // SINE: direct LUT lookup
                     s = (int32_t)SINE_LUT_Q15[(ch.phaseQ32 >> 24) & 255u];
+                } else if (ch.type == WaveType::TRIANGLE) {
+                    // Hito 2 M5: per-sample NES gate. AND of (length open)
+                    // and (linear open); each sub-unit, when its `enabled`
+                    // flag is false, is treated as always-open. When the
+                    // gate is closed the output is 0 and the phase does
+                    // NOT advance — re-loading via a $4008 / $400B write
+                    // resumes the voice.
+                    const bool lengthOk =
+                        (!ch.nesLengthCounter.enabled) || (ch.nesLengthCounter.counter > 0);
+                    const bool linearOk =
+                        (!ch.nesLinearCounter.linearEnabled) || (ch.nesLinearCounter.counter > 0);
+                    if (lengthOk && linearOk) {
+                        s = generateTriangleSampleQ15(ch);
+                        ch.phaseQ32 += ch.phaseIncQ32;  // advance only if gate open
+                    } else {
+                        s = 0;
+                    }
+                } else if (ch.type == WaveType::PULSE) {
+                    // Hito 2 M6: PULSE special case to apply the sweep
+                    // muting flag (always-evaluated by the half-clock
+                    // dispatch). SAW + SINE go through the function
+                    // pointer dispatch below.
+                    s = generatePulseSampleQ15(ch);
+                    if (ch.nesSweepUnit.muted) {
+                        s = 0;
+                    }
                 } else if (auto gen = WAVE_GENERATORS_Q15[static_cast<int>(ch.type)]) {
-                    // PULSE, TRIANGLE, SAW: function pointer lookup
+                    // SAW: function pointer lookup. (TRIANGLE handled above,
+                    // PULSE handled above, NOISE / SINE handled above.)
                     s = gen(ch);
                 } else {
                     // Fallback (should never reach)
@@ -1848,8 +3068,18 @@ namespace pixelroot32::audio {
                 }
 
                 // Apply per-channel Q15 volume × envelope: (s * volQ15 * envQ15) >> 30
+                // Hito 2 M7: when the NES envelope is enabled (PULSE / NOISE),
+                // use the envelope's `output` (0..15) scaled to Q15 as the
+                // multiplier. 32768/15 = 2184, so output=15 → 32760 (≈1.0).
+                int32_t envQ15;
+                if ((ch.type == WaveType::PULSE || ch.type == WaveType::NOISE)
+                    && ch.nesEnvelope.envelopeEnabled) {
+                    envQ15 = (int32_t)ch.nesEnvelope.output * 2184;  // 32768/15
+                } else {
+                    envQ15 = ch.envelope.currentLevelQ15;
+                }
                 int32_t sv = (s * volQ15[c]) >> 15;
-                sv = (sv * ch.envelope.currentLevelQ15) >> 15;
+                sv = (sv * envQ15) >> 15;
 
                 // Volume LFO (tremolo) — Q15 only, no float conversion.
                 if (ch.lfo.enabled && ch.lfo.target == LfoTarget::VOLUME) {
@@ -1859,17 +3089,23 @@ namespace pixelroot32::audio {
                     sv = (sv * volModQ15) >> 15;
                 }
 
-                // MIXER_SCALE = 0.4 per channel. 0.4 ≈ 13107/32768 so we
-                // scale by 13107 and shift 15 to land back in Q15. This
-                // matches the FPU branch exactly (MIXER_SCALE * channel).
-                sv = (sv * 13107) >> 15;
+                // Hito 5 M12: NO per-channel MIXER_SCALE here. The
+                // accumulator carries the RAW channel sum (+-131072 for four
+                // full-scale voices) because that is the convention every
+                // downstream stage was built for: `audio_mixer_lut` bakes the
+                // 0.4 into its own mapping, and the computed curves apply it
+                // once explicitly. Scaling here as well applied 0.4 twice and
+                // left the outer 60% of the table unreachable.
                 sum += sv;
 
                 // Duty stepped + pitch envelope (shared age; integer pitch path).
                 tick_voice_automation(ch, sampleRate, /*q15Path=*/true);
 
                 // Phase accumulator (integer, wraps automatically).
-                if (ch.type != WaveType::NOISE) {
+                // Hito 2 M5: TRIANGLE phase is advanced inside the gate
+                // branch above (only when the gate is open), so we must
+                // skip it here to avoid double-advancing.
+                if (ch.type != WaveType::NOISE && ch.type != WaveType::TRIANGLE) {
                     ch.phaseQ32 += ch.phaseIncQ32;
                     if (ch.type == WaveType::PULSE && ch.dutySweepQ32 != 0) {
                         ch.dutyCycleQ32 += ch.dutySweepQ32; // naturally wraps
@@ -1962,37 +3198,84 @@ namespace pixelroot32::audio {
                 sum = (int32_t)(((int64_t)sum * (int64_t)masterVolumeScale) >> 16);
             }
 
-            int32_t index = (sum + 131072) >> 8;
-            if (index < 0) index = 0;
-            if (index > 1024) index = 1024;
-
-            // Q15 HPF coefficient: R = 0.995, Q15 = 0.995 * 32768 = 32604
-            // Yields ~35 Hz -3dB cutoff at 22050 Hz sample rate
-            static constexpr int32_t HPF_R_Q15 = 32604;
+            // Hito 4 M11: master shaping curve. `Rational` keeps the
+            // pre-fitted LUT so the canonical golden PCM is untouched; the
+            // other modes are computed from the same accumulated mix.
+            //
+            // The LUT maps the RAW sum through `32767 * S / (1 + |S|*0.5)`
+            // with `S = sum * 1.6 / 131072`, i.e. it applies MIXER_SCALE = 0.4
+            // itself (four full-scale channels land at S = 1.6, the float
+            // path's post-MIXER_SCALE bound). The computed modes therefore
+            // need the same single 0.4 applied by hand: `(sum * 13107) >> 15`.
+            int32_t inputQ15;
+            if (softClipMode_ == SoftClipMode::Rational) {
+                int32_t index = (sum + 131072) >> 8;
+                if (index < 0) index = 0;
+                if (index > 1024) index = 1024;
+                inputQ15 = audio_mixer_lut[index];
+            } else {
+                const int32_t sQ15 = (int32_t)(((int64_t)sum * 13107) >> 15);
+                switch (softClipMode_) {
+                    case SoftClipMode::Tanh: {
+                        // x*(27+x^2)/(27+9x^2) evaluated in Q15. int64 is
+                        // required: |sQ15| reaches ~52428 when four voices
+                        // sum at full scale, so x^2 overflows int32.
+                        const int64_t x2 = ((int64_t)sQ15 * sQ15) >> 15;
+                        const int64_t num = (int64_t)27 * 32768 + x2;
+                        const int64_t den = (int64_t)27 * 32768 + 9 * x2;
+                        inputQ15 = (int32_t)(((int64_t)sQ15 * num) / den);
+                        break;
+                    }
+                    case SoftClipMode::HardClip:
+                        inputQ15 = sQ15;
+                        if (inputQ15 > 32767) inputQ15 = 32767;
+                        if (inputQ15 < -32768) inputQ15 = -32768;
+                        break;
+                    case SoftClipMode::None:
+                    default:
+                        // Unshaped: the final int16 clamp is the only bound,
+                        // so the HPF still sees the overshoot (as in float).
+                        inputQ15 = sQ15;
+                        break;
+                }
+            }
 
             // Q15 HPF: y[n] = x[n] - x[n-1] + (R * y[n-1])
-            // Uses Q15 fixed-point to avoid soft-float on RISC-V cores
-            int32_t inputQ15 = audio_mixer_lut[index];
+            // Uses Q15 fixed-point to avoid soft-float on RISC-V cores.
+            // Hito 4 M10: `hpfRQ15_` mirrors the float coefficient, derived
+            // from the configured corner. Default 32604 = 0.995 * 32768,
+            // the historical value (~35.2 Hz at 44100, ~17.6 Hz at 22050).
+            int32_t hpfOutQ15;
+            if (hpfEnabled_) {
+                // Compute R * y[n-1] in Q30, then shift to Q15
+                int64_t feedback = (int64_t)hpfRQ15_ * (int64_t)hpfPrevOutQ15;
+                int32_t feedbackQ15 = (int32_t)(feedback >> 15);
 
-            // Compute R * y[n-1] in Q30, then shift to Q15
-            int64_t feedback = (int64_t)HPF_R_Q15 * (int64_t)hpfPrevOutQ15;
-            int32_t feedbackQ15 = (int32_t)(feedback >> 15);
+                // HPF difference equation
+                hpfOutQ15 = inputQ15 - hpfPrevInQ15 + feedbackQ15;
 
-            // HPF difference equation
-            int32_t hpfOutQ15 = inputQ15 - hpfPrevInQ15 + feedbackQ15;
+                // Saturating clamp to prevent overflow artifacts
+                if (hpfOutQ15 > 32767) hpfOutQ15 = 32767;
+                if (hpfOutQ15 < -32768) hpfOutQ15 = -32768;
 
-            // Saturating clamp to prevent overflow artifacts
-            if (hpfOutQ15 > 32767) hpfOutQ15 = 32767;
-            if (hpfOutQ15 < -32768) hpfOutQ15 = -32768;
+                // Update state for next sample
+                hpfPrevInQ15 = inputQ15;
+                hpfPrevOutQ15 = hpfOutQ15;
+            } else {
+                hpfOutQ15 = inputQ15;
+                hpfPrevInQ15 = inputQ15;
+                hpfPrevOutQ15 = 0;
+            }
 
-            // Update state for next sample
-            hpfPrevInQ15 = inputQ15;
-            hpfPrevOutQ15 = hpfOutQ15;
-
-            // Fixed -6 dB headroom pad (Q15 -> Q14). NOTE: the FPU path has no
-            // equivalent pad; kept for now to avoid a silent loudness change on
-            // no-FPU targets — revisit when unifying paths in the APU library.
-            int32_t finalSample = hpfOutQ15 >> 1;
+            // Hito 5 M12: the fixed -6 dB headroom pad (`>>1`, Q15 -> Q14) is
+            // gone; this path now lands at the same level as the float one.
+            // The pad also happened to keep the value below half scale, so the
+            // int16 cast could never overflow. It can now: an unshaped mix
+            // reaches S = 1.6 and a bypassed HPF skips the clamp above, so
+            // saturate here exactly as the float branch does before its cast.
+            int32_t finalSample = hpfOutQ15;
+            if (finalSample > 32767) finalSample = 32767;
+            if (finalSample < -32768) finalSample = -32768;
 
             stream[i] = apply_master_bitcrush((int16_t)finalSample, masterBitcrushBits_);
 
@@ -2037,6 +3320,47 @@ namespace pixelroot32::audio {
         postMixMono_ = fn;
         postMixUser_ = user;
     }
+
+    void ApuCore::setVoicePulseDutyMode(int slot, uint8_t nesDutyIndex) {
+        if (slot < 0 || slot >= MAX_VOICES) return;
+        // 0..3 -> NES discrete patterns. 4..254 are reserved / invalid and
+        // are clamped to continuous. 255 is the documented "continuous"
+        // sentinel and is stored verbatim.
+        if (nesDutyIndex < 4 || nesDutyIndex == 255) {
+            voices[slot].pulseDutyIndex = nesDutyIndex;
+        } else {
+            voices[slot].pulseDutyIndex = 255;
+        }
+    }
+
+    // Hito 3 M8: NES NOISE period LUT.
+    void ApuCore::setVoiceNesNoiseLutMode(int slot, uint8_t lutIndex) {
+        if (slot < 0 || slot >= MAX_VOICES) return;
+        Voice& v = voices[slot];
+        // 0..15 -> LUT entry. 16..254 are invalid and fall back to the
+        // documented 255 "derive from frequency" sentinel.
+        v.nesNoiseLutIndex = (lutIndex < 16u) ? lutIndex : 255u;
+
+        // Retune now so the change is audible without waiting for a new
+        // note, matching how setVoiceNesTimer re-syncs the pulse period.
+        if (v.type != WaveType::NOISE) return;
+        if (v.nesNoiseLutIndex < 16u) {
+            v.noisePeriodSamples =
+                nes_apu::nesNoisePeriodToSamples(v.nesNoiseLutIndex, sampleRate);
+        } else {
+            v.noisePeriodSamples = noise_clock_hz_to_period(v.frequency, sampleRate);
+        }
+        if (v.noiseCountdown > v.noisePeriodSamples) {
+            v.noiseCountdown = v.noisePeriodSamples;
+        }
+    }
+
+#if defined(UNIT_TEST)
+    void ApuCore::setVoiceTriangleOctaveUpForTesting(int slot, bool enabled) {
+        if (slot < 0 || slot >= MAX_VOICES) return;
+        voices[slot].triangleOctaveUp = enabled;
+    }
+#endif
 
     void ApuCore::getAndResetProfileStats(ProfileEntry* out, uint8_t& count) {
         count = profileCount;

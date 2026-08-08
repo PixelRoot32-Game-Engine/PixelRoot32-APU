@@ -15,8 +15,14 @@ namespace pixelroot32::audio {
      * Resolution: 1025 entries, index = (suma + 131072) >> 8
      *
      * Curve: LUT[i] ≈ 32767 * x / (1 + |x|*0.5) where x = sum * 1.6 / 131072.
-     * This matches the FPU mixing path when each channel is pre-scaled by 0.4
-     * before summation (see ApuCore::generateSamples).
+     *
+     * The input is the RAW sum of channels, NOT pre-scaled by MIXER_SCALE:
+     * the mapping applies the 0.4 itself, so four full-scale channels
+     * (sum = 131072) land at x = 1.6, which is exactly the bound of the FPU
+     * path's post-MIXER_SCALE accumulator — hence LUT[0] = -29126, the value
+     * of the curve at -1.6 rather than at -1.0. Pre-scaling the channels as
+     * well applies 0.4 twice and leaves the outer 60% of the table
+     * unreachable (see ApuCore::generateSamples, Hito 5 M12).
      *
      * Marked `inline constexpr` (C++17) so every translation unit shares the
      * same storage — avoids multiple ~2 KB .rodata copies that the default

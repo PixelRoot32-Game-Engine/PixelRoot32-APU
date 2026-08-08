@@ -1,5 +1,12 @@
 cmake_minimum_required(VERSION 3.16)
-project(pixelroot32-apu VERSION 1.0.0 LANGUAGES C CXX)
+project(pixelroot32-apu VERSION 2.0.0 LANGUAGES C CXX)
+
+# The test files have pre-existing narrowing conversions in brace-init
+# (committed before M7). Suppress this warning so the test build doesn't
+# fail on those lines.
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    add_compile_options(-Wno-narrowing)
+endif()
 
 # ---------------------------------------------------------------------------
 # Library target
@@ -63,5 +70,17 @@ if(PR32_APU_BUILD_TESTS)
     target_include_directories(test_q15_smoke PRIVATE include test test/support)
     target_link_libraries(test_q15_smoke PRIVATE pr32_apu_unity)
     add_test(NAME test_q15_smoke COMMAND test_q15_smoke
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test)
+
+    # Consumer link surface. Every suite above recompiles src/ApuCore.cpp with
+    # UNIT_TEST=1, so a definition left inside a `#if defined(UNIT_TEST)` block
+    # still resolves for them — and the shipped library silently loses the
+    # symbol. This target is the only one that links `pixelroot32-apu` the way
+    # a consumer does, so it MUST NOT define UNIT_TEST and MUST NOT compile the
+    # source itself.
+    add_executable(test_library_link test/test_library_link.cpp)
+    target_include_directories(test_library_link PRIVATE test test/support)
+    target_link_libraries(test_library_link PRIVATE pixelroot32-apu pr32_apu_unity)
+    add_test(NAME test_library_link COMMAND test_library_link
              WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test)
 endif()
