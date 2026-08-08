@@ -153,9 +153,9 @@ struct InstrumentPreset {
     //   noiseLfsrShort == true  <->  NES T = 0 (noisy/metallic, 93-step, tap bit 6)
     //   noiseLfsrShort == false <->  NES T = 1 (tone mode, 32767-step, tap bit 1)
     // Short alias retained for ABI stability; will be removed in a future major.
+    // The alias itself is the LAST member of this struct, not here — see the
+    // note on `noiseShortMode` below for why.
     bool noiseLfsrShort = false;   // For NOISE: true = metallic timbre (93-step LFSR)
-    /** @deprecated Use noiseLfsrShort. Will be removed in a future major version. */
-    bool noiseShortMode = false;
     float dutySweep = 0.0f;        // For PULSE: duty cycle change per second
 
     // Optional pitch sweep (materialized to AudioEvent.sweep* when both > 0)
@@ -178,10 +178,33 @@ struct InstrumentPreset {
      * counterpart and are left untouched. Default false, so the rendered PCM
      * is unchanged for every existing preset.
      *
-     * Keep this the LAST member: the shipped `INSTR_*` presets and the test
+     * Keep this near the end: the shipped `INSTR_*` presets and the test
      * literals use positional aggregate initialization.
      */
     bool nesAccurate = false;
+
+    /**
+     * @deprecated Use `noiseLfsrShort`. Will be removed in a future major.
+     *
+     * Deliberately the LAST member, and it must stay there. Both consumers
+     * (PixelRoot32-Game-Engine and PixelRoot32-Tool-Suite) build presets with
+     * POSITIONAL aggregate initializers written against the 1.0.1 field order,
+     * where position 14 was the sole noise-mode flag and 15/16/17 were
+     * `dutySweep` / `pitchSweepEndHz` / `pitchSweepDurationSec`.
+     *
+     * Introducing the alias next to `noiseLfsrShort` pushed all three of those
+     * down one slot, so every such literal either failed to compile (a float
+     * landing on this bool) or silently rebound its trailing values. Keeping
+     * the alias here leaves positions 1..17 meaning exactly what they meant in
+     * 1.0.1, so consumer literals keep working untouched.
+     *
+     * Consequence for anyone editing the `INSTR_*` presets below: the alias no
+     * longer sits next to the field it mirrors, so it is easy to forget. It is
+     * NOT auto-synced at the struct level (both are plain independent bools);
+     * `ApuCore::initVoiceFromEvent` only syncs the copies on `AudioChannel`.
+     * `test_shipped_presets_keep_deprecated_alias_in_sync` guards this.
+     */
+    bool noiseShortMode = false;
 };
 
 constexpr InstrumentPreset INSTR_PULSE_LEAD{
@@ -199,7 +222,6 @@ constexpr InstrumentPreset INSTR_PULSE_LEAD{
     0.025f,   // lfoDepth    – slightly more vibrato
     0.15f,    // lfoDelay    – delayed vibrato for natural feel
     false,    // noiseLfsrShort (unused for pulse)
-    false,    // noiseShortMode (deprecated alias)
     0.0f,      // dutySweep   – no sweep by default
     0.0f,     // pitchSweepEndHz
     0.0f      // pitchSweepDurationSec
@@ -220,7 +242,6 @@ constexpr InstrumentPreset INSTR_TRIANGLE_LEAD{
     0.020f,   // lfoDepth – subtle vibrato
     0.20f,    // lfoDelay – delayed vibrato
     false,    // noiseLfsrShort (unused)
-    false,    // noiseShortMode (deprecated alias)
     0.0f,      // dutySweep
     0.0f,     // pitchSweepEndHz
     0.0f      // pitchSweepDurationSec
@@ -241,7 +262,6 @@ constexpr InstrumentPreset INSTR_TRIANGLE_PAD{
     0.15f,    // lfoDepth – subtle volume movement
     0.50f,    // lfoDelay
     false,    // noiseLfsrShort
-    false,    // noiseShortMode (deprecated alias)
     0.0f,      // dutySweep
     0.0f,     // pitchSweepEndHz
     0.0f      // pitchSweepDurationSec
@@ -262,7 +282,6 @@ constexpr InstrumentPreset INSTR_PULSE_PAD{
     0.035f,   // lfoDepth – noticeable pitch modulation
     0.30f,    // lfoDelay
     false,    // noiseLfsrShort
-    false,    // noiseShortMode (deprecated alias)
     0.08f,     // dutySweep – gentle PWM movement for evolving texture
     0.0f,     // pitchSweepEndHz
     0.0f      // pitchSweepDurationSec
@@ -283,7 +302,6 @@ constexpr InstrumentPreset INSTR_PULSE_HARMONY{
     0.30f,    // lfoDepth    – 30 % volume modulation
     0.0f,     // lfoDelay
     false,    // noiseLfsrShort
-    false,    // noiseShortMode (deprecated alias)
     0.15f,     // dutySweep   – more pronounced PWM-like movement
     0.0f,     // pitchSweepEndHz
     0.0f      // pitchSweepDurationSec
@@ -304,7 +322,6 @@ constexpr InstrumentPreset INSTR_TRIANGLE_BASS{
     0.0f,     // lfoDepth
     0.0f,     // lfoDelay
     false,    // noiseLfsrShort
-    false,    // noiseShortMode (deprecated alias)
     0.0f,      // dutySweep
     0.0f,     // pitchSweepEndHz
     0.0f      // pitchSweepDurationSec
@@ -325,7 +342,6 @@ constexpr InstrumentPreset INSTR_PULSE_BASS{
     0.0f,     // lfoDepth
     0.0f,     // lfoDelay
     false,    // noiseLfsrShort
-    false,    // noiseShortMode (deprecated alias)
     0.0f,      // dutySweep
     0.0f,     // pitchSweepEndHz
     0.0f      // pitchSweepDurationSec
@@ -346,7 +362,6 @@ constexpr InstrumentPreset INSTR_KICK{
     0.0f,
     0.0f,
     false,    // noiseLfsrShort – kick is not metallic
-    false,    // noiseShortMode (deprecated alias)
     0.0f,      // dutySweep
     0.0f,     // pitchSweepEndHz
     0.0f      // pitchSweepDurationSec
@@ -367,10 +382,11 @@ constexpr InstrumentPreset INSTR_SNARE{
     0.0f,
     0.0f,
     true,     // noiseLfsrShort – metallic 93‑step LFSR for snare
-    true,     // noiseShortMode (deprecated alias)
     0.0f,      // dutySweep
     0.0f,     // pitchSweepEndHz
-    0.0f      // pitchSweepDurationSec
+    0.0f,     // pitchSweepDurationSec
+    false,    // nesAccurate
+    true      // noiseShortMode (deprecated alias, last member — keep in sync)
 };
 
 constexpr InstrumentPreset INSTR_HIHAT{
@@ -388,10 +404,11 @@ constexpr InstrumentPreset INSTR_HIHAT{
     0.0f,
     0.0f,
     true,     // noiseLfsrShort – metallic timbre for closed hat
-    true,     // noiseShortMode (deprecated alias)
     0.0f,      // dutySweep
     0.0f,     // pitchSweepEndHz
-    0.0f      // pitchSweepDurationSec
+    0.0f,     // pitchSweepDurationSec
+    false,    // nesAccurate
+    true      // noiseShortMode (deprecated alias, last member — keep in sync)
 };
 
 /**

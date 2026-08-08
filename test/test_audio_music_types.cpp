@@ -443,6 +443,65 @@ void test_noise_lfsr_short_default_value(void)
     TEST_ASSERT_EQUAL(p.noiseLfsrShort, p.noiseShortMode);
 }
 
+// THE consumer contract. Both PixelRoot32-Game-Engine and PixelRoot32-Tool-Suite
+// build InstrumentPreset with POSITIONAL aggregate initializers written against
+// the published 1.0.1 field order, so any member inserted before the tail
+// silently rebinds every one of those literals — or, since the displaced values
+// are floats landing on a bool, breaks the build outright.
+//
+// The deprecated `noiseShortMode` alias therefore lives at the END of the
+// struct, after `nesAccurate`. That is the whole reason for its position: it
+// keeps positions 1..17 meaning exactly what they meant in 1.0.1.
+//
+// Distinctive value per trailing field on purpose — a one-slot shift is then
+// unmissable instead of hiding behind a matching default.
+void test_instrument_preset_positional_layout_matches_published_abi(void)
+{
+    constexpr InstrumentPreset legacy{
+        0.8f, 0.5f, 4, 0.25f, 7,
+        0.01f, 0.02f, 0.75f, 0.03f,
+        LfoTarget::VOLUME, 6.0f, 0.4f, 0.05f,
+        true,        // 14: noiseLfsrShort (named noiseShortMode in 1.0.1)
+        0.125f,      // 15: dutySweep
+        880.0f,      // 16: pitchSweepEndHz
+        1.5f         // 17: pitchSweepDurationSec
+    };
+
+    TEST_ASSERT_TRUE(legacy.noiseLfsrShort);
+    TEST_ASSERT_EQUAL_FLOAT(0.125f, legacy.dutySweep);
+    TEST_ASSERT_EQUAL_FLOAT(880.0f, legacy.pitchSweepEndHz);
+    TEST_ASSERT_EQUAL_FLOAT(1.5f, legacy.pitchSweepDurationSec);
+
+    // Everything added after 1.0.1 must sit beyond the reach of such a literal.
+    TEST_ASSERT_FALSE(legacy.nesAccurate);
+    TEST_ASSERT_FALSE(legacy.noiseShortMode);
+}
+
+// Guards the shipped presets against the alias silently falling out of sync.
+// They initialize positionally, and the alias is now the LAST member, so it is
+// easy to drop it and leave INSTR_SNARE / INSTR_HIHAT reporting false through
+// the deprecated name while the canonical field says true. Consumers still read
+// the alias off these constants, so the two must agree.
+void test_shipped_presets_keep_deprecated_alias_in_sync(void)
+{
+    const InstrumentPreset presets[] = {
+        INSTR_PULSE_LEAD, INSTR_TRIANGLE_LEAD, INSTR_TRIANGLE_PAD,
+        INSTR_PULSE_PAD,  INSTR_PULSE_HARMONY, INSTR_TRIANGLE_BASS,
+        INSTR_PULSE_BASS, INSTR_KICK,          INSTR_SNARE,
+        INSTR_HIHAT
+    };
+
+    for (const InstrumentPreset& p : presets) {
+        TEST_ASSERT_EQUAL_MESSAGE(p.noiseLfsrShort, p.noiseShortMode,
+            "shipped preset: deprecated alias must match noiseLfsrShort");
+    }
+
+    // Pin the two that are actually true, so an all-false regression cannot
+    // satisfy the loop above.
+    TEST_ASSERT_TRUE(INSTR_SNARE.noiseShortMode);
+    TEST_ASSERT_TRUE(INSTR_HIHAT.noiseShortMode);
+}
+
 int main(int argc, char **argv) {
     UNITY_BEGIN();
     
@@ -494,6 +553,8 @@ int main(int argc, char **argv) {
     // Hito 0 (M15) rename coverage
     RUN_TEST(test_noise_lfsr_short_alias_consistency);
     RUN_TEST(test_noise_lfsr_short_default_value);
+    RUN_TEST(test_instrument_preset_positional_layout_matches_published_abi);
+    RUN_TEST(test_shipped_presets_keep_deprecated_alias_in_sync);
 
     return UNITY_END();
 }

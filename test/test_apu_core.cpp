@@ -1792,7 +1792,7 @@ void test_apu_core_duty_stepped_absent_keeps_legacy_duty_sweep(void) {
     // Large dutySweep with no duty steps must still advance dutyCycle (legacy PWM).
     static const InstrumentPreset kSweepPreset{
         0.8f, 0.5f, 4, 0.0f, 0, 0.001f, 0.0f, 1.0f, 0.001f,
-        LfoTarget::NONE, 0.0f, 0.0f, 0.0f, false, false,
+        LfoTarget::NONE, 0.0f, 0.0f, 0.0f, false,
         8.0f  // dutySweep: +8.0 duty units per second
     };
 
@@ -2025,7 +2025,7 @@ void test_apu_core_pitch_envelope_count_below_two_keeps_sweep(void) {
 void test_apu_core_duty_stepped_hold_after_last_and_ignores_duty_sweep(void) {
     static const InstrumentPreset kSweepPreset{
         0.8f, 0.5f, 4, 0.0f, 0, 0.001f, 0.0f, 1.0f, 0.001f,
-        LfoTarget::NONE, 0.0f, 0.0f, 0.0f, false, false,
+        LfoTarget::NONE, 0.0f, 0.0f, 0.0f, false,
         20.0f  // would move duty fast if not ignored
     };
     static const SfxBreakpoint kSteps[] = {
@@ -2068,7 +2068,7 @@ void test_apu_core_music_uses_track_duty_not_preset_duty(void)
     // Preset duty is 50%; track duty is 12.5%. Sequencer must wire track->duty.
     static const InstrumentPreset kPresetDuty50{
         0.8f, 0.5f, 4, 0.0f, 0, 0.001f, 0.0f, 1.0f, 0.001f,
-        LfoTarget::NONE, 0.0f, 0.0f, 0.0f, false, false, 0.0f};
+        LfoTarget::NONE, 0.0f, 0.0f, 0.0f, false, 0.0f};
     static const MusicNote kNotes[] = {
         makeNote(kPresetDuty50, Note::C, 4, 2.0f),
     };
