@@ -3073,10 +3073,13 @@ namespace pixelroot32::audio {
                     sv = (sv * volModQ15) >> 15;
                 }
 
-                // MIXER_SCALE = 0.4 per channel. 0.4 ≈ 13107/32768 so we
-                // scale by 13107 and shift 15 to land back in Q15. This
-                // matches the FPU branch exactly (MIXER_SCALE * channel).
-                sv = (sv * 13107) >> 15;
+                // Hito 5 M12: NO per-channel MIXER_SCALE here. The
+                // accumulator carries the RAW channel sum (+-131072 for four
+                // full-scale voices) because that is the convention every
+                // downstream stage was built for: `audio_mixer_lut` bakes the
+                // 0.4 into its own mapping, and the computed curves apply it
+                // once explicitly. Scaling here as well applied 0.4 twice and
+                // left the outer 60% of the table unreachable.
                 sum += sv;
 
                 // Duty stepped + pitch envelope (shared age; integer pitch path).
@@ -3183,11 +3186,11 @@ namespace pixelroot32::audio {
             // pre-fitted LUT so the canonical golden PCM is untouched; the
             // other modes are computed from the same accumulated mix.
             //
-            // The LUT maps `sum` through `32767 * S / (1 + |S|*0.5)` where
-            // `S = sum * 1.6 / 131072` (the float path's post-MIXER_SCALE
-            // accumulator). For the computed modes we need `S` in Q15,
-            // which is `sum * 0.4` -> `(sum * 13107) >> 15`, matching the
-            // 0.4 per-channel scale the float branch applies up front.
+            // The LUT maps the RAW sum through `32767 * S / (1 + |S|*0.5)`
+            // with `S = sum * 1.6 / 131072`, i.e. it applies MIXER_SCALE = 0.4
+            // itself (four full-scale channels land at S = 1.6, the float
+            // path's post-MIXER_SCALE bound). The computed modes therefore
+            // need the same single 0.4 applied by hand: `(sum * 13107) >> 15`.
             int32_t inputQ15;
             if (softClipMode_ == SoftClipMode::Rational) {
                 int32_t index = (sum + 131072) >> 8;
@@ -3248,10 +3251,15 @@ namespace pixelroot32::audio {
                 hpfPrevOutQ15 = 0;
             }
 
-            // Fixed -6 dB headroom pad (Q15 -> Q14). NOTE: the FPU path has no
-            // equivalent pad; kept for now to avoid a silent loudness change on
-            // no-FPU targets — revisit when unifying paths in the APU library.
-            int32_t finalSample = hpfOutQ15 >> 1;
+            // Hito 5 M12: the fixed -6 dB headroom pad (`>>1`, Q15 -> Q14) is
+            // gone; this path now lands at the same level as the float one.
+            // The pad also happened to keep the value below half scale, so the
+            // int16 cast could never overflow. It can now: an unshaped mix
+            // reaches S = 1.6 and a bypassed HPF skips the clamp above, so
+            // saturate here exactly as the float branch does before its cast.
+            int32_t finalSample = hpfOutQ15;
+            if (finalSample > 32767) finalSample = 32767;
+            if (finalSample < -32768) finalSample = -32768;
 
             stream[i] = apply_master_bitcrush((int16_t)finalSample, masterBitcrushBits_);
 

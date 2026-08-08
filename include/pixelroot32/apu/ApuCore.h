@@ -34,7 +34,10 @@ namespace pixelroot32::audio {
       *                DC-blocker to remove offset + transient clicks.
       *
       * On cores without an FPU (ESP32-C3) the integer-optimised path uses
-      * `audio_mixer_lut` which is pre-fitted to the same curve.
+      * `audio_mixer_lut`, which is pre-fitted to the same curve and renders
+      * at the same level (Hito 5 M12). It applies MIXER_SCALE once, after
+      * summation rather than per channel, because the table's mapping already
+      * contains the 0.4 — see AudioMixerLUT.h.
       */
      class ApuCore {
     public:
