@@ -8,3 +8,4 @@ build/
 compile_commands.json
 .cache/
 .atl/
+tools/loudness_probe/build/
