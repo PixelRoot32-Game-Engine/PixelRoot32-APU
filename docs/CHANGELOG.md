@@ -4,6 +4,36 @@ Format: [semver](https://semver.org/). Changes that alter rendered PCM or struct
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-08-08
+
+NES-accurate APU emulation (Hitos 0-5), a configurable output stage, and the
+unification of the two render paths.
+
+### Breaking changes
+
+Three, and only the first is audible to existing consumers on FPU-capable
+targets:
+
+1. **TRIANGLE is quantised to 4-bit NES levels by default** (Hito 1 M1). Opt out
+   per voice with `voice.triangleQuantize4Bit = false`. The golden PCM was
+   regenerated for this.
+2. **The integer/Q15 render path renders ~4.4x louder** (Hito 5 M12), matching
+   the float path. Affects FPU-less targets only — ESP32-C3 and any build with
+   `-DPR32_APU_HAS_FPU=0`. Desktop, ESP32 and ESP32-S3 are unchanged. Consumers
+   on those targets should re-check their master volume.
+3. **The NOISE LFSR seeds to `0x7FFF`** instead of `0x4000` (Hito 1 M9), which
+   is the NES-equivalent state after a `$400F` write. Changes the first samples
+   of every NOISE event.
+
+Everything else added in this release is opt-in and default-off, so a consumer
+that upgrades and touches nothing keeps its previous behaviour apart from the
+three items above.
+
+`InstrumentPreset` gained fields but its first 17 positions still mean exactly
+what they meant in 1.0.1, so positional aggregate initializers keep working
+untouched — see the `noiseShortMode` entry under Fixed for why that is load
+bearing.
+
 ### Added
 - **API**: NES APU frame counter (Hito 2 M3). Adds the `pixelroot32::audio::NesFrameCounter` struct (mode, currentStep, APU-cycle accumulator, IRQ flag, inhibit flag, reset-pending) and the `nes_apu` namespace in `ApuConfig.h` with the canonical 4-step / 5-step cycle tables (`kMode0ApuCyclesPerStep`, `kMode1ApuCyclesPerStep`, `kNesApuHzNtsc`). New public methods on `ApuCore`: `setNesFrameCounterMode(int)`, `setNesFrameCounterInhibit(bool)`, `getNesFrameCounterIrq()`. Default OFF — the counter does not tick and the canonical track PCM is unchanged until the consumer calls `setNesFrameCounterMode(0 or 1)`. Four private stub methods (`tickAllNesEnvelopes`, `tickAllNesLinearCounters`, `tickAllNesLengthCounters`, `tickAllNesSweepUnits`) plus a private per-sample `tickNesFrameCounter(apuCyclesPerSample)` wired into both the float and Q15 hot paths. Future Hitos (M4 length counter, M5 linear counter, M6 sweep, M7 envelope) fill in the stubs.
 - **Tests (UNIT_TEST)**: 8 new Hito 2 M3 tests in `test_apu_core.cpp` covering initial state, mode-set reset, quarter/half clock rates (240/120 Hz mode 0), mode-1 no-IRQ, IRQ rate (60 Hz), IRQ inhibit, and APU-cycle timing at 22050 Hz. 7 new test-only accessors expose the internal counters under `#if defined(UNIT_TEST)`.

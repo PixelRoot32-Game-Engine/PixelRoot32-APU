@@ -51,7 +51,7 @@ Consumers with dynamic presets must guarantee address stability (the Tool Suite 
 
 Float chain: `Σ(voice · MIXER_SCALE=0.4) · masterVolume → soft-clip 1/(1+|x|·0.5) → HPF R=0.995 → ±32767 → bitcrush`. The Q15 path replicates the same chain with the pre-adjusted LUT and master volume applied **before** the compressor (order parity since v1.0.0).
 
-**Loudness parity** (unreleased; ships in the next major, 2.0.0): both paths render at the same level. The Q15 accumulator carries the **raw** channel sum and `MIXER_SCALE` is applied exactly once downstream — by `audio_mixer_lut`, whose curve is defined over `x = sum · 1.6 / 131072` and therefore bakes the 0.4 in, or explicitly as `(sum · 13107) >> 15` for the computed soft-clip modes. Do **not** pre-scale channels before summation: that applies 0.4 twice and puts the compressor knee in the wrong place.
+**Loudness parity** (since 2.0.0): both paths render at the same level. The Q15 accumulator carries the **raw** channel sum and `MIXER_SCALE` is applied exactly once downstream — by `audio_mixer_lut`, whose curve is defined over `x = sum · 1.6 / 131072` and therefore bakes the 0.4 in, or explicitly as `(sum · 13107) >> 15` for the computed soft-clip modes. Do **not** pre-scale channels before summation: that applies 0.4 twice and puts the compressor knee in the wrong place.
 
 Previously the Q15 path was ~0.225× the float level — the double `MIXER_SCALE` plus a fixed −6 dB pad (`>>1`, Q15→Q14) with no float equivalent. Both are gone; consumers on FPU-less targets should re-check their master volume. See the CHANGELOG entry for Hito 5 M12.
 
