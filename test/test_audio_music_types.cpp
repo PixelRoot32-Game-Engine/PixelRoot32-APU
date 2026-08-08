@@ -185,7 +185,7 @@ void test_instr_pulse_lead_values(void) {
     TEST_ASSERT_EQUAL_FLOAT(5.0f, INSTR_PULSE_LEAD.lfoFrequency);
     TEST_ASSERT_EQUAL_FLOAT(0.025f, INSTR_PULSE_LEAD.lfoDepth);
     TEST_ASSERT_EQUAL_FLOAT(0.15f, INSTR_PULSE_LEAD.lfoDelay);
-    TEST_ASSERT_FALSE(INSTR_PULSE_LEAD.noiseShortMode);
+    TEST_ASSERT_FALSE(INSTR_PULSE_LEAD.noiseLfsrShort);
     TEST_ASSERT_EQUAL_FLOAT(0.0f, INSTR_PULSE_LEAD.dutySweep);
     TEST_ASSERT_EQUAL_FLOAT(0.0f, INSTR_PULSE_LEAD.pitchSweepEndHz);
     TEST_ASSERT_EQUAL_FLOAT(0.0f, INSTR_PULSE_LEAD.pitchSweepDurationSec);
@@ -269,7 +269,7 @@ void test_instr_kick_values(void) {
     TEST_ASSERT_EQUAL_FLOAT(0.10f, INSTR_KICK.decayTime);
     TEST_ASSERT_EQUAL_FLOAT(0.00f, INSTR_KICK.sustainLevel);
     TEST_ASSERT_EQUAL(LfoTarget::NONE, INSTR_KICK.lfoTarget);
-    TEST_ASSERT_FALSE(INSTR_KICK.noiseShortMode);
+    TEST_ASSERT_FALSE(INSTR_KICK.noiseLfsrShort);
 }
 
 void test_instr_snare_values(void) {
@@ -281,7 +281,7 @@ void test_instr_snare_values(void) {
     // LFSR clock = brighter snare crack.
     TEST_ASSERT_EQUAL(15, INSTR_SNARE.noisePeriod);
     TEST_ASSERT_EQUAL_FLOAT(0.08f, INSTR_SNARE.decayTime);
-    TEST_ASSERT_TRUE(INSTR_SNARE.noiseShortMode);            // metallic timbre
+    TEST_ASSERT_TRUE(INSTR_SNARE.noiseLfsrShort);            // metallic timbre
 }
 
 void test_instr_hihat_values(void) {
@@ -292,7 +292,7 @@ void test_instr_hihat_values(void) {
     TEST_ASSERT_EQUAL(12, INSTR_HIHAT.noisePeriod);
     TEST_ASSERT_EQUAL_FLOAT(0.0005f, INSTR_HIHAT.attackTime);
     TEST_ASSERT_EQUAL_FLOAT(0.015f, INSTR_HIHAT.decayTime);
-    TEST_ASSERT_TRUE(INSTR_HIHAT.noiseShortMode);            // metallic timbre
+    TEST_ASSERT_TRUE(INSTR_HIHAT.noiseLfsrShort);            // metallic timbre
 }
 
 // ============================================================================
@@ -394,6 +394,55 @@ void test_music_track_with_voices(void) {
     TEST_ASSERT_EQUAL(&percTrack, percussionOnlyTrack.percussion);
 }
 
+// ============================================================================
+// noiseLfsrShort / noiseShortMode alias — Hito 0 (M15) rename coverage
+// ============================================================================
+
+// Verifies that the InstrumentPreset struct exposes BOTH `noiseLfsrShort`
+// (the new canonical name) and `noiseShortMode` (the deprecated alias) and
+// that the built-in percussion presets keep them in sync. The two fields are
+// independent C++ storage; the APU init path (ApuCore::initVoiceFromEvent)
+// is the single point that copies the canonical value into the deprecated
+// alias on AudioChannel.
+void test_noise_lfsr_short_alias_consistency(void)
+{
+    // Built-in percussion presets must carry the same value in both fields
+    // (literal initialization in AudioMusicTypes.h).
+    TEST_ASSERT_TRUE(INSTR_SNARE.noiseLfsrShort);
+    TEST_ASSERT_TRUE(INSTR_SNARE.noiseShortMode);
+    TEST_ASSERT_TRUE(INSTR_HIHAT.noiseLfsrShort);
+    TEST_ASSERT_TRUE(INSTR_HIHAT.noiseShortMode);
+
+    // Non-percussion presets: both must be false and equal.
+    TEST_ASSERT_FALSE(INSTR_PULSE_LEAD.noiseLfsrShort);
+    TEST_ASSERT_FALSE(INSTR_PULSE_LEAD.noiseShortMode);
+    TEST_ASSERT_EQUAL(INSTR_PULSE_LEAD.noiseLfsrShort,
+                      INSTR_PULSE_LEAD.noiseShortMode);
+
+    // User-written InstrumentPreset: the two fields are independent storage
+    // (no auto-sync at the struct level). Writing only one of them must
+    // leave the other at its previous value. This documents the design:
+    // the alias is kept in sync only via ApuCore::initVoiceFromEvent.
+    InstrumentPreset custom{};
+    custom.noiseLfsrShort = true;
+    TEST_ASSERT_TRUE(custom.noiseLfsrShort);
+    TEST_ASSERT_FALSE(custom.noiseShortMode); // not auto-synced in the struct
+
+    custom.noiseLfsrShort = false;
+    custom.noiseShortMode = true;
+    TEST_ASSERT_FALSE(custom.noiseLfsrShort);
+    TEST_ASSERT_TRUE(custom.noiseShortMode);
+}
+
+// Verifies the default value (false) of both the new and deprecated fields.
+void test_noise_lfsr_short_default_value(void)
+{
+    InstrumentPreset p{};
+    TEST_ASSERT_FALSE(p.noiseLfsrShort);
+    TEST_ASSERT_FALSE(p.noiseShortMode);
+    TEST_ASSERT_EQUAL(p.noiseLfsrShort, p.noiseShortMode);
+}
+
 int main(int argc, char **argv) {
     UNITY_BEGIN();
     
@@ -441,6 +490,10 @@ int main(int argc, char **argv) {
     RUN_TEST(test_music_note_struct_fields);
     RUN_TEST(test_music_track_struct_fields);
     RUN_TEST(test_music_track_with_voices);
-    
+
+    // Hito 0 (M15) rename coverage
+    RUN_TEST(test_noise_lfsr_short_alias_consistency);
+    RUN_TEST(test_noise_lfsr_short_default_value);
+
     return UNITY_END();
 }

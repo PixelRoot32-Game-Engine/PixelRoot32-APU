@@ -375,6 +375,7 @@ void test_apu_mirror_envelope_attack_rise(void)
         0.0f,
         0.0f,
         false,
+        false,
         0.0f,
     };
 
@@ -408,7 +409,9 @@ void test_apu_mirror_envelope_attack_rise(void)
 
 void test_apu_mirror_lfsr_15bit_sequence(void)
 {
-    uint16_t state = 0x4000u;
+    // Hito 1 M9: the APU seeds the 15-bit LFSR to 0x7FFF (all-1s) on every
+    // voice trigger, matching the NES APU state after a write to $400F.
+    uint16_t state = 0x7FFFu;
     uint16_t expected[32] = {};
     for (int i = 0; i < 32; ++i) {
         expected[i] = static_cast<uint16_t>(state & 1u);
@@ -456,7 +459,24 @@ void test_apu_mirror_lfsr_short_mode_differs(void)
             break;
         }
     }
-    TEST_ASSERT_TRUE_MESSAGE(differs, "noiseShortMode tap must diverge from normal LFSR");
+    TEST_ASSERT_TRUE_MESSAGE(differs, "noiseLfsrShort tap must diverge from normal LFSR");
+
+    // Hito 0 (M15) rename coverage: an AudioChannel must expose both the new
+    // canonical field `noiseLfsrShort` and the deprecated alias
+    // `noiseShortMode`. After `reset()` both default to false (symmetric
+    // reset). Writing the new field reads back true, and the alias is read
+    // independently at the struct level (sync happens in
+    // ApuCore::initVoiceFromEvent, not in the struct).
+    AudioChannel ch{};
+    ch.reset();
+    TEST_ASSERT_FALSE(ch.noiseLfsrShort);
+    TEST_ASSERT_FALSE(ch.noiseShortMode);
+
+    ch.noiseLfsrShort = true;
+    TEST_ASSERT_TRUE(ch.noiseLfsrShort);
+    // After a full init via ApuCore, both fields would be in sync; the
+    // struct itself does not auto-propagate, by design.
+    TEST_ASSERT_FALSE(ch.noiseShortMode);
 }
 
 void test_apu_mirror_music_gate_four_beats_at_120_bpm(void)
@@ -1055,7 +1075,8 @@ void test_apu_mirror_melodic_zero_release_unchanged(void)
         0.0f,     // lfoFrequency
         0.0f,     // lfoDepth
         0.0f,     // lfoDelay
-        false,    // noiseShortMode
+        false,    // noiseLfsrShort
+        false,    // noiseShortMode (deprecated alias)
         0.0f,     // dutySweep
     };
     static const MusicNote kNote[] = {

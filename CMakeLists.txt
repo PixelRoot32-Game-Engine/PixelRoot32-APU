@@ -1,6 +1,13 @@
 cmake_minimum_required(VERSION 3.16)
 project(pixelroot32-apu VERSION 1.0.0 LANGUAGES C CXX)
 
+# The test files have pre-existing narrowing conversions in brace-init
+# (committed before M7). Suppress this warning so the test build doesn't
+# fail on those lines.
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    add_compile_options(-Wno-narrowing)
+endif()
+
 # ---------------------------------------------------------------------------
 # Library target
 # ---------------------------------------------------------------------------

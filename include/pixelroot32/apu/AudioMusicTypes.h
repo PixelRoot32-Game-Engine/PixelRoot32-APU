@@ -149,12 +149,39 @@ struct InstrumentPreset {
     float lfoDelay = 0.0f;         // seconds before LFO starts
 
     // Waveform Refinements
-    bool noiseShortMode = false;   // For NOISE: true = metallic timbre (93-step LFSR)
+    // NES register $400E bit 4 (T) maps INVERTED to this flag:
+    //   noiseLfsrShort == true  <->  NES T = 0 (noisy/metallic, 93-step, tap bit 6)
+    //   noiseLfsrShort == false <->  NES T = 1 (tone mode, 32767-step, tap bit 1)
+    // Short alias retained for ABI stability; will be removed in a future major.
+    bool noiseLfsrShort = false;   // For NOISE: true = metallic timbre (93-step LFSR)
+    /** @deprecated Use noiseLfsrShort. Will be removed in a future major version. */
+    bool noiseShortMode = false;
     float dutySweep = 0.0f;        // For PULSE: duty cycle change per second
 
     // Optional pitch sweep (materialized to AudioEvent.sweep* when both > 0)
     float pitchSweepEndHz = 0.0f;       // End frequency in Hz; 0 = inactive
     float pitchSweepDurationSec = 0.0f; // Sweep duration in seconds; 0 = inactive
+
+    /**
+     * Hito 2 M17. When true, `initVoiceFromEvent` resets the voice's NES
+     * sub-unit fields to the canonical silent state from the nesdev
+     * APU_basics `@regs` array before the note starts, so NES mode always
+     * begins from a known point instead of inheriting whatever the previous
+     * note left on that slot.
+     *
+     * It is a clean slate, NOT an enable: the per-voice opt-in flags of the
+     * length counter, envelope, sweep and linear counter are all left off.
+     * Arm the ones you want afterwards with the `setVoiceNes*` setters or
+     * `AudioCommandType::TRIGGER_NES_LENGTH`.
+     *
+     * Only PULSE, TRIANGLE and NOISE are affected; SINE and SAW have no NES
+     * counterpart and are left untouched. Default false, so the rendered PCM
+     * is unchanged for every existing preset.
+     *
+     * Keep this the LAST member: the shipped `INSTR_*` presets and the test
+     * literals use positional aggregate initialization.
+     */
+    bool nesAccurate = false;
 };
 
 constexpr InstrumentPreset INSTR_PULSE_LEAD{
@@ -171,7 +198,8 @@ constexpr InstrumentPreset INSTR_PULSE_LEAD{
     5.0f,     // lfoFrequency (Hz)
     0.025f,   // lfoDepth    – slightly more vibrato
     0.15f,    // lfoDelay    – delayed vibrato for natural feel
-    false,    // noiseShortMode (unused for pulse)
+    false,    // noiseLfsrShort (unused for pulse)
+    false,    // noiseShortMode (deprecated alias)
     0.0f,      // dutySweep   – no sweep by default
     0.0f,     // pitchSweepEndHz
     0.0f      // pitchSweepDurationSec
@@ -191,7 +219,8 @@ constexpr InstrumentPreset INSTR_TRIANGLE_LEAD{
     4.0f,     // lfoFrequency (Hz) – gentle vibrato
     0.020f,   // lfoDepth – subtle vibrato
     0.20f,    // lfoDelay – delayed vibrato
-    false,    // noiseShortMode (unused)
+    false,    // noiseLfsrShort (unused)
+    false,    // noiseShortMode (deprecated alias)
     0.0f,      // dutySweep
     0.0f,     // pitchSweepEndHz
     0.0f      // pitchSweepDurationSec
@@ -211,7 +240,8 @@ constexpr InstrumentPreset INSTR_TRIANGLE_PAD{
     2.5f,     // lfoFrequency (Hz) – slow modulation
     0.15f,    // lfoDepth – subtle volume movement
     0.50f,    // lfoDelay
-    false,    // noiseShortMode
+    false,    // noiseLfsrShort
+    false,    // noiseShortMode (deprecated alias)
     0.0f,      // dutySweep
     0.0f,     // pitchSweepEndHz
     0.0f      // pitchSweepDurationSec
@@ -231,7 +261,8 @@ constexpr InstrumentPreset INSTR_PULSE_PAD{
     3.0f,     // lfoFrequency (Hz)
     0.035f,   // lfoDepth – noticeable pitch modulation
     0.30f,    // lfoDelay
-    false,    // noiseShortMode
+    false,    // noiseLfsrShort
+    false,    // noiseShortMode (deprecated alias)
     0.08f,     // dutySweep – gentle PWM movement for evolving texture
     0.0f,     // pitchSweepEndHz
     0.0f      // pitchSweepDurationSec
@@ -251,7 +282,8 @@ constexpr InstrumentPreset INSTR_PULSE_HARMONY{
     6.0f,     // lfoFrequency (Hz)
     0.30f,    // lfoDepth    – 30 % volume modulation
     0.0f,     // lfoDelay
-    false,    // noiseShortMode
+    false,    // noiseLfsrShort
+    false,    // noiseShortMode (deprecated alias)
     0.15f,     // dutySweep   – more pronounced PWM-like movement
     0.0f,     // pitchSweepEndHz
     0.0f      // pitchSweepDurationSec
@@ -271,7 +303,8 @@ constexpr InstrumentPreset INSTR_TRIANGLE_BASS{
     0.0f,     // lfoFrequency
     0.0f,     // lfoDepth
     0.0f,     // lfoDelay
-    false,    // noiseShortMode
+    false,    // noiseLfsrShort
+    false,    // noiseShortMode (deprecated alias)
     0.0f,      // dutySweep
     0.0f,     // pitchSweepEndHz
     0.0f      // pitchSweepDurationSec
@@ -291,7 +324,8 @@ constexpr InstrumentPreset INSTR_PULSE_BASS{
     0.0f,     // lfoFrequency
     0.0f,     // lfoDepth
     0.0f,     // lfoDelay
-    false,    // noiseShortMode
+    false,    // noiseLfsrShort
+    false,    // noiseShortMode (deprecated alias)
     0.0f,      // dutySweep
     0.0f,     // pitchSweepEndHz
     0.0f      // pitchSweepDurationSec
@@ -311,7 +345,8 @@ constexpr InstrumentPreset INSTR_KICK{
     0.0f,
     0.0f,
     0.0f,
-    false,    // noiseShortMode – kick is not metallic
+    false,    // noiseLfsrShort – kick is not metallic
+    false,    // noiseShortMode (deprecated alias)
     0.0f,      // dutySweep
     0.0f,     // pitchSweepEndHz
     0.0f      // pitchSweepDurationSec
@@ -331,7 +366,8 @@ constexpr InstrumentPreset INSTR_SNARE{
     0.0f,
     0.0f,
     0.0f,
-    true,     // noiseShortMode – metallic 93‑step LFSR for snare
+    true,     // noiseLfsrShort – metallic 93‑step LFSR for snare
+    true,     // noiseShortMode (deprecated alias)
     0.0f,      // dutySweep
     0.0f,     // pitchSweepEndHz
     0.0f      // pitchSweepDurationSec
@@ -351,7 +387,8 @@ constexpr InstrumentPreset INSTR_HIHAT{
     0.0f,
     0.0f,
     0.0f,
-    true,     // noiseShortMode – metallic timbre for closed hat
+    true,     // noiseLfsrShort – metallic timbre for closed hat
+    true,     // noiseShortMode (deprecated alias)
     0.0f,      // dutySweep
     0.0f,     // pitchSweepEndHz
     0.0f      // pitchSweepDurationSec
