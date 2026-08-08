@@ -937,6 +937,16 @@ namespace pixelroot32::audio {
         }
         return voices[slot].phase;
     }
+#endif  // UNIT_TEST — the test-only accessors end here.
+
+    // =====================================================================
+    // NES sub-units (Hito 2 M3-M7). PRODUCTION CODE — everything from here
+    // to the end of tickNesFrameCounter is public API and MUST stay outside
+    // the UNIT_TEST guard. It once sat inside it, which compiled fine in
+    // every suite (they all recompile this file with UNIT_TEST=1) while the
+    // shipped library lost the symbols and no consumer could link. See
+    // test_library_link, which exists to catch exactly that.
+    // =====================================================================
 
     // -- NES frame counter (Hito 2 M3) -----------------------------------
     void ApuCore::setNesFrameCounterMode(int mode) {
@@ -1037,7 +1047,9 @@ namespace pixelroot32::audio {
             env.output = env.constVolume ? env.volume : env.decayLevel;
         }
 #if defined(UNIT_TEST)
+#if defined(UNIT_TEST)
         ++nesQuarterTickCountForTesting_;
+#endif
 #endif
     }
 
@@ -1435,7 +1447,9 @@ namespace pixelroot32::audio {
                         if (!frameCounter_.irqFlag) {
                             frameCounter_.irqFlag = true;
                         }
+#if defined(UNIT_TEST)
                         ++nesIrqSetCountForTesting_;
+#endif
                     }
                 }
                 frameCounter_.apuCycles -= steps[maxStep];
@@ -1444,6 +1458,8 @@ namespace pixelroot32::audio {
         }
     }
 
+#if defined(UNIT_TEST)
+    // Test-only accessors resume here.
     void ApuCore::resetNesFrameCounterForTesting() {
         frameCounter_.apuCycles = 0.0;
         frameCounter_.currentStep = 0;
