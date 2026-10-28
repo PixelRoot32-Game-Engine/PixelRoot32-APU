@@ -6,6 +6,17 @@
 /// committed render of the canonical track, and `Legacy` keeps its own two
 /// references untouched.
 ///
+/// Two scenes are pinned, not one. The canonical track is PULSE-only, so it
+/// cannot observe E2's band-limited SAW (S4): `Hybrid`'s canonical fixture is
+/// byte-identical before and after the mipmap landed, and the unit suite that
+/// proves the read re-derives it. The second scene
+/// (`apu_wavetable_track.h`) renders four SAW notes — 55 Hz, 220 Hz gliding
+/// through a mipmap level boundary, 880 Hz and 1 760 Hz — through the same
+/// command API, so a committed file now fails end to end when the level
+/// selection, the crossfade or the table read changes. `Nes` keeps the ideal
+/// ramp, so its wavetable fixture is the reference the `Hybrid` one is read
+/// against, not a second copy of it.
+///
 /// Both profiles render the integer core by definition (`profileUsesIntegerCore`),
 /// so the two targets that compile this source differ only in the core
 /// configuration: an FPU build with the float body compiled out, and a build
@@ -16,6 +27,7 @@
 /// `test_apu_profile_golden_no_fpu` in CMakeLists.txt.
 
 #include "golden/apu_mirror_canonical_track.h"
+#include "golden/apu_wavetable_track.h"
 #include "pixelroot32/apu/ApuCore.h"
 #include "unity.h"
 
@@ -30,21 +42,30 @@
 using namespace pixelroot32::audio;
 
 /// @brief One committed reference: the file, the profile that must reproduce
-/// it, and the label used in the failure message.
+/// it, the label used in the failure message, and the scene renderer that
+/// defines it.
 struct ProfileFixture {
     const char* file;
     SoundProfile profile;
     const char* label;
+    void (*render)(ApuCore&, int16_t*, int);
 };
 
-/// @brief The two profile goldens of E1, one per audible profile (S7).
+/// @brief The E1 profile goldens, plus the E2 wavetable goldens that pin the
+/// band-limited SAW the canonical track cannot reach.
 static const ProfileFixture kFixtures[] = {
-    {"apu_nes_canonical_s16le_44100.pcm", SoundProfile::Nes, "Nes"},
-    {"apu_hybrid_canonical_s16le_44100.pcm", SoundProfile::Hybrid, "Hybrid"},
+    {"apu_nes_canonical_s16le_44100.pcm", SoundProfile::Nes, "Nes",
+     apu_golden::render_canonical},
+    {"apu_hybrid_canonical_s16le_44100.pcm", SoundProfile::Hybrid, "Hybrid",
+     apu_golden::render_canonical},
+    {"apu_nes_wavetable_s16le_44100.pcm", SoundProfile::Nes, "Nes wavetable",
+     apu_golden::render_wavetable},
+    {"apu_hybrid_wavetable_s16le_44100.pcm", SoundProfile::Hybrid, "Hybrid wavetable",
+     apu_golden::render_wavetable},
 };
 
-/// @brief S16 samples per fixture; both profiles render the same canonical
-/// track, so the sample count is shared with the `Legacy` fixtures.
+/// @brief S16 samples per fixture; both scenes render the same length, so the
+/// sample count is shared with the `Legacy` fixtures.
 static constexpr int kSampleCount = apu_golden::kGoldenSampleCount;
 
 // The fixture format is fixed by S9 (raw S16LE); if the sample type or the
@@ -87,13 +108,13 @@ static std::vector<uint8_t> read_fixture_bytes(const std::string& name)
     return buf;
 }
 
-/// @brief Renders the canonical track under one profile and compares it with
-/// that profile's committed fixture.
+/// @brief Renders one fixture's scene under its profile and compares the result
+/// with that profile's committed file.
 ///
 /// A divergence is reported at the first differing sample with both values,
 /// because "the golden moved" is only actionable when the reader can see the
 /// sample where the render left the reference.
-/// @param fixture Reference, profile and label to assert.
+/// @param fixture Reference, profile, scene and label to assert.
 static void assert_profile_golden(const ProfileFixture& fixture)
 {
     const auto bytes = read_fixture_bytes(fixture.file);
@@ -114,9 +135,9 @@ static void assert_profile_golden(const ProfileFixture& fixture)
     ApuCore apu;
     apu.init(apu_golden::kSampleRate);
     // After init() and before rendering: the profile is configuration, so it
-    // survives the reset()/init() that render_canonical performs (S4).
+    // survives the reset()/init() the scene renderer performs (S4).
     apu.setSoundProfile(fixture.profile);
-    apu_golden::render_canonical(apu, actual, kSampleCount);
+    fixture.render(apu, actual, kSampleCount);
 
     const int cmp = std::memcmp(actual, bytes.data(), expected_bytes);
     if (cmp != 0) {
@@ -127,9 +148,10 @@ static void assert_profile_golden(const ProfileFixture& fixture)
         }
         char message[224] = {};
         std::snprintf(message, sizeof(message),
-                      "%s bytes diverged from its canonical fixture at sample "
-                      "%d: actual %d, expected %d",
-                      fixture.label, first, static_cast<int>(actual[first]),
+                      "%s bytes diverged from %s at sample %d: actual %d, "
+                      "expected %d",
+                      fixture.label, fixture.file, first,
+                      static_cast<int>(actual[first]),
                       static_cast<int>(expected[first]));
         TEST_FAIL_MESSAGE(message);
     }
@@ -148,10 +170,24 @@ void test_apu_profile_golden_hybrid(void)
     assert_profile_golden(kFixtures[1]);
 }
 
+/// @brief S4/S9: `Nes` renders the wavetable scene with the ideal ramp.
+void test_apu_profile_golden_nes_wavetable(void)
+{
+    assert_profile_golden(kFixtures[2]);
+}
+
+/// @brief S4/S6/S9: `Hybrid` renders the wavetable scene from the mipmap.
+void test_apu_profile_golden_hybrid_wavetable(void)
+{
+    assert_profile_golden(kFixtures[3]);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
     RUN_TEST(test_apu_profile_golden_nes);
     RUN_TEST(test_apu_profile_golden_hybrid);
+    RUN_TEST(test_apu_profile_golden_nes_wavetable);
+    RUN_TEST(test_apu_profile_golden_hybrid_wavetable);
     return UNITY_END();
 }

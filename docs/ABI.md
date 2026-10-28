@@ -183,25 +183,29 @@ Measured 2026-10-28 on the sound-profile branch (`cmake -S . -B build -G "MinGW 
 | `test_q15_smoke` | 15 | Integer/Q15 path smoke coverage |
 | `test_apu_integer_golden` | 1 | The integer core against the `Legacy` integer golden (FPU build with the float body off) |
 | `test_apu_integer_golden_no_fpu` | 1 | The same golden from a build with no FPU at all |
-| `test_apu_profile_golden` | 2 | `Nes` and `Hybrid` against their own goldens (FPU build with the float body off) |
-| `test_apu_profile_golden_no_fpu` | 2 | The same two goldens from a build with no FPU at all |
+| `test_apu_profile_golden` | 4 | `Nes` and `Hybrid` against their canonical and wavetable goldens (FPU build with the float body off) |
+| `test_apu_profile_golden_no_fpu` | 4 | The same four goldens from a build with no FPU at all |
 | `test_library_link` | 4 | Public symbols exist in the shipped artifact (links, no `UNIT_TEST`) |
-| **Total** | **559** | 0 failures, 0 ignored, exit code 0 in all fifteen |
+| **Total** | **563** | 0 failures, 0 ignored, exit code 0 in all fifteen |
 
 The five continuous-duty cases added by the full-scale fix (`test_pulse_duty_full_scale_*`, `test_pulse_duty_zero_never_goes_positive`, `test_pulse_duty_interior_value_unchanged`) live in `test/test_apu_core.cpp`, so both core targets run them; that is the 205 → 210 step on the two rows above.
 
 ### 9.2 Golden PCM
 
-Four immutable references: two for `Legacy` — one per render route, never regenerated — and one per audible profile. All are raw S16LE, no header, 22 050 samples at 44 100 Hz from `test/golden/apu_mirror_canonical_track.h`.
+Six immutable references: two for `Legacy` — one per render route, never regenerated — and two per audible profile, one for each committed scene. All are raw S16LE, no header, 22 050 samples at 44 100 Hz, rendered from `test/golden/apu_mirror_canonical_track.h` (canonical scene) or `test/golden/apu_wavetable_track.h` (wavetable scene).
 
 | Reference | Consumed by | SHA-256 |
 |---|---|---|
 | `apu_mirror_canonical_s16le_44100.pcm` | `test_apu_mirror` | `7FF568A5A163A5E11E7A86DFCC0DAFEBCE9C3EE7088C88C6DE9C82293CC15DE9` |
 | `apu_integer_core_canonical_s16le_44100.pcm` | `test_apu_integer_golden`, `test_apu_integer_golden_no_fpu` | `F59501D66B522CC26D7F1D48432FAF0FEF9C8ABDACA1B68A09C67D574EF3902D` |
-| `apu_nes_canonical_s16le_44100.pcm` | `test_apu_profile_golden`, `test_apu_profile_golden_no_fpu` | `225CE203A7BF7880BC59D915941614DF1DE82260883975F0126A221E563B18B8` |
-| `apu_hybrid_canonical_s16le_44100.pcm` | `test_apu_profile_golden`, `test_apu_profile_golden_no_fpu` | `7E77507E57E6CC934ACC22CB30F86D6AD3EA044ED1C1AF2F7CFE1B89A4B72343` |
+| `apu_nes_canonical_s16le_44100.pcm` | `test_apu_profile_golden`, `test_apu_profile_golden_no_fpu` | `645DE5C756B74A52F4CDBCE0D186F4B2DE79EAF94255D1A3C54B45B77E42AA76` |
+| `apu_hybrid_canonical_s16le_44100.pcm` | `test_apu_profile_golden`, `test_apu_profile_golden_no_fpu` | `163F65E2B511AD81F7489D9937309532472A91573398D1805EC300573C8B7708` |
+| `apu_nes_wavetable_s16le_44100.pcm` | `test_apu_profile_golden`, `test_apu_profile_golden_no_fpu` | `A4012158A45AA076C5C8951E79334F223A18C9F7A5CF557D99B4ED5AE23890CC` |
+| `apu_hybrid_wavetable_s16le_44100.pcm` | `test_apu_profile_golden`, `test_apu_profile_golden_no_fpu` | `C3FDEDCCD33940A1CDD02566FBD7C217514B1E90B3163B44E28F9F6AA0B8A419` |
 
-One golden per affected profile, and no more (S7): E1 is the change that makes `Nes` and `Hybrid` audible, so each needs its own reference and neither may keep sharing `Legacy`'s. The two new files were rendered by `apu_golden_gen_nofpu --profile <nes|hybrid>` and independently reproduced byte for byte by `apu_golden_gen` (FPU build) and `apu_golden_gen_integer` (FPU build with the float body off): both profiles run the integer core, so the build cannot be allowed to matter.
+One golden per affected profile, and no more (S7): E1 is the change that makes `Nes` and `Hybrid` audible, so each needs its own reference and neither may keep sharing `Legacy`'s. The two canonical profile files were rendered by `apu_golden_gen_nofpu --profile <nes|hybrid>` and independently reproduced byte for byte by `apu_golden_gen` (FPU build) and `apu_golden_gen_integer` (FPU build with the float body off): both profiles run the integer core, so the build cannot be allowed to matter.
+
+The wavetable pair exists because the canonical track is PULSE-only and cannot observe E2's band-limited SAW (S4): `apu_hybrid_canonical_s16le_44100.pcm` is byte-identical before and after the mipmap landed. `apu_golden_gen_nofpu --scene wavetable --profile <nes|hybrid>` renders four SAW notes — 55 Hz, 220 Hz gliding through a mipmap level boundary, 880 Hz and 1 760 Hz — and the same three builds reproduce both files byte for byte. `Nes` keeps the ideal ramp, so its wavetable file is the reference the `Hybrid` one is read against; the two differ on 18 139 of 22 050 samples (max 13 181 LSB, −17.81 dBFS RMS difference), which is the evidence that the scene reaches the table read instead of describing a ramp twice.
 
 The integer fixture is written by `python tools/golden_gen/run.py --write`, which builds three generator binaries and refuses to proceed unless the default build still reproduces the float fixture byte-for-byte and the two integer builds agree with each other. Regenerate a fixture **only** when the output changes intentionally and the change is documented in the CHANGELOG.
 
