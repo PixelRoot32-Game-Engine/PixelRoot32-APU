@@ -169,13 +169,13 @@ namespace pixelroot32::audio {
      * reproducible, not a rounding accident.
      *
      * The input is the note's clamped `dutyCycle` (float) and not
-     * `dutyCycleQ32`, because the Q32 mirror is `(uint32_t)(duty * 2^32)` and
-     * therefore overflows at exactly `duty == 1.0` (2^32 does not fit in
-     * `uint32_t`) — a pre-existing property of `set_pulse_duty` that the
-     * continuous generator has always carried. The selector is armed instead of
-     * that comparison here, so a 100 % note still means "the 75 % step" rather
-     * than "the wrapped mirror", and snapping from the float keeps the two from
-     * disagreeing.
+     * `dutyCycleQ32`. The float is the value the caller declared, and this
+     * selector is about the declared duty, not about the integer generator's
+     * mirror of it: the mirror saturates at `duty == 1.0` (it used to wrap to 0,
+     * which the full-scale fix removed), so reading it here would fold "100 %"
+     * into "full scale" and turn a declared 100 % note into the 75 % step by a
+     * route nobody asked for. Snapping from the declared float keeps the two
+     * from disagreeing, whatever the mirror does.
      *
      * `Legacy` answers the 255 sentinel — "keep the continuous generator" — for
      * every duty. Every other value answers the nearest step, i.e. the
