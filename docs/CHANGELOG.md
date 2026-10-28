@@ -161,8 +161,9 @@ first.
     because a board without an FPU renders `Legacy` through the integer core
     this phase rewrote. On the C3 at 32 000 Hz with eight voices the profiles
     now measure 50.1 % (`Nes`) and 50.9 % (`Hybrid`) of the block against the
-    half-block rule that decides whether a target keeps 32 kHz: that rate should
-    be treated as 22 050-Hz-only for those profiles on that board.
+    half-block rule that decides whether a target keeps 32 kHz, so **32 000 Hz
+    is withdrawn for those two profiles on that board** while `Legacy` keeps it
+    at 48.7 %.
     `docs/ABI.md` §9.7 and §9.8 carry the tables, the procedure needed to reach
     the C3 at all, the two optimisations that were measured and rejected, and
     what the last one cost in alias margin (18.52 → 13.71 dB).
@@ -196,7 +197,8 @@ first.
 
 ### Migration
 
-- Consumers on `PR32_APU_HAS_FPU=0` targets that calibrated levels or wrote PCM references against the integer path must regenerate them: the path no longer leaves a −199 DC offset behind a silenced voice.
+- On `esp32-c3-devkitm-1`, `Nes` and `Hybrid` are **22 050 Hz only**: at 32 000 Hz with eight voices they measure 50.1 % and 50.9 % of the block, over the half-block rule that decides whether a target keeps that rate. `Legacy` keeps both rates (48.7 %). The library renders at the rate it is given and has no per-target policy, so this binds wherever the rate is configured.
+- Consumers on `PR32_APU_HAS_FPU=0` targets that calibrated levels or wrote PCM references against the integer path must regenerate them: the path no longer leaves a -199 DC offset behind a silenced voice.
 - Consumers that sized a buffer from `AUDIO_COMMAND_QUEUE_CAPACITY` should read it rather than hard-coding 128; the default is now 64, and more than 63 outstanding commands between consumer passes will be dropped.
 - Consumers that selected `Nes` or `Hybrid` while this release sat unreleased should re-check their levels: the mix balance changed on purpose (a triangle is +1.07 dB against a pulse, noise −3.65 dB), `Hybrid` envelopes now decay exponentially, PULSE duty snaps to the nearest NES step, and noise percussion follows the NES period LUT instead of the preset's own `noisePeriod`. No released version ever exposed those profiles as aliases, so there is nothing to migrate from.
 - Consumers already using `Nes`/`Hybrid` must re-check their levels **again** after E2: the output chain takes the canonical track from -19.7/-20.7 dBFS to -23.0/-24.0 dBFS RMS while nearly doubling the peak, because the 440 Hz high-pass removes low-mid energy and the two cascaded high-passes spike on every edge. E2 ships a fixed per-profile trim matched on crest-weighted loudness (0.75 x RMS + 0.25 x peak) to the `Legacy` anchor, so the profiles end up 2.2/2.4 dB BELOW `Legacy` in RMS while level with it on the weighted figure - deliberately, because an earlier RMS-matched trim (+3.28/+4.31 dB) measured equal and sounded louder on hardware. Peak growth is reduced but not gone: `Nes`/`Hybrid` peak at ~37 %/41 % of full scale on the canonical track and ~52 %/51 % on a dense mix, against `Legacy`'s 18 %/36 %. Anything calibrated against a `Nes`/`Hybrid` render before this release - including recorded references and loudness budgets - must be re-measured, not inherited.
