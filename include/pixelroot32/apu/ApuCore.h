@@ -1364,8 +1364,9 @@ namespace pixelroot32::audio {
          * Called by `init` (a configured corner is in Hz, so it follows the
          * rate), by `setSoundProfile` (the profile decides whether the chain
          * is installed) and by `setHpfCutoffHz` (the caller override flips it
-         * off). Never called per sample or per block: the sample loop only
-         * reads `outputFilterActive_` and the pre-computed Q15 coefficients.
+         * off). Never called per sample or per block: the render loop copies
+         * `outputFilterActive_` and the pre-computed Q15 coefficients into its
+         * block-local stage snapshot once, and the sample loop only reads that.
          *
          * The LPF is computed with the RBJ low-pass at Q = 1/sqrt(2) and its
          * corner is `min(14000 Hz, 0.45 * fs)`, engaged only when
@@ -1387,32 +1388,101 @@ namespace pixelroot32::audio {
         void resetOutputFilterState();
 
         /**
+         * @struct OutputStageStateQ15
+         * @brief Block-local snapshot of the integer output stage.
+         *
+         * The stage is the only reader and writer of its own state, and it runs
+         * on every sample, so the render loop copies it out of the class once
+         * per block and writes it back once. Read through `this`, the ten
+         * recursion words plus the coefficients and the three flags cost twenty
+         * member loads and stores per sample for six multiplies of arithmetic;
+         * held in a local, the compiler is free to keep the words that stay
+         * live across iterations in registers.
+         *
+         * It holds no new state and changes no arithmetic: every field is a
+         * verbatim copy of a member below, and `captureOutputStageState` /
+         * `restoreOutputStageState` are the only two places that move between
+         * them. That mechanical copy is what makes the hoist bit-exact — a
+         * member added to the stage must be added to this struct and to both
+         * helpers, never handled inline at a call site.
+         */
+        struct OutputStageStateQ15 {
+            /** Stage selection; block-constant, resolved on a config change. */
+            bool chainActive;          ///< `outputFilterActive_`
+            bool lpfActive;            ///< `outputLpfActive_`
+            bool legacyHpfEnabled;     ///< `hpfEnabled_`
+            /** Coefficients, all Q15 in `int32_t` (see `kOutputCoeffQ15Max`). */
+            int32_t legacyRQ15;        ///< `hpfRQ15_`, the historical pole
+            int32_t hpf1RQ15;          ///< `outHpf1RQ15_`
+            int32_t hpf2RQ15;          ///< `outHpf2RQ15_`
+            int32_t lpfB0Q15;          ///< `outLpfB0Q15_`
+            int32_t lpfB1Q15;          ///< `outLpfB1Q15_`
+            int32_t lpfB2Q15;          ///< `outLpfB2Q15_`
+            int32_t lpfA1Q15;          ///< `outLpfA1Q15_`
+            int32_t lpfA2Q15;          ///< `outLpfA2Q15_`
+            /** Recursion state; every word is saturated to the int16 rail. */
+            int32_t legacyPrevInQ15;   ///< `hpfPrevInQ15`
+            int32_t legacyPrevOutQ15;  ///< `hpfPrevOutQ15`
+            int32_t hpf1PrevInQ15;     ///< `outHpf1PrevInQ15_`
+            int32_t hpf1PrevOutQ15;    ///< `outHpf1PrevOutQ15_`
+            int32_t hpf2PrevInQ15;     ///< `outHpf2PrevInQ15_`
+            int32_t hpf2PrevOutQ15;    ///< `outHpf2PrevOutQ15_`
+            int32_t lpfX1Q15;          ///< `outLpfX1Q15_`
+            int32_t lpfX2Q15;          ///< `outLpfX2Q15_`
+            int32_t lpfY1Q15;          ///< `outLpfY1Q15_`
+            int32_t lpfY2Q15;          ///< `outLpfY2Q15_`
+        };
+
+        /**
+         * @brief Copies the live output stage into a block-local snapshot.
+         *
+         * Called once per rendered block, never per sample.
+         *
+         * @return Snapshot of every field `OutputStageStateQ15` names.
+         */
+        OutputStageStateQ15 captureOutputStageState() const;
+
+        /**
+         * @brief Writes a block-local snapshot's recursion state back.
+         *
+         * The counterpart of `captureOutputStageState`; called once per block,
+         * after the sample loop, so the next block (and every test accessor)
+         * sees the state the loop ended on. Only the recursion words travel
+         * back: the stage's configuration is read-only for the duration of a
+         * block, because its writers (`recomputeOutputFilterCoefficients`,
+         * `setSoundProfile`, `setHpfCutoffHz`, `resetOutputFilterState`) never
+         * run inside the loop.
+         *
+         * @param state Snapshot produced by `captureOutputStageState`.
+         */
+        void restoreOutputStageState(const OutputStageStateQ15& state);
+
+        /**
          * @brief The complete integer output stage for one Q15 sample.
          *
          * The single entry point `renderIntegerCore` uses: the profile chain
-         * when `outputFilterActive_`, otherwise the historical single-pole
-         * HPF, which is the frozen `Legacy` arithmetic. Extracted verbatim so
-         * the same code the renderer runs can be driven over a test buffer.
+         * (HPF 90 Hz -> HPF 440 Hz -> Butterworth LPF) when `chainActive`,
+         * otherwise the historical single-pole HPF, which is the frozen
+         * `Legacy` arithmetic. Extracted verbatim so the same code the renderer
+         * runs can be driven over a test buffer.
          *
-         * @param inputQ15 Post-shaping mix sample in Q15.
-         * @return Stage output, clamped to the int16 range.
-         */
-        int32_t applyOutputStage(int32_t inputQ15);
-
-        /**
-         * @brief HPF 90 Hz -> HPF 440 Hz -> LPF, one Q15 sample.
-         *
-         * Each stage saturates its own state to [-32768, 32767], so a corrupt
+         * Every stage saturates its own state to [-32768, 32767], so a corrupt
          * coefficient can never wrap the recursion. Every Q15 feedback product
          * is `int32_t` (see the bounds above) and is rescaled by a truncating
          * shift, not a division and not an arithmetic shift: a floor shift
          * freezes the DC decay on a permanent offset, while division truncates
          * toward zero (see the historical one-pole comment).
          *
-         * @param inputQ15 Chain input in Q15.
-         * @return Chain output, saturated to the int16 range.
+         * `static` and `inline` because it is a pure function of its arguments:
+         * it reads nothing from `this`, so the per-sample path can carry the
+         * state in a local and the call disappears into the loop body.
+         *
+         * @param inputQ15 Post-shaping mix sample in Q15.
+         * @param state Stage configuration and recursion state, updated in place.
+         * @return Stage output, clamped to the int16 range.
          */
-        int32_t processOutputFilterChain(int32_t inputQ15);
+        static inline int32_t applyOutputStage(int32_t inputQ15,
+                                               OutputStageStateQ15& state);
 
         // -- Profiling ring buffer (thread-safe offload) --------------------
         ProfileEntry profileRing[PROFILE_RING_SIZE];

@@ -69,9 +69,11 @@ namespace pixelroot32::audio {
     // ========================================================================
     // `Legacy` and `Nes` keep `generateSawSampleQ15` above, the ideal ramp with
     // its audible aliasing. Only `Hybrid` gets the tables. The level and the
-    // crossfade weight are derived from the voice's OWN phase increment, never
-    // from `frequency`, so a sweep, LFO or pitch envelope is tracked sample by
-    // sample and no per-voice state is added (`AudioChannel` is size-pinned).
+    // crossfade window are derived from the voice's OWN `phaseIncQ32`, never
+    // from `frequency`, so a sweep, LFO or pitch envelope is tracked -- and they
+    // are derived once per voice per block, then re-derived only when that
+    // increment leaves the band it described. No per-voice state is added
+    // (`AudioChannel` is size-pinned); the cache lives on the render stack.
 
     /**
      * @brief Leading-zero count of a non-zero 32-bit value.
@@ -136,6 +138,21 @@ namespace pixelroot32::audio {
     }
 
     /**
+     * @brief Forces one of the two hot helpers below into its caller.
+     *
+     * `-Os` (what the ESP32 presets build with) treats `inline` as a hint and
+     * leaves a short helper out of line: the table read became a call, so every
+     * `Hybrid` SAW sample paid two call/return pairs on top of the loads it
+     * cannot avoid. This attribute is what removes them; `inline` alone is not
+     * enough at `-Os`.
+     */
+#if defined(__GNUC__) || defined(__clang__)
+#define PR32_APU_ALWAYS_INLINE inline __attribute__((always_inline))
+#else
+#define PR32_APU_ALWAYS_INLINE inline
+#endif
+
+    /**
      * @brief One Q15 point of a mipmap level, linearly interpolated.
      *
      * The bare `phase >> 24` read puts a ~-43 dBFS truncation floor under a
@@ -149,7 +166,7 @@ namespace pixelroot32::audio {
      * @param phaseQ32 Oscillator phase in Q32.
      * @return Interpolated Q15 sample in [-32767, 32767].
      */
-    static inline int32_t readSawMipSampleQ15(int level, uint32_t phaseQ32) {
+    static PR32_APU_ALWAYS_INLINE int32_t readSawMipSampleQ15(int level, uint32_t phaseQ32) {
         const int index = (int)((phaseQ32 >> 24) & 255u);
         const int next = (index + 1) & 255;
         const int32_t a = SAW_MIP_Q15[level][index];
@@ -159,37 +176,132 @@ namespace pixelroot32::audio {
     }
 
     /**
-     * @brief `Hybrid` SAW: two adjacent levels blended by the octave position.
+     * @brief First Q8 position inside a band that blends toward the neighbour.
      *
-     * Blending, not switching, is what removes the glissando seam (S6). The
-     * position inside the level's octave is the Q8 mantissa of the increment
-     * after its leading one: at `w -> 255` the output is almost entirely
-     * level `L + 1`, and after the level increments `w -> 0` the output is
-     * still level `L + 1`. Level 7 has no upper neighbour, so it reads alone.
+     * Table `L` is built for the TOP of its band, so it is alias-free
+     * everywhere below it: the neighbour table exists only to remove the step
+     * where the level increments. Blending across the whole octave -- what
+     * E2/T3 did -- therefore made every sample pay for two table reads to fix a
+     * seam that only exists in the last fraction of the band. `224` puts the
+     * window on the top 1/8, i.e. `[2^(24+L) - 2^(20+L), 2^(24+L))` for level
+     * `L`, which is the shift in `resolveSawMipBandState` below. S5 is
+     * unaffected by the narrowing: a table that is alias-free over its whole
+     * band stays alias-free when the neighbour read is dropped.
+     */
+    static constexpr int kSawMipCrossfadeStartQ8 = 224;
+    /** @brief Width of the crossfade window, in Q8 position units. */
+    static constexpr int kSawMipCrossfadeWidthQ8 = 256 - kSawMipCrossfadeStartQ8;
+
+    /**
+     * @brief Everything the `Hybrid` SAW read needs that is constant in a band.
      *
-     * @param ch Voice whose `phaseQ32`/`phaseIncQ32` are read.
+     * The level, the window edges and the shift all come from `phaseIncQ32`,
+     * which only moves while pitch automation is active. Resolving them once
+     * per voice per block -- and again when the increment leaves the band --
+     * takes a `clz`, the mantissa shifts and three clamps out of the per-sample
+     * path. What stays there is one table read, one compare, and near a
+     * boundary the neighbour read and the blend.
+     *
+     * Deliberately NOT a member of `AudioChannel`: the pool is size-pinned
+     * (`sizeof(AudioChannel)` is 336 B with no spare padding), so this lives on
+     * the render call's stack, indexed by voice, for one block at a time.
+     */
+    struct SawMipBandState {
+        uint32_t bandLo;     ///< First increment this state describes.
+        uint32_t bandSpan;   ///< Width of that range; one compare guards it.
+        uint32_t windowLo;   ///< First increment of the crossfade window.
+        uint32_t windowSpan; ///< Width of the window; 0 disables the blend entirely.
+        uint8_t level;       ///< Table row the band selects.
+        uint8_t windowShift; ///< `(inc - windowLo) >> windowShift` is the Q8 weight.
+    };
+
+    /**
+     * @brief Fills @p state for one increment; the only place a band is derived.
+     *
+     * The level comes from `sawMipLevelForPhaseIncQ32` unchanged -- the same
+     * selector the S4 case asserts against the band layout -- so the cache
+     * cannot drift from the documented rule. The rest is algebra on the bands:
+     * level `L` covers `[2^(23+L), 2^(24+L))`, level 0 also owns the low clamp
+     * below 2^23 and level 7 the high clamp above 2^31, the window is the top
+     * 1/8 of the unclamped band, and scaling that span by 256 is a shift.
+     *
+     * @param phaseIncQ32 Increment to describe.
+     * @param state Destination.
+     */
+    static inline void resolveSawMipBandState(uint32_t phaseIncQ32, SawMipBandState& state) {
+        const int level = sawMipLevelForPhaseIncQ32(phaseIncQ32);
+        state.level = (uint8_t)level;
+
+        if (level <= 0) {
+            state.bandLo = 0u;
+            state.bandSpan = 1u << 24;
+        } else if (level >= (int)SAW_MIP_LEVEL_COUNT - 1) {
+            state.bandLo = 0x40000000u;
+            state.bandSpan = 0xC0000000u;
+        } else {
+            state.bandLo = 1u << (23 + level);
+            state.bandSpan = state.bandLo;
+        }
+
+        if (level < (int)SAW_MIP_LEVEL_COUNT - 1) {
+            // The window is the top `kSawMipCrossfadeWidthQ8 / 256` = 1/8 of
+            // the band, and the band is a power of two, so both its start and
+            // its width are shifts: level `L` covers `[2^(23+L), 2^(24+L))`,
+            // the window is its last `2^(20+L)` increments, and scaling that
+            // span to 256 weight units is the remaining 8 bits (12 + level).
+            static_assert(kSawMipCrossfadeWidthQ8 == 32,
+                          "the crossfade window must be a power-of-two fraction of a band");
+            state.windowLo = (1u << (24 + level)) - (1u << (20 + level));
+            state.windowSpan = 1u << (20 + level);
+            state.windowShift = (uint8_t)(12 + level);
+        } else {
+            // Level 7 has no upper neighbour: the span of zero makes the
+            // per-sample window test always fail, so nothing ever blends.
+            state.windowLo = 0xFFFFFFFFu;
+            state.windowSpan = 0u;
+            state.windowShift = 0u;
+        }
+    }
+
+    /**
+     * @brief One `Hybrid` SAW sample: the band's table, blended only near the edge.
+     *
+     * Continuity at a boundary is exact in both directions, which is why this
+     * is a crossfade and not a switch: the last increment inside band `L`
+     * blends almost entirely to table `L + 1`, and the first increment of band
+     * `L + 1` reads table `L + 1` outright, so the same table is on both sides
+     * of the seam. The bucket the weight does not spend is the 8/256 the shift
+     * mapping leaves below `bandTop`; that residue is the seam step the tests
+     * budget for, and it is 1/32 of what a hard switch would jump by.
+     *
+     * @param ch Voice whose phase and increment are read.
+     * @param state Band state for this voice, updated when the increment leaves
+     *              the band it describes (sweep, vibrato, pitch envelope).
      * @return Q15 sample in [-32767, 32767].
      */
-    static auto generateBandLimitedSawSampleQ15 = [](AudioChannel& ch) -> int32_t {
+    static PR32_APU_ALWAYS_INLINE int32_t generateBandLimitedSawSampleQ15(
+        const AudioChannel& ch, SawMipBandState& state) {
         const uint32_t increment = ch.phaseIncQ32;
-        if (increment == 0u) {
-            // No advance: the phase never leaves its current point, so the
-            // level is irrelevant; level 0 is the alias-free choice.
-            return readSawMipSampleQ15(0, ch.phaseQ32);
+        if (increment - state.bandLo >= state.bandSpan) {
+            // One unsigned compare covers both edges and the wrap. A steady
+            // note never takes it; pitch automation takes it once per band
+            // crossing instead of once per sample, and that is what keeps the
+            // level exact for any block size.
+            resolveSawMipBandState(increment, state);
         }
-        const int zeros = leadingZeros32(increment);
-        const int level = sawMipLevelFromLeadingZeros(zeros);
 
-        const int32_t low = readSawMipSampleQ15(level, ch.phaseQ32);
-        if (level >= (int)SAW_MIP_LEVEL_COUNT - 1) {
+        const int32_t low = readSawMipSampleQ15(state.level, ch.phaseQ32);
+        if (increment - state.windowLo >= state.windowSpan) {
+            // Outside the window: one table, which is the common case and the
+            // branch that is predicted that way.
             return low;
         }
-        // `increment << zeros` lands in [2^31, 2^32); bits 30..23 are the Q8
-        // position of the note inside its octave.
-        const int32_t weightQ8 = (int32_t)(((increment << zeros) >> 23) & 0xFFu);
-        const int32_t high = readSawMipSampleQ15(level + 1, ch.phaseQ32);
+        const int32_t weightQ8 =
+            (int32_t)((increment - state.windowLo) >> state.windowShift);
+        const int32_t high = readSawMipSampleQ15(state.level + 1, ch.phaseQ32);
         return low + (int32_t)(((high - low) * weightQ8 + 128) >> 8);
-    };
+    }
+
     static auto generateNoiseSampleQ15 = [](AudioChannel& ch) -> int32_t {
         return (ch.lfsrState & 1u) ? 32767 : -32767;
     };
@@ -1382,6 +1494,59 @@ namespace pixelroot32::audio {
         return (int32_t)(v >= 0 ? (v >> 15) : -((-v) >> 15));
     }
 
+    ApuCore::OutputStageStateQ15 ApuCore::captureOutputStageState() const {
+        // The zero-init is not load-bearing — every field is assigned below.
+        // It is here so a field added to the struct but forgotten here degrades
+        // to a zeroed stage instead of reading indeterminate memory.
+        OutputStageStateQ15 state{};
+        state.chainActive = outputFilterActive_;
+        state.lpfActive = outputLpfActive_;
+        state.legacyHpfEnabled = hpfEnabled_;
+        state.legacyRQ15 = hpfRQ15_;
+        state.hpf1RQ15 = outHpf1RQ15_;
+        state.hpf2RQ15 = outHpf2RQ15_;
+        state.lpfB0Q15 = outLpfB0Q15_;
+        state.lpfB1Q15 = outLpfB1Q15_;
+        state.lpfB2Q15 = outLpfB2Q15_;
+        state.lpfA1Q15 = outLpfA1Q15_;
+        state.lpfA2Q15 = outLpfA2Q15_;
+        state.legacyPrevInQ15 = hpfPrevInQ15;
+        state.legacyPrevOutQ15 = hpfPrevOutQ15;
+        state.hpf1PrevInQ15 = outHpf1PrevInQ15_;
+        state.hpf1PrevOutQ15 = outHpf1PrevOutQ15_;
+        state.hpf2PrevInQ15 = outHpf2PrevInQ15_;
+        state.hpf2PrevOutQ15 = outHpf2PrevOutQ15_;
+        state.lpfX1Q15 = outLpfX1Q15_;
+        state.lpfX2Q15 = outLpfX2Q15_;
+        state.lpfY1Q15 = outLpfY1Q15_;
+        state.lpfY2Q15 = outLpfY2Q15_;
+        return state;
+    }
+
+    void ApuCore::restoreOutputStageState(const OutputStageStateQ15& state) {
+        // Only the recursion state travels back. The stage's configuration —
+        // the three selection flags and the seven coefficients — is read-only
+        // for the duration of a block: its only writers are
+        // `recomputeOutputFilterCoefficients`, `setSoundProfile`,
+        // `setHpfCutoffHz` and `resetOutputFilterState`, and none of them can
+        // run inside the sample loop. Writing those eleven words back would be
+        // unchanged values stored into unchanged fields, paid in flash on a
+        // budget where that is the scarce resource.
+        //
+        // Anything that makes the stage mutate its own configuration must add
+        // the corresponding line here in the same change.
+        hpfPrevInQ15 = state.legacyPrevInQ15;
+        hpfPrevOutQ15 = state.legacyPrevOutQ15;
+        outHpf1PrevInQ15_ = state.hpf1PrevInQ15;
+        outHpf1PrevOutQ15_ = state.hpf1PrevOutQ15;
+        outHpf2PrevInQ15_ = state.hpf2PrevInQ15;
+        outHpf2PrevOutQ15_ = state.hpf2PrevOutQ15;
+        outLpfX1Q15_ = state.lpfX1Q15;
+        outLpfX2Q15_ = state.lpfX2Q15;
+        outLpfY1Q15_ = state.lpfY1Q15;
+        outLpfY2Q15_ = state.lpfY2Q15;
+    }
+
     void ApuCore::resetOutputFilterState() {
         outHpf1PrevInQ15_ = 0;
         outHpf1PrevOutQ15_ = 0;
@@ -1393,71 +1558,69 @@ namespace pixelroot32::audio {
         outLpfY2Q15_ = 0;
     }
 
-    int32_t ApuCore::processOutputFilterChain(int32_t inputQ15) {
-        // HPF 90 Hz, then HPF 440 Hz: `y[n] = x[n] - x[n-1] + R*y[n-1]`.
-        //
-        // Two first-order sections rather than one merged second-order
-        // section on purpose. The merge (`b = [1, -2, 1]`) is exact in real
-        // arithmetic but differentiates the int16 input twice, and at 20 Hz
-        // that second difference (~0.5 LSB at half scale) is smaller than the
-        // quantisation noise it differentiates; measured, the merged form
-        // turned a -0.35 dB point into -45 dB. The cascade keeps the
-        // intermediate at full scale, which is where the low-band resolution
-        // comes from.
-        //
-        // The cost is paid back by the arithmetic: every product is int32_t
-        // (|coefficient| < 2^16, |state| < 2^15, see the header's
-        // static_asserts) and the /32768 is a truncating shift instead of an
-        // int64 division, so |y| still drops by at least one LSB per silent
-        // sample.
-        int32_t hpf1 = inputQ15 - outHpf1PrevInQ15_ +
-                       q15_truncate_from_int32(outHpf1RQ15_ * outHpf1PrevOutQ15_);
-        if (hpf1 > 32767) hpf1 = 32767;
-        if (hpf1 < -32768) hpf1 = -32768;
-        outHpf1PrevInQ15_ = inputQ15;
-        outHpf1PrevOutQ15_ = hpf1;
+    // `always_inline` is the point of this shape, not a hint. At `-Os` (the
+    // ESP32 preset) GCC leaves a body this size out of line, and the render
+    // loop then pays two call/return pairs per sample — the exact overhead the
+    // block hoist around it exists to remove. The symbol must not survive in
+    // the object; the bench disassembly is where that is checked.
+    PR32_APU_ALWAYS_INLINE int32_t ApuCore::applyOutputStage(
+        int32_t inputQ15, OutputStageStateQ15& state) {
+        if (state.chainActive) {
+            // HPF 90 Hz, then HPF 440 Hz: `y[n] = x[n] - x[n-1] + R*y[n-1]`.
+            //
+            // Two first-order sections rather than one merged second-order
+            // section on purpose. The merge (`b = [1, -2, 1]`) is exact in real
+            // arithmetic but differentiates the int16 input twice, and at 20 Hz
+            // that second difference (~0.5 LSB at half scale) is smaller than
+            // the quantisation noise it differentiates; measured, the merged
+            // form turned a -0.35 dB point into -45 dB. The cascade keeps the
+            // intermediate at full scale, which is where the low-band
+            // resolution comes from.
+            //
+            // The cost is paid back by the arithmetic: every product is int32_t
+            // (|coefficient| < 2^16, |state| < 2^15, see the header's
+            // static_asserts) and the /32768 is a truncating shift instead of an
+            // int64 division, so |y| still drops by at least one LSB per silent
+            // sample.
+            int32_t hpf1 = inputQ15 - state.hpf1PrevInQ15 +
+                           q15_truncate_from_int32(state.hpf1RQ15 * state.hpf1PrevOutQ15);
+            if (hpf1 > 32767) hpf1 = 32767;
+            if (hpf1 < -32768) hpf1 = -32768;
+            state.hpf1PrevInQ15 = inputQ15;
+            state.hpf1PrevOutQ15 = hpf1;
 
-        int32_t hpf2 = hpf1 - outHpf2PrevInQ15_ +
-                       q15_truncate_from_int32(outHpf2RQ15_ * outHpf2PrevOutQ15_);
-        if (hpf2 > 32767) hpf2 = 32767;
-        if (hpf2 < -32768) hpf2 = -32768;
-        outHpf2PrevInQ15_ = hpf1;
-        outHpf2PrevOutQ15_ = hpf2;
+            int32_t hpf2 = hpf1 - state.hpf2PrevInQ15 +
+                           q15_truncate_from_int32(state.hpf2RQ15 * state.hpf2PrevOutQ15);
+            if (hpf2 > 32767) hpf2 = 32767;
+            if (hpf2 < -32768) hpf2 = -32768;
+            state.hpf2PrevInQ15 = hpf1;
+            state.hpf2PrevOutQ15 = hpf2;
 
-        if (!outputLpfActive_) {
-            return hpf2;
-        }
+            if (!state.lpfActive) {
+                return hpf2;
+            }
 
-        // Butterworth biquad:
-        //   y = b0*x + b1*x1 + b2*x2 - a1*y1 - a2*y2, all Q15, then /32768.
-        // Each product fits int32_t (same bound as above); the five-term sum
-        // needs int64_t. The state is saturated so a corrupt coefficient can
-        // never wrap the recursion.
-        const int32_t b0x = outLpfB0Q15_ * hpf2;
-        const int32_t b1x1 = outLpfB1Q15_ * outLpfX1Q15_;
-        const int32_t b2x2 = outLpfB2Q15_ * outLpfX2Q15_;
-        const int32_t a1y1 = outLpfA1Q15_ * outLpfY1Q15_;
-        const int32_t a2y2 = outLpfA2Q15_ * outLpfY2Q15_;
-        const int64_t acc = (int64_t)b0x + (int64_t)b1x1 + (int64_t)b2x2
-                            - (int64_t)a1y1 - (int64_t)a2y2;
-        int32_t y = q15_truncate_from_int64(acc);
-        if (y > 32767) y = 32767;
-        if (y < -32768) y = -32768;
+            // Butterworth biquad:
+            //   y = b0*x + b1*x1 + b2*x2 - a1*y1 - a2*y2, all Q15, then /32768.
+            // Each product fits int32_t (same bound as above); the five-term sum
+            // needs int64_t. The state is saturated so a corrupt coefficient can
+            // never wrap the recursion.
+            const int32_t b0x = state.lpfB0Q15 * hpf2;
+            const int32_t b1x1 = state.lpfB1Q15 * state.lpfX1Q15;
+            const int32_t b2x2 = state.lpfB2Q15 * state.lpfX2Q15;
+            const int32_t a1y1 = state.lpfA1Q15 * state.lpfY1Q15;
+            const int32_t a2y2 = state.lpfA2Q15 * state.lpfY2Q15;
+            const int64_t acc = (int64_t)b0x + (int64_t)b1x1 + (int64_t)b2x2
+                                - (int64_t)a1y1 - (int64_t)a2y2;
+            int32_t y = q15_truncate_from_int64(acc);
+            if (y > 32767) y = 32767;
+            if (y < -32768) y = -32768;
 
-        outLpfX2Q15_ = outLpfX1Q15_;
-        outLpfX1Q15_ = hpf2;
-        outLpfY2Q15_ = outLpfY1Q15_;
-        outLpfY1Q15_ = y;
-        return y;
-    }
-
-    int32_t ApuCore::applyOutputStage(int32_t inputQ15) {
-        // E2/S1: `Nes`/`Hybrid` replace the historical one-pole with their
-        // output chain on the SUMMED mix. The active flag was resolved on the
-        // configuration change, so this branch is the whole per-sample cost of
-        // selecting the stage.
-        if (outputFilterActive_) {
-            return processOutputFilterChain(inputQ15);
+            state.lpfX2Q15 = state.lpfX1Q15;
+            state.lpfX1Q15 = hpf2;
+            state.lpfY2Q15 = state.lpfY1Q15;
+            state.lpfY1Q15 = y;
+            return y;
         }
 
         // Historical single-pole HPF — the frozen `Legacy` arithmetic. It also
@@ -1465,7 +1628,7 @@ namespace pixelroot32::audio {
         // body is the only one compiled, so every line below must stay
         // byte-identical to what it replaced.
         int32_t hpfOutQ15;
-        if (hpfEnabled_) {
+        if (state.legacyHpfEnabled) {
             // Compute R * y[n-1] in Q30, then shift to Q15.
             // The shift truncates TOWARD ZERO, not arithmetically: an
             // arithmetic >>15 has a fixed point for every negative y with
@@ -1474,23 +1637,23 @@ namespace pixelroot32::audio {
             // instead of decaying. Truncation toward zero mirrors the
             // float path's int conversion and guarantees |y| drops by at
             // least one LSB per silent sample, whatever the coefficient.
-            int64_t feedback = (int64_t)hpfRQ15_ * (int64_t)hpfPrevOutQ15;
+            int64_t feedback = (int64_t)state.legacyRQ15 * (int64_t)state.legacyPrevOutQ15;
             int32_t feedbackQ15 = (int32_t)(feedback / 32768);
 
             // HPF difference equation
-            hpfOutQ15 = inputQ15 - hpfPrevInQ15 + feedbackQ15;
+            hpfOutQ15 = inputQ15 - state.legacyPrevInQ15 + feedbackQ15;
 
             // Saturating clamp to prevent overflow artifacts
             if (hpfOutQ15 > 32767) hpfOutQ15 = 32767;
             if (hpfOutQ15 < -32768) hpfOutQ15 = -32768;
 
             // Update state for next sample
-            hpfPrevInQ15 = inputQ15;
-            hpfPrevOutQ15 = hpfOutQ15;
+            state.legacyPrevInQ15 = inputQ15;
+            state.legacyPrevOutQ15 = hpfOutQ15;
         } else {
             hpfOutQ15 = inputQ15;
-            hpfPrevInQ15 = inputQ15;
-            hpfPrevOutQ15 = 0;
+            state.legacyPrevInQ15 = inputQ15;
+            state.legacyPrevOutQ15 = 0;
         }
         return hpfOutQ15;
     }
@@ -2693,13 +2856,19 @@ namespace pixelroot32::audio {
         if (buffer == nullptr || length <= 0) {
             return;
         }
+        // The same block-local snapshot the render loop keeps, so the hook still
+        // drives PRODUCTION code — `applyOutputStage` on hoisted state — and not
+        // a per-sample re-read of `this` that the renderer no longer performs.
+        // State still persists across calls: the snapshot is written back below.
+        OutputStageStateQ15 stage = captureOutputStageState();
         for (int i = 0; i < length; ++i) {
-            int32_t sample = applyOutputStage(static_cast<int32_t>(buffer[i]));
+            int32_t sample = applyOutputStage(static_cast<int32_t>(buffer[i]), stage);
             if (sample > 32767) sample = 32767;
             if (sample < -32768) sample = -32768;
             buffer[i] = apply_master_bitcrush(static_cast<int16_t>(sample),
                                               masterBitcrushBits_);
         }
+        restoreOutputStageState(stage);
     }
 #endif
 
@@ -4368,6 +4537,12 @@ namespace pixelroot32::audio {
         // one and never leaves this function.
         int32_t volQ15[MAX_VOICES];
         int32_t mixGainQ15[MAX_VOICES];
+        // E2/T4: the `Hybrid` SAW read state, resolved here once per voice
+        // instead of once per sample. Only the SAW branch below reads an entry,
+        // and `type` cannot change between this fold and that branch (see the
+        // note above about `initVoiceFromEvent`), so the other slots are left
+        // alone: writing them would be per-block work for a value nothing reads.
+        SawMipBandState sawReadBand[MAX_VOICES];
         for (int c = 0; c < MAX_VOICES; ++c) {
             volQ15[c] = (int32_t)(voices[c].volume * 32768.0f);
             int32_t gain = volQ15[c];
@@ -4379,7 +4554,21 @@ namespace pixelroot32::audio {
                 gain <<= kNoiseUnipolarCompensationShift;
             }
             mixGainQ15[c] = gain;
+
+            if (sawWavetable && voices[c].type == WaveType::SAW) {
+                resolveSawMipBandState(voices[c].phaseIncQ32, sawReadBand[c]);
+            }
         }
+
+        // E2/S7: the output stage is the only reader and writer of its own
+        // state and it runs on every sample, so the whole stage is snapshotted
+        // into a local before the loop and written back after it. That is what
+        // lets the ten recursion words live where the compiler wants them
+        // (registers, or stack slots it chose) instead of being reloaded from
+        // `this` twice per sample through a call boundary. Bit-exact by
+        // construction: the snapshot is a copy, never a re-derivation, and no
+        // line of arithmetic changes — only where the words live.
+        OutputStageStateQ15 outStage = captureOutputStageState();
 
         for (int i = 0; i < length; ++i) {
             // Hito 2 M3: tick the NES frame counter before voice mixing.
@@ -4444,7 +4633,7 @@ namespace pixelroot32::audio {
                     // PULSE handled above, NOISE / SINE handled above.)
                     // E2/S4: `Hybrid` reads the band-limited mipmap instead; the
                     // other profiles reach the same ideal ramp as before.
-                    s = sawWavetable ? generateBandLimitedSawSampleQ15(ch)
+                    s = sawWavetable ? generateBandLimitedSawSampleQ15(ch, sawReadBand[c])
                                      : gen(ch);
                 } else {
                     // Fallback (should never reach)
@@ -4645,8 +4834,10 @@ namespace pixelroot32::audio {
             // the configuration change, so this is a flag test here — no
             // coefficient is computed per sample. `applyOutputStage` owns the
             // arithmetic, including the truncate-toward-zero reasoning the
-            // one-pole depends on.
-            int32_t hpfOutQ15 = applyOutputStage(inputQ15);
+            // one-pole depends on; it is forced inline and reads only
+            // `outStage`, so the per-sample path carries no call and no
+            // `this`-relative state access.
+            int32_t hpfOutQ15 = applyOutputStage(inputQ15, outStage);
 
             // Hito 5 M12: the fixed -6 dB headroom pad (`>>1`, Q15 -> Q14) is
             // gone; this path now lands at the same level as the float one.
@@ -4663,6 +4854,10 @@ namespace pixelroot32::audio {
             const int32_t absSample = (stream[i] < 0) ? -(int32_t)stream[i] : (int32_t)stream[i];
             if ((float)absSample > currentPeak) currentPeak = (float)absSample;
         }
+
+        // Persist the stage the loop ended on. Every return path out of the
+        // loop is the loop's own exit, so this cannot be skipped.
+        restoreOutputStageState(outStage);
 
         // Sync per-channel float volume back from Q15 so the next block
         // (and the FPU fallback if ever invoked) sees up-to-date state.

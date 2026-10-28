@@ -13,8 +13,9 @@
  *   - the level comes from the voice's own `phaseIncQ32`
  *     (`L = floor(log2(q)) + 9`, clamped), which is what makes pitch
  *     automation track the table selection.
- *   - adjacent levels are CROSSFADED by the position inside the octave, so a
- *     glissando crossing a boundary has no seam (S6).
+ *   - adjacent levels are CROSSFADED, but only over the top of the octave, so a
+ *     glissando crossing a boundary has no seam (S6) while the rest of the band
+ *     pays for one table read instead of two.
  *   - S5 end to end: the SAME note rendered through `ApuCore` under `Hybrid`
  *     folds at least 10 dB less energy below the fundamental than under `Nes`.
  *     The spectral suite measures the tables in isolation and the cases below
@@ -34,6 +35,14 @@
  * integer core's single 0.4 mix scale as the only arithmetic between the
  * oscillator and the PCM. The flat preset (one-sample attack, sustain 1.0)
  * makes that scale exact, so the reference below is the oscillator itself.
+ *
+ * E2/T4 narrowed the crossfade (see `kWindowStartQ8`) and moved the level and
+ * the window out of the per-sample path into a per-block resolution. The tests
+ * that follow pin BOTH properties separately: the window is narrow enough that
+ * a mid-band note reads one table (`..._crossfade_window_is_narrow`) and the
+ * block resolution is bit-neutral, because a block render must reproduce a
+ * one-sample-per-call render exactly (`..._glissando_...` and
+ * `..._fast_vibrato_...`).
  *
  * The target is built with `PR32_APU_ENABLE_LEGACY_FLOAT=0` on purpose: on an
  * FPU build `Legacy` renders through the frozen float body, and "the ideal
@@ -186,9 +195,48 @@ int32_t readMipQ15(int level, uint32_t phaseQ32)
     return a + static_cast<int32_t>(((b - a) * (fraction >> 1) + 16384) >> 15);
 }
 
-/// @brief The continuous `Hybrid` SAW definition: level crossfade by the Q8
-/// octave position, interpolation inside each level.
+/// @brief First Q8 position inside a band that blends toward the neighbour.
+///
+/// The crossfade is a BOUNDARY fix, not a timbre: table `L` is built for the
+/// top of its band and is alias-free everywhere below it, so the neighbour is
+/// only needed to remove the step where the level increments. Blending across
+/// the whole octave would make every sample pay for two table reads to fix a
+/// seam that only exists in the last fraction of the band. `224` puts the
+/// window on the top 1/8 of the band.
+constexpr int32_t kWindowStartQ8 = 224;
+
+/// @brief `(inc - windowLo) >> shift`, the weight the renderer derives.
+///
+/// Restated here from the BAND RULE rather than copied from the renderer: for
+/// level `L` the band is `[2^(23+L), 2^(24+L))`, the window is its top 1/8
+/// (`[2^(24+L) - 2^(20+L), 2^(24+L))`) and the Q8 weight is that span scaled
+/// by 256, which is a shift by `12 + L`. A drift in either constant fails the
+/// exact-reference assertions below.
+int32_t windowWeightQ8(int level, uint32_t phaseIncQ32)
+{
+    if (level >= kLevels - 1) return 0;
+    const uint32_t windowLo = (1u << (24 + level)) - (1u << (20 + level));
+    if (phaseIncQ32 < windowLo) return 0;
+    return static_cast<int32_t>((phaseIncQ32 - windowLo) >> (12 + level));
+}
+
+/// @brief The `Hybrid` SAW definition the renderer owes: the band's table,
+/// blended toward its neighbour over the window and not outside it.
 int32_t hybridSawQ15(uint32_t phaseQ32, uint32_t phaseIncQ32)
+{
+    if (phaseIncQ32 == 0u) return readMipQ15(0, phaseQ32);
+    const int level = bandLevel(phaseIncQ32);
+
+    const int32_t low = readMipQ15(level, phaseQ32);
+    const int32_t weightQ8 = windowWeightQ8(level, phaseIncQ32);
+    if (weightQ8 == 0) return low;
+    const int32_t high = readMipQ15(level + 1, phaseQ32);
+    return low + (((high - low) * weightQ8 + 128) >> 8);
+}
+
+/// @brief The PREVIOUS shape, kept only so a case can prove the window moved
+/// the output: level blended across the whole octave by the Q8 position.
+int32_t fullOctaveSawQ15(uint32_t phaseQ32, uint32_t phaseIncQ32)
 {
     if (phaseIncQ32 == 0u) return readMipQ15(0, phaseQ32);
     const int zeros = leadingZeros(phaseIncQ32);
@@ -228,6 +276,55 @@ int32_t maxAdjacentLevelDifference()
         }
     }
     return worst;
+}
+
+/// @brief Table points one sample can advance in the S6 scenes.
+///
+/// 880 Hz at 44 100 Hz is 5.11 points per sample; one more point covers the
+/// boundary case. Every level is measured, because the bound has to hold
+/// wherever the sweep happens to be.
+constexpr int kS6WindowWidth = 6;
+
+/// @brief Q8 weight the shift mapping leaves unspent at the top of a band.
+///
+/// The window maps `[windowLo, bandTop)` onto `[0, 256)`, but the top of a band
+/// is never reached: the last increment inside it is `bandTop - 1`, one table
+/// position below. The blend therefore tops out at 248 of 256, and that
+/// remaining 8/256 of the adjacent-level difference is the seam residue the
+/// bound below has to allow -- instead of the whole difference a hard switch
+/// would jump by.
+constexpr int32_t kSeamResidueQ8 = 8;
+
+/// @brief The step bound the tables justify, plus what it is made of.
+struct SeamBound {
+    int32_t worstWindowStep = 0;   ///< worst `|T[x + width] - T[x]|`, Q15
+    int32_t seamResidue = 0;       ///< unspent crossfade weight, Q15
+    int32_t boundPcm = 0;          ///< the bound itself, PCM LSB
+    int32_t hardSwitchJumpPcm = 0; ///< what a hard table switch could jump by
+};
+
+/// @brief Derives the S6 bound from the committed tables.
+///
+/// The table is a polyline, so a phase advance of `h` points moves at most
+/// `max |T[x + ceil(h)] - T[x]|` and interpolation only shrinks that. On top of
+/// it the blend can step by one unspent weight unit, and rounding adds a few
+/// LSB. Nothing here is a tuned constant: change the tables or the window and
+/// the bound follows.
+SeamBound seamBound()
+{
+    SeamBound bound;
+    for (int level = 0; level < kLevels; ++level) {
+        bound.worstWindowStep =
+            std::max(bound.worstWindowStep, maxTableWindowStep(level, kS6WindowWidth));
+    }
+    bound.seamResidue =
+        (maxAdjacentLevelDifference() * kSeamResidueQ8 + 255) / 256;
+    bound.boundPcm = static_cast<int32_t>(
+        (static_cast<int64_t>(bound.worstWindowStep + bound.seamResidue + 4) *
+         kMixScaleQ15) >> kMixScaleShift);
+    bound.hardSwitchJumpPcm =
+        (maxAdjacentLevelDifference() * kMixScaleQ15) >> kMixScaleShift;
+    return bound;
 }
 
 // =============================================================================
@@ -545,6 +642,117 @@ void test_hybrid_saw_level_selection_matches_the_band_rule(void)
 }
 
 // =============================================================================
+// S5/S6 - the crossfade window is narrow: one table read away from the edge
+// =============================================================================
+//
+// Table `L` is built for the top of its band, so it is alias-free everywhere in
+// it and the neighbour is only there to remove the step at the boundary. This
+// pins the consequence the CPU cost depends on: a note in the middle of a band
+// must read exactly one table, and a note in the top 1/8 must still blend.
+
+void test_hybrid_saw_crossfade_window_is_narrow(void)
+{
+    // Both notes sit in level 3 at 44 100 Hz (`q` in [2^-5, 2^-4), i.e.
+    // 1 378.13 .. 2 756.25 Hz). The frequency for a position `p` inside a band
+    // is `bandLo * (1 + p / 256)`.
+    constexpr double kBand3LoHz = 44100.0 / 64.0;   // 2^(3-9) * fs
+    struct WindowCase {
+        const char* label;
+        double positionQ8;   // intended position inside the band
+        bool expectBlend;    // inside the window?
+    };
+    static const WindowCase cases[] = {
+        {"mid-band (position 64)", 64.0, false},
+        {"top of band (position 240)", 240.0, true},
+    };
+
+    const InstrumentPreset preset = flatPreset();
+    constexpr int kCount = 2048;
+
+    for (const WindowCase& windowCase : cases) {
+        const float frequency = static_cast<float>(
+            kBand3LoHz * (1.0 + windowCase.positionQ8 / 256.0));
+        const AudioCommand cmd = noteCommand(WaveType::SAW, frequency, true,
+                                             0.0f, 0.0f, SweepCurve::Linear,
+                                             preset);
+        const std::vector<int16_t> pcm = render(SoundProfile::Hybrid, cmd, kCount);
+
+        // The increment `initVoiceFromEvent` derives is the test's own
+        // conversion (pinned by the ramp case), so the level and the weight are
+        // the ones the renderer must be using.
+        const uint32_t increment = phaseIncFor(frequency, kSampleRate);
+        const int level = bandLevel(increment);
+        const int32_t weightQ8 = windowWeightQ8(level, increment);
+        char message[256];
+        std::snprintf(message, sizeof(message),
+                      "%s: %.2f Hz landed on level %d with weight %d", windowCase.label,
+                      static_cast<double>(frequency), level, weightQ8);
+        TEST_ASSERT_EQUAL_INT_MESSAGE(3, level, message);
+
+        if (windowCase.expectBlend) {
+            TEST_ASSERT_TRUE_MESSAGE(weightQ8 > 32 && weightQ8 < 255,
+                                     "the case did not land inside the crossfade window");
+        } else {
+            TEST_ASSERT_EQUAL_INT_MESSAGE(0, weightQ8,
+                                          "the case did not land outside the window");
+        }
+
+        // Sample 0 still has the envelope at zero; every later sample must be
+        // the definition exactly (see `toPcm` for why the mix scale is the only
+        // arithmetic between the oscillator and the PCM).
+        uint32_t phase = 0u;
+        size_t differsFromSingleTable = 0;
+        size_t differsFromFullOctave = 0;
+        int32_t worstDelta = 0;
+        for (int i = 0; i < kCount; ++i) {
+            const int32_t single = readMipQ15(level, phase);
+            const int32_t windowed = hybridSawQ15(phase, increment);
+            const int32_t previousShape = fullOctaveSawQ15(phase, increment);
+            if (i > 0) {
+                const int16_t expected = toPcm(windowed);
+                const int32_t delta = std::abs(
+                    static_cast<int32_t>(pcm[static_cast<size_t>(i)]) - expected);
+                worstDelta = std::max(worstDelta, delta);
+                std::snprintf(message, sizeof(message),
+                              "%s: sample %d is %d, the definition says %d",
+                              windowCase.label, i,
+                              static_cast<int>(pcm[static_cast<size_t>(i)]),
+                              static_cast<int>(expected));
+                TEST_ASSERT_TRUE_MESSAGE(delta <= 0, message);
+            }
+            if (single != windowed) ++differsFromSingleTable;
+            if (previousShape != windowed) ++differsFromFullOctave;
+            phase += increment;
+        }
+
+        std::printf("\n  window: %s at %.2f Hz -> level %d, weight %d; "
+                    "%zu samples differ from a single-table read, "
+                    "%zu from the previous full-octave blend\n",
+                    windowCase.label, static_cast<double>(frequency), level,
+                    weightQ8, differsFromSingleTable, differsFromFullOctave);
+
+        if (windowCase.expectBlend) {
+            // The blend is live, and it is the NEW shape rather than the old
+            // one: both clauses are what make the case evidence.
+            TEST_ASSERT_TRUE_MESSAGE(differsFromSingleTable > 0,
+                                     "the window did not blend at all");
+            TEST_ASSERT_TRUE_MESSAGE(differsFromFullOctave > 0,
+                                     "the blend is still the full-octave shape");
+        } else {
+            // One table, no neighbour: this is the per-sample work the window
+            // is supposed to remove.
+            TEST_ASSERT_EQUAL_INT_MESSAGE(
+                0, static_cast<int>(differsFromSingleTable),
+                "a mid-band note still reads (and blends) two tables");
+            // ...and the old shape would have blended here, so the clause is
+            // not satisfied by a table that happens to have equal neighbours.
+            TEST_ASSERT_TRUE_MESSAGE(differsFromFullOctave > 0,
+                                     "the previous blend also equalled one table here");
+        }
+    }
+}
+
+// =============================================================================
 // S6 - the glissando has no seam and SINE is inert
 // =============================================================================
 
@@ -557,24 +765,28 @@ void test_hybrid_saw_glissando_crosses_levels_without_a_step(void)
     constexpr float kStartHz = 55.0f;
     constexpr float kEndHz = 880.0f;
     constexpr float kSeconds = 3.0f;
+    constexpr int kBlock = 512;   // the block the firmware renders
     const int count = static_cast<int>(kSeconds * kSampleRate);
 
     const InstrumentPreset preset = flatPreset();
     const AudioCommand cmd = noteCommand(WaveType::SAW, kStartHz, true, kEndHz,
                                          kSeconds, SweepCurve::Exponential,
                                          preset);
+    const int slot = ApuCore::SFX_VOICE_BASE;
+
+    // Pass 1 - one sample per render call. The renderer's per-block level is
+    // resolved once per voice per block, so a block of one resolves at every
+    // sample; that is the granularity at which the level rule is defined, and
+    // it lets the increment used for each sample be read BEFORE it is used.
     ApuCore apu;
     prepare(apu, SoundProfile::Hybrid, kSampleRate);
     TEST_ASSERT_TRUE(apu.submitCommand(cmd));
-
     std::vector<int16_t> pcm(static_cast<size_t>(count), 0);
     std::vector<int> levels(static_cast<size_t>(count), 0);
     std::vector<uint32_t> phaseIncHistory(static_cast<size_t>(count), 0u);
-    const int slot = ApuCore::SFX_VOICE_BASE;
     // Sample 0: the queued command is processed INSIDE the render call, so the
     // increment it uses is the note-on one (the event frequency), before any
-    // sweep step. Every later sample is generated one at a time so the level
-    // the renderer will use can be read first, from the voice's own increment.
+    // sweep step.
     phaseIncHistory[0] = phaseIncFor(static_cast<double>(kStartHz), kSampleRate);
     levels[0] = ApuCore::sawMipmapLevelForTesting(phaseIncHistory[0]);
     apu.generateSamples(&pcm[0], 1);
@@ -585,11 +797,39 @@ void test_hybrid_saw_glissando_crosses_levels_without_a_step(void)
         apu.generateSamples(&pcm[static_cast<size_t>(i)], 1);
     }
 
+    // Pass 2 - the same command in production-sized blocks. Hoisting the level
+    // out of the sample loop is a cost change, not an output change: the state
+    // is re-resolved whenever the pitch leaves its band, so the block render
+    // must reproduce pass 1 byte for byte. This is the assertion that a
+    // per-block cache with a stale level cannot pass, because it would keep the
+    // old table for up to 511 samples after a boundary.
+    ApuCore blocked;
+    prepare(blocked, SoundProfile::Hybrid, kSampleRate);
+    TEST_ASSERT_TRUE(blocked.submitCommand(cmd));
+    std::vector<int16_t> blockPcm(static_cast<size_t>(count), 0);
+    for (int at = 0; at < count; at += kBlock) {
+        const int n = std::min(kBlock, count - at);
+        blocked.generateSamples(&blockPcm[static_cast<size_t>(at)], n);
+    }
+    int blockFirstDiff = -1;
+    int32_t blockWorst = 0;
+    for (int i = 0; i < count; ++i) {
+        const int32_t diff = std::abs(
+            static_cast<int32_t>(blockPcm[static_cast<size_t>(i)]) -
+            static_cast<int32_t>(pcm[static_cast<size_t>(i)]));
+        if (diff != 0 && blockFirstDiff < 0) blockFirstDiff = i;
+        blockWorst = std::max(blockWorst, diff);
+    }
+    char message[256];
+    std::snprintf(message, sizeof(message),
+                  "the %d-sample block render diverged from the per-sample render "
+                  "at sample %d (worst %d LSB)", kBlock, blockFirstDiff, blockWorst);
+    TEST_ASSERT_EQUAL_INT_MESSAGE(-1, blockFirstDiff, message);
+
     // The level moves by at most one per sample.
     for (int i = 1; i < count; ++i) {
         const int delta = levels[static_cast<size_t>(i)] -
                           levels[static_cast<size_t>(i - 1)];
-        char message[128];
         std::snprintf(message, sizeof(message),
                       "level jumped by %d at sample %d (%d -> %d)", delta, i,
                       levels[static_cast<size_t>(i - 1)],
@@ -618,14 +858,36 @@ void test_hybrid_saw_glissando_crosses_levels_without_a_step(void)
     TEST_ASSERT_TRUE_MESSAGE(distinctLevels >= 4,
                              "the sweep did not cross three level boundaries");
 
-    // Largest adjacent-sample delta of the render, and the bound the tables
-    // imply for it: the table is a polyline, so a phase advance of `h` points
-    // can move at most `max |T[x + ceil(h)] - T[x]|`, and interpolation only
-    // shrinks that. The crossfade's own Q8 residue adds at most one
-    // 1/256 step of the adjacent-level difference.
+    // The boundary itself is covered by the window. At a level change the LOWER
+    // band is the one whose neighbour read produces the next table, so its
+    // weight has to be inside the window on BOTH sides of the change; if it is
+    // not, the renderer switched tables instead of fading between them and the
+    // seam is whatever the two tables differ by.
+    int levelChanges = 0;
+    int32_t minWeightAtChange = 255;
+    for (int i = 1; i < count; ++i) {
+        const int before = levels[static_cast<size_t>(i - 1)];
+        const int after = levels[static_cast<size_t>(i)];
+        if (before == after) continue;
+        ++levelChanges;
+        const int lower = std::min(before, after);
+        const int32_t outgoing = windowWeightQ8(lower, phaseIncHistory[static_cast<size_t>(i - 1)]);
+        const int32_t incoming = windowWeightQ8(lower, phaseIncHistory[static_cast<size_t>(i)]);
+        minWeightAtChange = std::min(minWeightAtChange, std::min(outgoing, incoming));
+        std::snprintf(message, sizeof(message),
+                      "level %d -> %d at sample %d: the lower band's weight was "
+                      "%d outgoing / %d incoming, outside the crossfade window",
+                      before, after, i, outgoing, incoming);
+        TEST_ASSERT_TRUE_MESSAGE(outgoing >= 200 && incoming >= 200, message);
+    }
+    TEST_ASSERT_TRUE_MESSAGE(levelChanges >= 3,
+                             "the sweep did not cross three level boundaries");
+
+    // Largest adjacent-sample delta of the render against the bound the tables
+    // justify (see `seamBound`).
+    const SeamBound bound = seamBound();
     int32_t maxDelta = 0;
     int32_t maxDeltaAtLevelChange = 0;
-    int32_t worstWindowStep = 0;
     for (int i = 1; i < count; ++i) {
         const int32_t delta = std::abs(
             static_cast<int32_t>(pcm[static_cast<size_t>(i)]) -
@@ -635,32 +897,20 @@ void test_hybrid_saw_glissando_crosses_levels_without_a_step(void)
             maxDeltaAtLevelChange = std::max(maxDeltaAtLevelChange, delta);
         }
     }
-    for (int level = 0; level < kLevels; ++level) {
-        // 880 Hz at 44 100 is 5.11 table points per sample; one more point
-        // covers the boundary case.
-        worstWindowStep = std::max(worstWindowStep, maxTableWindowStep(level, 6));
-    }
-    const int32_t seamResidue = (maxAdjacentLevelDifference() + 255) / 256;
-    const int32_t bound =
-        (int32_t)((static_cast<int64_t>(worstWindowStep + seamResidue + 4) *
-                   kMixScaleQ15) >> kMixScaleShift);
-    // What a hard switch would be allowed to jump by at a boundary: the whole
-    // adjacent-level difference. The crossfade keeps the observed delta at a
-    // level change orders below this.
-    const int32_t hardSwitchJump =
-        (maxAdjacentLevelDifference() * kMixScaleQ15) >> kMixScaleShift;
-    std::printf("  S6 largest delta %d LSB (at a level change %d), table-derived bound %d LSB; "
-                "hard-switch jump would reach %d LSB, crossfade residue %d\n",
-                maxDelta, maxDeltaAtLevelChange, bound, hardSwitchJump,
-                seamResidue);
-    TEST_ASSERT_TRUE_MESSAGE(maxDelta <= bound,
+    std::printf("  S6 %d level changes, worst weight at a change %d (window starts %d); "
+                "largest delta %d LSB (at a level change %d), table-derived bound "
+                "%d LSB; hard-switch jump would reach %d LSB, seam residue %d\n",
+                levelChanges, static_cast<int>(minWeightAtChange),
+                static_cast<int>(kWindowStartQ8), maxDelta, maxDeltaAtLevelChange,
+                bound.boundPcm, bound.hardSwitchJumpPcm, bound.seamResidue);
+    TEST_ASSERT_TRUE_MESSAGE(maxDelta <= bound.boundPcm,
                              "adjacent-sample delta exceeded the table-derived bound");
-    TEST_ASSERT_TRUE_MESSAGE(maxDeltaAtLevelChange < hardSwitchJump,
+    TEST_ASSERT_TRUE_MESSAGE(maxDeltaAtLevelChange < bound.hardSwitchJumpPcm,
                              "a level change jumped as far as a hard table switch");
 
-    // The continuous definition, sample for sample. This is the S6 pin that a
-    // hard table switch cannot pass: at a boundary a switch would jump by the
-    // whole adjacent-level difference, while the crossfade stays inside the
+    // The definition, sample for sample. This is the S6 pin that a hard table
+    // switch cannot pass: at a boundary a switch would jump by the whole
+    // adjacent-level difference, while the crossfade stays inside the
     // interpolation rounding. The absolute delta above is dominated by the
     // saw's own discontinuity at the top of the sweep, so it cannot see that.
     uint32_t phase = 0u;
@@ -684,11 +934,137 @@ void test_hybrid_saw_glissando_crosses_levels_without_a_step(void)
         worstReferenceDelta = std::max(worstReferenceDelta,
                                        std::abs(actual - mapped));
         TEST_ASSERT_TRUE_MESSAGE(std::abs(actual - mapped) <= 2,
-                                 "Hybrid SAW left the continuous crossfade definition");
+                                 "Hybrid SAW left the windowed crossfade definition");
         phase += phaseIncHistory[static_cast<size_t>(i)];
     }
-    std::printf("  S6 worst deviation from the continuous definition: %d LSB\n",
+    std::printf("  S6 worst deviation from the windowed definition: %d LSB\n",
                 worstReferenceDelta);
+}
+
+void test_hybrid_saw_fast_vibrato_keeps_up_with_its_blocks(void)
+{
+    // A pitch envelope that turns around every 26 ms is a vibrato an order of
+    // magnitude faster than a player's, and it is chosen so a boundary crossing
+    // lands on a block edge: the block resolver is dragged out of its band
+    // repeatedly and must still render the same samples a per-sample resolve
+    // would. 300 Hz is level 1 (`q` in [2^-8, 2^-7), i.e. 172.3 .. 344.5 Hz at
+    // 44 100 Hz) and 400 Hz is level 2, so each segment of the envelope crosses
+    // the 344.53 Hz boundary once.
+    static const SfxBreakpoint kVibrato[] = {
+        {0.0000f, 300.0f},
+        {0.0261f, 400.0f},
+        {0.0522f, 300.0f},
+        {0.0783f, 400.0f},
+    };
+    constexpr float kSeconds = 0.09f;
+    constexpr int kBlock = 512;
+    const int count = static_cast<int>(kSeconds * kSampleRate);
+
+    const InstrumentPreset preset = flatPreset();
+    AudioCommand cmd = noteCommand(WaveType::SAW, 300.0f, true, 0.0f, 0.0f,
+                                  SweepCurve::Linear, preset);
+    cmd.event.pitchEnvelope = kVibrato;
+    cmd.event.pitchEnvelopeCount =
+        static_cast<uint8_t>(sizeof(kVibrato) / sizeof(kVibrato[0]));
+
+    // Pass 1 - one sample per call, for the increment of every sample.
+    ApuCore apu;
+    prepare(apu, SoundProfile::Hybrid, kSampleRate);
+    TEST_ASSERT_TRUE(apu.submitCommand(cmd));
+    std::vector<int16_t> pcm(static_cast<size_t>(count), 0);
+    std::vector<int> levels(static_cast<size_t>(count), 0);
+    std::vector<uint32_t> phaseIncHistory(static_cast<size_t>(count), 0u);
+    const int slot = ApuCore::SFX_VOICE_BASE;
+    phaseIncHistory[0] = phaseIncFor(300.0, kSampleRate);
+    levels[0] = ApuCore::sawMipmapLevelForTesting(phaseIncHistory[0]);
+    apu.generateSamples(&pcm[0], 1);
+    for (int i = 1; i < count; ++i) {
+        phaseIncHistory[static_cast<size_t>(i)] = apu.getVoicePhaseIncQ32ForTesting(slot);
+        levels[static_cast<size_t>(i)] = ApuCore::sawMipmapLevelForTesting(
+            phaseIncHistory[static_cast<size_t>(i)]);
+        apu.generateSamples(&pcm[static_cast<size_t>(i)], 1);
+    }
+
+    // Pass 2 - the same command in blocks, and it must agree sample for sample
+    // with pass 1. A resolver that kept its level for a whole block would move
+    // the output by a table's worth of harmonics for the rest of that block.
+    ApuCore blocked;
+    prepare(blocked, SoundProfile::Hybrid, kSampleRate);
+    TEST_ASSERT_TRUE(blocked.submitCommand(cmd));
+    std::vector<int16_t> blockPcm(static_cast<size_t>(count), 0);
+    for (int at = 0; at < count; at += kBlock) {
+        const int n = std::min(kBlock, count - at);
+        blocked.generateSamples(&blockPcm[static_cast<size_t>(at)], n);
+    }
+    int blockFirstDiff = -1;
+    int32_t blockWorst = 0;
+    for (int i = 0; i < count; ++i) {
+        const int32_t diff = std::abs(
+            static_cast<int32_t>(blockPcm[static_cast<size_t>(i)]) -
+            static_cast<int32_t>(pcm[static_cast<size_t>(i)]));
+        if (diff != 0 && blockFirstDiff < 0) blockFirstDiff = i;
+        blockWorst = std::max(blockWorst, diff);
+    }
+    char message[256];
+    std::snprintf(message, sizeof(message),
+                  "the block render diverged from the per-sample render at sample "
+                  "%d (worst %d LSB): the block cache lost its level", blockFirstDiff,
+                  blockWorst);
+    TEST_ASSERT_EQUAL_INT_MESSAGE(-1, blockFirstDiff, message);
+
+    // The case is only evidence if it really crosses a boundary AT a block edge.
+    int levelChanges = 0;
+    int atBlockBoundary = 0;
+    int minDistanceToBoundary = kBlock;
+    int32_t maxDeltaAtBoundaryChange = 0;
+    for (int i = 1; i < count; ++i) {
+        if (levels[static_cast<size_t>(i)] == levels[static_cast<size_t>(i - 1)]) continue;
+        ++levelChanges;
+        const int distance = i % kBlock;
+        minDistanceToBoundary = std::min(minDistanceToBoundary,
+                                         std::min(distance, kBlock - distance));
+        if (distance <= 1) {
+            ++atBlockBoundary;
+            maxDeltaAtBoundaryChange = std::max(
+                maxDeltaAtBoundaryChange,
+                std::abs(static_cast<int32_t>(pcm[static_cast<size_t>(i)]) -
+                         static_cast<int32_t>(pcm[static_cast<size_t>(i - 1)])));
+        }
+    }
+    const SeamBound bound = seamBound();
+    int32_t maxDelta = 0;
+    int peakHigh = 0;
+    int peakLow = 0;
+    for (int i = 0; i < count; ++i) {
+        const int value = static_cast<int>(pcm[static_cast<size_t>(i)]);
+        peakHigh = std::max(peakHigh, value);
+        peakLow = std::min(peakLow, value);
+        if (i == 0) continue;
+        maxDelta = std::max(maxDelta,
+                            std::abs(static_cast<int32_t>(pcm[static_cast<size_t>(i)]) -
+                                     static_cast<int32_t>(pcm[static_cast<size_t>(i - 1)])));
+    }
+    std::printf("  S6 vibrato: %d level changes, %d of them on a block edge "
+                "(closest %d samples), range [%d, %d] LSB (limit [-13107, 13106]), "
+                "largest delta %d LSB vs bound %d LSB, largest delta on a block "
+                "edge %d LSB (hard switch %d LSB)\n",
+                levelChanges, atBlockBoundary, minDistanceToBoundary, peakLow,
+                peakHigh, maxDelta, bound.boundPcm, maxDeltaAtBoundaryChange,
+                bound.hardSwitchJumpPcm);
+    TEST_ASSERT_TRUE_MESSAGE(levelChanges >= 3,
+                             "the vibrato did not cross three level boundaries");
+    TEST_ASSERT_TRUE_MESSAGE(peakHigh > 4000 && peakLow < -4000,
+                             "the vibrato rendered (nearly) silence");
+    TEST_ASSERT_TRUE_MESSAGE(peakHigh <= 13106 && peakLow >= -13107,
+                             "the vibrato left the unshaped output range");
+    TEST_ASSERT_TRUE_MESSAGE(maxDelta <= bound.boundPcm,
+                             "the vibrato stepped further than the tables justify");
+    // A block edge is where a per-block cache is tempted to jump a table: from
+    // the level it resolved before the sweep moved and the one after, the two
+    // tables differ by the whole adjacent-level difference. The window makes
+    // the incoming and outgoing sample read the same table.
+    TEST_ASSERT_TRUE_MESSAGE(maxDeltaAtBoundaryChange < bound.hardSwitchJumpPcm / 2,
+                             "a block edge jumped like a hard table switch");
 }
 
 void test_hybrid_saw_fast_sweep_stays_bounded(void)
@@ -701,15 +1077,24 @@ void test_hybrid_saw_fast_sweep_stays_bounded(void)
                                          0.02f, SweepCurve::Linear, preset);
     const std::vector<int16_t> pcm = render(SoundProfile::Hybrid, cmd,
                                             kSampleRate / 2);
-    int peak = 0;
+    int peakHigh = 0;
+    int peakLow = 0;
     for (int16_t sample : pcm) {
-        peak = std::max(peak, std::abs(static_cast<int>(sample)));
+        peakHigh = std::max(peakHigh, static_cast<int>(sample));
+        peakLow = std::min(peakLow, static_cast<int>(sample));
     }
-    // 32767 * 13107 / 32768 = 13106 is the largest PCM the unshaped path can
-    // emit; anything above it means an overflow or a summed crossfade.
-    std::printf("\n  S6 fast sweep peak %d LSB (unshaped limit 13106)\n", peak);
-    TEST_ASSERT_TRUE_MESSAGE(peak > 0, "the fast sweep rendered silence");
-    TEST_ASSERT_TRUE_MESSAGE(peak <= 13106,
+    // The unshaped path's own range: the mix scale is `(sum * 13107) >> 15`,
+    // and that shift FLOORS, so a +32767 voice lands on +13106 while a -32767
+    // one lands on -13107. The two sides are not symmetric, and a bound that
+    // tested only `|sample| <= 13106` would reject the legitimate negative
+    // peak the moment a sample reads a table's extreme value exactly. Anything
+    // outside this range is an overflow or a summed (rather than blended)
+    // crossfade.
+    std::printf("\n  S6 fast sweep range [%d, %d] LSB (unshaped range [-13107, 13106])\n",
+                peakLow, peakHigh);
+    TEST_ASSERT_TRUE_MESSAGE(peakHigh > 0 && peakLow < 0,
+                             "the fast sweep rendered silence");
+    TEST_ASSERT_TRUE_MESSAGE(peakHigh <= 13106 && peakLow >= -13107,
                              "the fast sweep left the unshaped output range");
 }
 
@@ -828,7 +1213,9 @@ int main(void)
     UNITY_BEGIN();
     RUN_TEST(test_hybrid_saw_reads_the_tables_and_others_keep_the_ramp);
     RUN_TEST(test_hybrid_saw_level_selection_matches_the_band_rule);
+    RUN_TEST(test_hybrid_saw_crossfade_window_is_narrow);
     RUN_TEST(test_hybrid_saw_glissando_crosses_levels_without_a_step);
+    RUN_TEST(test_hybrid_saw_fast_vibrato_keeps_up_with_its_blocks);
     RUN_TEST(test_hybrid_saw_fast_sweep_stays_bounded);
     RUN_TEST(test_hybrid_sine_is_not_band_limited);
     RUN_TEST(test_hybrid_saw_alias_improvement_through_the_renderer);
