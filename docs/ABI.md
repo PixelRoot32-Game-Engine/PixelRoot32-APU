@@ -212,8 +212,8 @@ Measured on 2026-10-28 with `tools/apu_bench_firmware` over `COM4`. Board: `ESP3
 
 | Board | Profile | 22 050 Hz, 1 / 8 voices (p50 µs) | 32 000 Hz, 1 / 8 voices (p50 µs) | Headroom at 8 voices | Underruns, 10 min |
 |---|---|---|---|---|---|
-| `esp32dev` | `Legacy` | 1 540 / 6 618 | 1 541 / 6 617 | 3.5x / 2.4x | `pendiente` |
-| `esp32dev` | `Nes` | 1 451 / 5 589 | 1 452 / 5 590 | 4.1x / 2.8x | `pendiente` |
+| `esp32dev` | `Legacy` | 1 540 / 6 618 | 1 541 / 6 617 | 3.5x / 2.4x | **0** |
+| `esp32dev` | `Nes` | 1 451 / 5 589 | 1 452 / 5 590 | 4.1x / 2.8x | **0** |
 | `esp32-c3-devkitm-1` | `Legacy`, `Nes` | `pendiente` | `pendiente` | `pendiente` | `pendiente` |
 
 What the table says:
@@ -221,6 +221,7 @@ What the table says:
 - The per-block cost is rate-invariant (6.6 ms for 512 samples at either rate), as it must be: what changes with the rate is the budget (23.2 ms vs 16 ms) and therefore the headroom.
 - On silicon the integer core is **1.18x faster** than the float body at 8 voices and **1.06x faster** at 1 voice. The host ratio (1.44-1.56x at 8 voices, and the integer path *slower* at 1 voice) does not transfer: the ESP32's single-precision FPU is not the bottleneck people assume.
 - 32 000 Hz with 8 voices leaves **2.4x** (`Legacy`) / **2.8x** (`Nes`): viable, and the tightest configuration in the matrix — which is why 22 050 Hz stayed the default.
-- Underruns remain `pendiente`: this bench measures render CPU only and never touches I2S. The ten-minute gate needs a harness that actually drives a backend; the plan records that gap.
+- **Underruns: 0 in ten minutes at both rates.** Measured with `tools/apu_underrun_probe` (engine repository), which drives the real I2S backend with eight voices on pins BCLK 26 / LRCK 25 / DOUT 22. Worst whole iteration: 23 221 us at 22 050 Hz (budget 23 220) and 15 995 us at 32 000 (budget 16 000). Worst write wait: 17 298 us and 10 087 us. The write wait is the figure that matters: with a one-block ring a healthy write blocks for most of the period, so a starving producer shows up as a write that barely waits, not as a slow iteration.
+- The I2S gate is a separate harness on purpose: this bench renders into RAM and never touches a peripheral, so it cannot count underruns. `esp32-c3-devkitm-1` and `esp32-s3-devkitc-1` remain `pendiente` for both the CPU table and the gate.
 
 The target `sizeof` printed by that bench is not `pendiente`: `sizeof_apu_core=9800`, `sizeof_audio_command=96`, `sizeof_audio_channel=296`, `queue_bytes=6144` on the 32-bit ABI, all consistent with §9.4. `Legacy` and `Nes` measure the same body on the C3 (no FPU), which the tool prints rather than hides.
