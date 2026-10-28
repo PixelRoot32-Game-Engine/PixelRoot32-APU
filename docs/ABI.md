@@ -167,7 +167,7 @@ The suite (`ctest`) includes `test_apu_mirror` with a **golden PCM** (`test/gold
 
 ### 9.1 Targets and case counts
 
-Measured 2026-10-28 on the sound-profile branch (`cmake -S . -B build -G "MinGW Makefiles" -DPR32_APU_BUILD_TESTS=ON`, `cmake --build build`, `cd build && ctest --output-on-failure` → `100% tests passed out of 15`). The case counts are Unity's summary line, each binary run from `test/`:
+Measured 2026-10-28 on the sound-profile branch (`cmake -S . -B build -G "MinGW Makefiles" -DPR32_APU_BUILD_TESTS=ON`, `cmake --build build`, `cd build && ctest --output-on-failure` → `100% tests passed out of 16`). The case counts are Unity's summary line, each binary run from `test/`:
 
 | Target | Cases | What it covers |
 |---|---|---|
@@ -180,13 +180,14 @@ Measured 2026-10-28 on the sound-profile branch (`cmake -S . -B build -G "MinGW 
 | `test_apu_output_filter_integer` | 12 | The same suite where `Legacy` has no float body (`PR32_APU_ENABLE_LEGACY_FLOAT=0`) |
 | `test_apu_wavetable_spectral` | 5 | E2/S4: the generated SAW mipmap — band limit per level, seam-free tables, the S5 alias sweep |
 | `test_apu_hybrid_wavetable` | 8 | E2/T3+T4: `Hybrid` reads the tables (level and crossfade window resolved per block, one table read outside the window), `Nes`/`Legacy` keep the ramp, SINE inert, block render bit-identical to the per-sample one |
+| `test_apu_profile_level` | 4 | E2 level trim: crest-weighted loudness parity against the integer `Legacy` anchor, and RMS never above `Legacy` |
 | `test_q15_smoke` | 15 | Integer/Q15 path smoke coverage |
 | `test_apu_integer_golden` | 1 | The integer core against the `Legacy` integer golden (FPU build with the float body off) |
 | `test_apu_integer_golden_no_fpu` | 1 | The same golden from a build with no FPU at all |
 | `test_apu_profile_golden` | 4 | `Nes` and `Hybrid` against their canonical and wavetable goldens (FPU build with the float body off) |
 | `test_apu_profile_golden_no_fpu` | 4 | The same four goldens from a build with no FPU at all |
 | `test_library_link` | 4 | Public symbols exist in the shipped artifact (links, no `UNIT_TEST`) |
-| **Total** | **568** | 0 failures, 0 ignored, exit code 0 in all fifteen |
+| **Total** | **572** | 0 failures, 0 ignored, exit code 0 in all sixteen |
 
 The five continuous-duty cases added by the full-scale fix (`test_pulse_duty_full_scale_*`, `test_pulse_duty_zero_never_goes_positive`, `test_pulse_duty_interior_value_unchanged`) live in `test/test_apu_core.cpp`, so both core targets run them; that is the 205 → 210 step on the two rows above.
 
@@ -211,7 +212,7 @@ The integer fixture is written by `python tools/golden_gen/run.py --write`, whic
 
 The E2 cost pass that followed the flash gate is bit-exact, so none of the six rows above moved. It replaced the output chain's int64 products and `/32768` divisions with int32 products and truncating shifts, and moved the coefficient derivation to `float`; `apu_golden_gen` reproduces all four profile fixtures byte for byte (0 differing samples, max |Δ| 0, RMS unchanged) and `apu_mirror_canonical` / `apu_integer_core_canonical` were not touched.
 
-The cost pass that followed it is **not** bit-exact, and only one row moved. `Hybrid`'s SAW crossfade was narrowed from the whole octave to the top 1/8 of each mipmap band (the neighbour table only removes the step at the boundary, and table `L` is alias-free everywhere in its band), and the level plus the window are now resolved once per voice per block instead of once per sample. Measured against the previous tree with the same generator: `apu_hybrid_wavetable` moved on 16 917 of 22 050 samples (max |Δ| 1 088 LSB, peak 9 965 → 10 351, RMS −0.060 dB) and was regenerated, which is the hash above. The other five rows are unchanged — `apu_mirror_canonical` (`7FF568A5…5DE9`), `apu_integer_core_canonical` (`F59501D6…3902D`), `apu_nes_canonical` (`645DE5C7…AA76`), `apu_hybrid_canonical` (`163F65E2…7708`) and `apu_nes_wavetable` (`A4012158…90CC`) were reproduced byte for byte by all three generator builds, and `Legacy`/`Nes` do not reach the changed path at all. Verified on 2026-10-28.
+The cost pass that followed it is **not** bit-exact, and only one row moved. `Hybrid`'s SAW crossfade was narrowed from the whole octave to the top 1/8 of each mipmap band (the neighbour table only removes the step at the boundary, and table `L` is alias-free everywhere in its band), and the level plus the window are now resolved once per voice per block instead of once per sample. Measured against the previous tree with the same generator: `apu_hybrid_wavetable` moved on 16 917 of 22 050 samples (max |Δ| 1 088 LSB, peak 9 965 → 10 351, RMS −0.060 dB) and was regenerated, which is the hash above. The other five rows are unchanged — `apu_mirror_canonical` (`7FF568A5…5DE9`), `apu_integer_core_canonical` (`F59501D6…3902D`), `apu_nes_canonical` (`645DE5C7…AA76`), `apu_hybrid_canonical` (`163F65E2…7708`) and `apu_nes_wavetable` (`A4012158…90CC`) were reproduced byte for byte by all three generator builds, and `Legacy`/`Nes` do not reach the changed path at all. Verified on 2026-10-28. The abbreviated hashes in this paragraph are the values measured at that pass; the level trim documented below regenerated the four profile fixtures afterwards, so the current references are the ones in the table at the top of this section.
 
 **The level trim: two attempts, and the metric was the bug.** `Nes` and `Hybrid` carry a fixed Q15 gain applied after the chain and before the master bitcrush, so a profile switch is a change of character and not of loudness. Getting the amount right took a listening check, and the first answer was wrong in a way worth keeping in the record.
 
