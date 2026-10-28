@@ -369,6 +369,17 @@ AudioConfig gConfig(&gBackend, kSampleRate);
 std::atomic<int32_t> gBlockPeak{0};
 
 /**
+ * @brief FNV-1a hash of everything the mix produced during the current block.
+ *
+ * `peak` cannot tell a block that replayed the same audio from one that changed
+ * profile: two different waveforms can share a peak. The hash is what makes the
+ * listening record defensible - if two profiles report the same hash for the
+ * same piece, the profile did not reach the renderer and the ear is being asked
+ * about nothing. Audio thread only; the main thread reads it between blocks.
+ */
+std::atomic<uint32_t> gBlockHash{2166136261u};
+
+/**
  * @brief Post-mix hook: tracks the peak of the buffer the audio task just mixed.
  *
  * `AudioEngine` copies its `AudioConfig` in the constructor, so setting
@@ -386,12 +397,18 @@ void postMixMono(int16_t* mono, int length, void* user)
         return;
     }
     int32_t peak = 0;
+    uint32_t hash = gBlockHash.load(std::memory_order_relaxed);
     for (int i = 0; i < length; ++i) {
         const int32_t value = mono[i] < 0 ? -static_cast<int32_t>(mono[i]) : mono[i];
         if (value > peak) {
             peak = value;
         }
+        // FNV-1a over the mixed samples: cheap, order sensitive and good enough
+        // to tell two renders apart.
+        hash ^= static_cast<uint32_t>(static_cast<uint16_t>(mono[i]));
+        hash *= 16777619u;
     }
+    gBlockHash.store(hash, std::memory_order_relaxed);
     int32_t current = gBlockPeak.load(std::memory_order_relaxed);
     while (peak > current &&
            !gBlockPeak.compare_exchange_weak(current, peak, std::memory_order_relaxed)) {
@@ -591,6 +608,7 @@ void startBlock(uint8_t blockIndex)
     Serial.flush();
 
     gBlockPeak.store(0, std::memory_order_relaxed);
+    gBlockHash.store(2166136261u, std::memory_order_relaxed);
     gUnderrunsAtBlockStart = gBackend.getUnderrunCount();
     gWorstRenderAtBlockStart = gBackend.getWorstRenderUs();
 
@@ -660,12 +678,14 @@ void reportBlock()
                                      ? (worstRenderNow - gWorstRenderAtBlockStart)
                                      : 0u;
     const long peak = static_cast<long>(gBlockPeak.load(std::memory_order_relaxed));
+    const unsigned long hash = static_cast<unsigned long>(
+        gBlockHash.load(std::memory_order_relaxed));
 
-    Serial.printf("REPORT piece=%s profile=%s underruns=%lu worst_render_us=%lu peak=%ld\n",
+    Serial.printf("REPORT piece=%s profile=%s underruns=%lu worst_render_us=%lu peak=%ld hash=%08lX\n",
                   kPieces[gPieceIndex].name,
                   kProfileNames[gBlockIndex % kProfileCount],
                   static_cast<unsigned long>(underruns),
-                  static_cast<unsigned long>(worstRender), peak);
+                  static_cast<unsigned long>(worstRender), peak, hash);
     Serial.flush();
 }
 
