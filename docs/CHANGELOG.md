@@ -123,6 +123,15 @@ first.
     (`apu_{nes,hybrid}_wavetable_s16le_44100.pcm`) pin the `Hybrid` SAW end to
     end, because the canonical track is PULSE-only and would not have seen it:
     a 220 → 900 Hz glide crosses two band edges inside a single note.
+  - **Measured cost, classic ESP32, p99 per 512-sample block at 22 050 Hz.**
+    `Legacy` flat (−0.1 %), `Nes` 8 voices **+4.96 %**, `Hybrid` 8 voices
+    **+6.82 %** — the profile that carries both changes misses the +6 % budget by
+    0.8 points at 26 % of the block. Flash **+8 624 B** of the 8 704 B allowance.
+    The C3 was not measurable: its native USB port delivers no application
+    output with either core USB mode, and a five-line probe sketch is equally
+    silent, so this is a tooling limit and not this change. `docs/ABI.md` §9.7
+    carries the full table, the two optimisations that were measured and
+    rejected, and what the last one cost in alias margin (18.52 → 13.71 dB).
 - **Tools**: `tools/mipmap_gen` generates and verifies the SAW tables
   (`python tools/mipmap_gen/generate.py --write|--check`); `tools/golden_gen`
   gained `--scene <canonical|wavetable>`, defaulting to `canonical`, so every
