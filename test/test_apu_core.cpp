@@ -6878,6 +6878,387 @@ void noise_legacy_character_is_unchanged(void) {
 }
 
 // =============================================================================
+// S6: stepped PULSE duty, its profile default and the D-3 overrides (E1/T4)
+// =============================================================================
+//
+// A NES duty pattern is eight phase steps long, so every probe below renders at
+// exactly eight output samples per period (44 100 / 8 = 5 512.5 Hz): one PCM
+// sample per phase step, with the oscillator reset to phase 0 on the note, which
+// makes the pattern readable straight off the sign of an aligned window.
+//
+// `configureMixerProbe` puts the shaping stage out of the way (HPF bypassed, no
+// soft clip) so the sign is the generator's own output and nothing else, and the
+// probe preset attacks in one sample with a flat sustain, so no window sample is
+// scaled by a moving envelope.
+
+static constexpr int kDutyProbeSamples = 256;
+static constexpr float kDutyProbeHz = 5512.5f;  // = 44 100 / 8, one sample per step
+// Sample 8 is the first cycle boundary that is already past the one-sample
+// attack: sample n carries phase step n % 8.
+static constexpr int kDutyProbeWindow = 8;
+
+/** @brief One duty probe: the resolved index plus the PCM it rendered. */
+struct DutyProbe {
+    uint8_t index = 255;
+    int16_t pcm[kDutyProbeSamples] = {};
+};
+
+/**
+ * @brief Renders one looping probe note and reports the resolved duty index.
+ * @param profile Sound profile in force for the note.
+ * @param type Waveform of the probe note.
+ * @param duty The note's own `duty` (and the preset's, so the two agree).
+ * @param pinIndex -1 leaves the profile default in force; 0..3 or 255 pins the
+ *        mode through `setVoicePulseDutyMode` BEFORE the note, which is the
+ *        order that makes the note-on the thing under test.
+ * @param out Probe result.
+ */
+static void probeDutyVoice(SoundProfile profile, WaveType type, float duty,
+                           int pinIndex, DutyProbe& out) {
+    ApuCore apu;
+    configureMixerProbe(apu, profile);
+    const int slot = ApuCore::SFX_VOICE_BASE;
+    if (pinIndex >= 0) {
+        apu.setVoicePulseDutyMode(slot, (uint8_t)pinIndex);
+    }
+
+    InstrumentPreset preset = mixerProbePreset();
+    preset.duty = duty;
+
+    AudioCommand cmd{};
+    cmd.type = AudioCommandType::PLAY_EVENT;
+    cmd.event.type = type;
+    cmd.event.frequency = kDutyProbeHz;
+    cmd.event.duration = 0.0f;
+    cmd.event.volume = 1.0f;
+    cmd.event.duty = duty;
+    cmd.event.loop = true;
+    cmd.event.preset = &preset;
+    TEST_ASSERT_TRUE(apu.submitCommand(cmd));
+
+    apu.generateSamples(out.pcm, kDutyProbeSamples);
+    out.index = apu.getVoiceNesOptions(slot).pulseDutyIndex;
+}
+
+/** @brief Sign of `pcm[i]` as +1/-1, or 0 for silence. */
+static int signOfSample(int16_t value) {
+    return (value > 0) ? 1 : ((value < 0) ? -1 : 0);
+}
+
+/**
+ * @brief Asserts the aligned window of a render matches an 8-step duty table.
+ *
+ * @param pcm Rendered PCM.
+ * @param pattern Table entry, 1 = high phase step, 0 = low.
+ * @param label Case name for the failure message.
+ */
+static void assertDutyPattern(const int16_t* pcm, const uint8_t (&pattern)[8],
+                              const char* label) {
+    for (int step = 0; step < 8; ++step) {
+        const int expected = pattern[step] ? 1 : -1;
+        const int actual = signOfSample(pcm[kDutyProbeWindow + step]);
+        char message[192];
+        std::snprintf(message, sizeof(message),
+                      "%s: phase step %d must be %s", label, step,
+                      pattern[step] ? "high" : "low");
+        TEST_ASSERT_EQUAL_INT_MESSAGE(expected, actual, message);
+    }
+}
+
+// S6 / D-3 tier 1: under a NES-derived profile a PULSE note renders the stepped
+// NES pattern chosen from its own `duty` — not the continuous `phaseQ32 <
+// dutyCycleQ32` comparison. A 0.5 note selects index 2, whose table entry is
+// {0,1,1,1,1,0,0,0}: 4 high of 8 (50 %), rotated one step from the continuous
+// square. Both halves are asserted, because the duty percentage alone cannot
+// tell the two generators apart.
+void duty_nes_profile_arms_the_stepped_pattern(void) {
+    static const uint8_t kIndex2Pattern[8] = {0, 1, 1, 1, 1, 0, 0, 0};
+
+    DutyProbe defaulted;
+    probeDutyVoice(SoundProfile::Nes, WaveType::PULSE, 0.5f, -1, defaulted);
+    TEST_ASSERT_EQUAL_UINT8_MESSAGE(2, defaulted.index,
+        "a 0.5 duty note under Nes must resolve to the 50 % NES step");
+
+    int highSteps = 0;
+    for (int step = 0; step < 8; ++step) {
+        if (signOfSample(defaulted.pcm[kDutyProbeWindow + step]) > 0) ++highSteps;
+    }
+    TEST_ASSERT_EQUAL_INT_MESSAGE(4, highSteps,
+        "the 50 % NES step must be high on 4 of the 8 phase steps");
+    assertDutyPattern(defaulted.pcm, kIndex2Pattern, "Nes 0.5 duty");
+
+    // The profile default IS the pinned pattern: same generator, same bytes.
+    DutyProbe pinned;
+    probeDutyVoice(SoundProfile::Nes, WaveType::PULSE, 0.5f, 2, pinned);
+    TEST_ASSERT_EQUAL_INT_MESSAGE(0, std::memcmp(defaulted.pcm, pinned.pcm,
+                                                sizeof(defaulted.pcm)),
+        "the profile default must render exactly the pattern its index selects");
+
+    // And it is not the continuous comparison: the same note under `Legacy`
+    // holds the first four steps high instead of steps 1..4.
+    DutyProbe legacy;
+    probeDutyVoice(SoundProfile::Legacy, WaveType::PULSE, 0.5f, -1, legacy);
+    TEST_ASSERT_TRUE_MESSAGE(std::memcmp(defaulted.pcm, legacy.pcm,
+                                        sizeof(defaulted.pcm)) != 0,
+        "the stepped 50 % pattern must differ from the continuous square");
+    static const uint8_t kContinuousPattern[8] = {1, 1, 1, 1, 0, 0, 0, 0};
+    assertDutyPattern(legacy.pcm, kContinuousPattern, "Legacy continuous 0.5");
+}
+
+// S6: the step is the NEAREST of the four NES duties, computed from the note's
+// own `duty` against the three midpoints:
+//
+//   0.1875 = (12.5 + 25) / 2 -> between step 0 and step 1
+//   0.375  = (25 + 50)   / 2 -> between step 1 and step 2
+//   0.625  = (50 + 75)   / 2 -> between step 2 and step 3
+//
+// A value below a midpoint rounds down, a value AT or above it rounds up, so an
+// exact tie picks the HIGHER duty: the comparison is `<` against each
+// midpoint, i.e. round-half-up. Every case below is a boundary of that rule.
+void duty_snapping_selects_the_nearest_nes_step(void) {
+    struct SnappingCase {
+        float duty;
+        uint8_t expected;
+        const char* why;
+    };
+    static const SnappingCase cases[] = {
+        {0.0f,   0, "below the first step clamps to 12.5 %"},
+        {0.0625f, 0, "half of the first step"},
+        {0.125f, 0, "12.5 % is step 0"},
+        {0.1874f, 0, "just below the 12.5/25 midpoint rounds down"},
+        {0.1875f, 1, "the exact midpoint rounds up to 25 %"},
+        {0.25f,  1, "25 % is step 1"},
+        {0.3749f, 1, "just below the 25/50 midpoint rounds down"},
+        {0.375f, 2, "the exact midpoint rounds up to 50 %"},
+        {0.5f,   2, "50 % is step 2"},
+        {0.6249f, 2, "just below the 50/75 midpoint rounds down"},
+        {0.625f, 3, "the exact midpoint rounds up to 75 %"},
+        {0.75f,  3, "75 % is step 3"},
+        {1.0f,   3, "above the last step clamps to 75 %"},
+    };
+
+    for (const SnappingCase& c : cases) {
+        DutyProbe probe;
+        probeDutyVoice(SoundProfile::Nes, WaveType::PULSE, c.duty, -1, probe);
+        char message[192];
+        std::snprintf(message, sizeof(message),
+                      "duty %.4f must snap to index %u: %s", (double)c.duty,
+                      (unsigned)c.expected, c.why);
+        TEST_ASSERT_EQUAL_UINT8_MESSAGE(c.expected, probe.index, message);
+    }
+
+    // Both NES-derived profiles share the rule, and neither one is a guess.
+    DutyProbe hybrid;
+    probeDutyVoice(SoundProfile::Hybrid, WaveType::PULSE, 0.25f, -1, hybrid);
+    TEST_ASSERT_EQUAL_UINT8(1, hybrid.index);
+}
+
+// S6 / D-3 tier 2: `setVoicePulseDutyMode` pins the pattern for the slot, and
+// the profile does NOT re-arm its own default over it on the next note. The pin
+// ignores the note's `duty` too: the selector owns the waveform mode, which is
+// the M2 contract ("ignored when pulseDutyIndex < 4").
+void duty_voice_override_survives_the_next_note(void) {
+    static const uint8_t kIndex3Pattern[8] = {1, 0, 1, 1, 1, 1, 1, 0};
+    static const uint8_t kContinuousPattern[8] = {1, 1, 1, 1, 0, 0, 0, 0};
+
+    ApuCore apu;
+    configureMixerProbe(apu, SoundProfile::Nes);
+    const int slot = ApuCore::SFX_VOICE_BASE;
+
+    // Every note below carries `duty` 0.5, i.e. the value that snaps to index 2:
+    // a profile re-arm would therefore be visible as 2, never as the pin.
+    InstrumentPreset preset = mixerProbePreset();
+    preset.duty = 0.5f;
+    preset.releaseTime = 0.0f;  // no release tail: the slot goes idle in place
+
+    static int16_t pcm[kDutyProbeSamples];
+    // A SHORT note rather than a looping one: it leaves the slot idle without
+    // resetting it, so the next note lands on the same slot and the per-slot
+    // mode is the only thing that can carry over (this is T3's pattern).
+    auto playShortNote = [&]() {
+        AudioCommand cmd{};
+        cmd.type = AudioCommandType::PLAY_EVENT;
+        cmd.event.type = WaveType::PULSE;
+        cmd.event.frequency = kDutyProbeHz;
+        cmd.event.duration = 0.002f;  // ~88 samples at 44.1 kHz
+        cmd.event.volume = 1.0f;
+        cmd.event.duty = 0.5f;
+        cmd.event.loop = false;
+        cmd.event.preset = &preset;
+        TEST_ASSERT_TRUE(apu.submitCommand(cmd));
+        apu.generateSamples(pcm, kDutyProbeSamples);
+    };
+    auto playLoopingNote = [&]() {
+        AudioCommand cmd{};
+        cmd.type = AudioCommandType::PLAY_EVENT;
+        cmd.event.type = WaveType::PULSE;
+        cmd.event.frequency = kDutyProbeHz;
+        cmd.event.duration = 0.0f;
+        cmd.event.volume = 1.0f;
+        cmd.event.duty = 0.5f;
+        cmd.event.loop = true;
+        cmd.event.preset = &preset;
+        TEST_ASSERT_TRUE(apu.submitCommand(cmd));
+        apu.generateSamples(pcm, kDutyProbeSamples);
+    };
+
+    playShortNote();
+    TEST_ASSERT_FALSE_MESSAGE(apu.isVoiceEnabledForTesting(slot),
+        "the short note must idle the slot for the next note to reuse it");
+    TEST_ASSERT_EQUAL_UINT8_MESSAGE(2, apu.getVoiceNesOptions(slot).pulseDutyIndex,
+        "the profile default must arm the note's own step first");
+
+    // Tier 2 wins: 75 %.
+    apu.setVoicePulseDutyMode(slot, 3);
+    TEST_ASSERT_EQUAL_UINT8(3, apu.getVoiceNesOptions(slot).pulseDutyIndex);
+
+    // The next note on the same slot carries duty 0.5, i.e. it would snap to
+    // index 2. The pinned selector must survive it: that is the whole point of
+    // the tier-2 marker, without which a voice-level choice dies on the next
+    // note-on.
+    playShortNote();
+    TEST_ASSERT_EQUAL_UINT8_MESSAGE(3, apu.getVoiceNesOptions(slot).pulseDutyIndex,
+        "the profile must not overwrite a pinned duty mode on the next note");
+
+    // And it is audible: the same pinned slot renders index 3's table.
+    playLoopingNote();
+    assertDutyPattern(pcm, kIndex3Pattern, "Nes pinned 75 % after a second note");
+
+    // Pinning the continuous sentinel works the same way: it is an explicit
+    // "this slot keeps the continuous generator", not a request to be re-armed.
+    // The selector is read per sample, so the sounding voice switches without a
+    // new note; 256 samples is a whole number of 8-sample periods, which keeps
+    // the window aligned to phase step 0.
+    apu.setVoicePulseDutyMode(slot, 255);
+    TEST_ASSERT_EQUAL_UINT8(255, apu.getVoiceNesOptions(slot).pulseDutyIndex);
+    apu.generateSamples(pcm, kDutyProbeSamples);
+    assertDutyPattern(pcm, kContinuousPattern, "Nes pinned continuous");
+
+    // `reset()` is what gives the slot back to the profile (it is per-slot
+    // state, exactly like the M2/M8 selectors it sits beside).
+    AudioCommand stop{};
+    stop.type = AudioCommandType::STOP_CHANNEL;
+    stop.channelIndex = (uint8_t)slot;
+    TEST_ASSERT_TRUE(apu.submitCommand(stop));
+    apu.generateSamples(pcm, 64);
+    playShortNote();
+    TEST_ASSERT_EQUAL_UINT8_MESSAGE(2, apu.getVoiceNesOptions(slot).pulseDutyIndex,
+        "a reset slot must fall back to the profile default");
+}
+
+// S6: PULSE only. The duty step is a property of the pulse generator, so for
+// every other waveform two notes that differ ONLY in `duty` must render the
+// same bytes — under both profiles — and no index may be armed.
+//
+// The comparison is within one profile on purpose: T2's weighting and T3's
+// unipolar noise already make `Nes` and `Legacy` differ for TRIANGLE and NOISE
+// by design, and repeating those assertions here would test the mixer instead
+// of the duty path. SINE and SAW join the pulse group at unity weight and carry
+// no other character, so for them the cross-profile half is exact and is
+// checked as well.
+void duty_profile_default_leaves_non_pulse_voices_untouched(void) {
+    static const WaveType types[] = {
+        WaveType::SINE, WaveType::SAW, WaveType::TRIANGLE, WaveType::NOISE,
+    };
+    static const char* const names[] = {"SINE", "SAW", "TRIANGLE", "NOISE"};
+    static const float duties[2] = {0.125f, 0.75f};  // opposite ends of the rule
+
+    for (int t = 0; t < 4; ++t) {
+        DutyProbe across[2];
+        for (int d = 0; d < 2; ++d) {
+            char label[128];
+            std::snprintf(label, sizeof(label), "%s under Nes at duty %.3f",
+                          names[t], (double)duties[d]);
+            probeDutyVoice(SoundProfile::Nes, types[t], duties[d], -1, across[d]);
+            TEST_ASSERT_EQUAL_UINT8_MESSAGE(255, across[d].index, label);
+            TEST_ASSERT_GREATER_THAN_INT32_MESSAGE(0,
+                peakMagnitude(across[d].pcm, kDutyProbeSamples), label);
+        }
+        char message[192];
+        std::snprintf(message, sizeof(message),
+                      "%s: changing the note duty must not change the render",
+                      names[t]);
+        TEST_ASSERT_EQUAL_INT_MESSAGE(0,
+            std::memcmp(across[0].pcm, across[1].pcm, sizeof(across[0].pcm)),
+            message);
+    }
+
+    // SINE and SAW: measured cross-profile agreement is 1 LSB in the settled
+    // window, and that residual is the two render cores' own rounding (the FPU
+    // build renders `Legacy` in float and both NES profiles integer), not the
+    // duty path — it is identical before and after this change, and it vanishes
+    // in `test_apu_core_integer`, where both profiles run the integer core.
+    // Asserted within that 1 LSB so a duty leak, which would move whole duty
+    // percentages, still fails loudly. TRIANGLE and NOISE are excluded on
+    // purpose: T2 gives TRIANGLE a 1.1316 weight and NOISE a 0.6569 one, and T3
+    // arms the NES noise period LUT, so those two differ across profiles by
+    // design and comparing them here would test the mixer instead.
+    static const WaveType unityTypes[] = {WaveType::SINE, WaveType::SAW};
+    static const char* const unityNames[] = {"SINE", "SAW"};
+    for (int t = 0; t < 2; ++t) {
+        DutyProbe nes;
+        DutyProbe legacy;
+        probeDutyVoice(SoundProfile::Nes, unityTypes[t], 0.5f, -1, nes);
+        probeDutyVoice(SoundProfile::Legacy, unityTypes[t], 0.5f, -1, legacy);
+        int32_t worst = 0;
+        for (int i = 8; i < kDutyProbeSamples; ++i) {
+            const int32_t delta = (int32_t)nes.pcm[i] - (int32_t)legacy.pcm[i];
+            const int32_t magnitude = (delta < 0) ? -delta : delta;
+            if (magnitude > worst) worst = magnitude;
+        }
+        char message[192];
+        std::snprintf(message, sizeof(message),
+                      "%s: Legacy and Nes differ by %d LSB per sample (limit 1)",
+                      unityNames[t], (int)worst);
+        TEST_ASSERT_LESS_OR_EQUAL_INT32_MESSAGE(1, worst, message);
+    }
+}
+
+// PRESERVE (T4): `Legacy` never arms a step. The index stays at the continuous
+// sentinel for every duty, and the rendered waveform is the continuous
+// comparison — which is what the two committed goldens and the canonical mirror
+// fixture pin byte for byte end to end.
+void duty_legacy_profile_keeps_continuous_duty(void) {
+    static const float duties[4] = {0.125f, 0.25f, 0.5f, 0.75f};
+
+    for (float duty : duties) {
+        DutyProbe probe;
+        probeDutyVoice(SoundProfile::Legacy, WaveType::PULSE, duty, -1, probe);
+        char message[160];
+        std::snprintf(message, sizeof(message),
+                      "Legacy must keep the continuous generator at duty %.3f",
+                      (double)duty);
+        TEST_ASSERT_EQUAL_UINT8_MESSAGE(255, probe.index, message);
+    }
+
+    // The preset's `duty` is still honoured as a continuous value: the phase
+    // comparison starts each period high and turns low at `duty`, so a 75 %
+    // note is high on 6 of the 8 steps and a 12.5 % one on 1. A stepped index
+    // cannot express this: its patterns start low at step 0 for 25/50 %.
+    for (float duty : duties) {
+        DutyProbe probe;
+        probeDutyVoice(SoundProfile::Legacy, WaveType::PULSE, duty, -1, probe);
+        int high = 0;
+        for (int i = kDutyProbeWindow; i < kDutyProbeWindow + 8; ++i) {
+            if (signOfSample(probe.pcm[i]) > 0) ++high;
+        }
+        char message[160];
+        std::snprintf(message, sizeof(message),
+                      "Legacy duty %.3f rendered %d high steps of 8", (double)duty,
+                      high);
+        if (duty == 0.125f) {
+            TEST_ASSERT_EQUAL_INT_MESSAGE(1, high, message);
+        } else if (duty == 0.25f) {
+            TEST_ASSERT_EQUAL_INT_MESSAGE(2, high, message);
+        } else if (duty == 0.5f) {
+            TEST_ASSERT_EQUAL_INT_MESSAGE(4, high, message);
+        } else {
+            TEST_ASSERT_EQUAL_INT_MESSAGE(6, high, message);
+        }
+    }
+}
+
+// =============================================================================
 // Unity test runner
 // =============================================================================
 
@@ -7142,6 +7523,13 @@ int main(int argc, char** argv) {
     RUN_TEST(profile_noise_defaults_yield_to_a_voice_override);
     RUN_TEST(noise_unipolar_override_survives_the_next_note);
     RUN_TEST(noise_legacy_character_is_unchanged);
+
+    // S6: stepped duty, profile default and the D-3 overrides (E1/T4)
+    RUN_TEST(duty_nes_profile_arms_the_stepped_pattern);
+    RUN_TEST(duty_snapping_selects_the_nearest_nes_step);
+    RUN_TEST(duty_voice_override_survives_the_next_note);
+    RUN_TEST(duty_profile_default_leaves_non_pulse_voices_untouched);
+    RUN_TEST(duty_legacy_profile_keeps_continuous_duty);
 
     // Integration tests
     RUN_TEST(test_apu_core_integration_full_pipeline);

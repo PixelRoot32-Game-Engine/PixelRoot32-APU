@@ -145,6 +145,67 @@ namespace pixelroot32::audio {
     }
 
     /**
+     * @brief PULSE duty step a NES-derived profile arms for a note (S6).
+     *
+     * `Nes` and `Hybrid` render the four discrete NES duty patterns instead of
+     * the continuous `phaseQ32 < dutyCycleQ32` comparison, because that is what
+     * the hardware does: the pulse channel has no duty register, only a 2-bit
+     * selector. The selector is chosen by NEAREST STEP from the note's own
+     * `duty`, so a composer who asks for 40 % gets the closest NES timbre (50 %)
+     * rather than silence or a made-up fifth pattern.
+     *
+     * The rule is round-half-up over the three midpoints:
+     *
+     *   | `duty`                | index       |
+     *   |-----------------------|-------------|
+     *   | `[0, 0.1875)`         | 0 (12.5 %)  |
+     *   | `[0.1875, 0.375)`     | 1 (25 %)    |
+     *   | `[0.375, 0.625)`      | 2 (50 %)    |
+     *   | `[0.625, 1]`          | 3 (75 %)    |
+     *
+     * An exact TIE (0.1875, 0.375, 0.625) rounds UP to the higher duty, because
+     * the comparison is `<` against each midpoint. All three midpoints are
+     * exactly representable in float, so the documented behaviour is
+     * reproducible, not a rounding accident.
+     *
+     * The input is the note's clamped `dutyCycle` (float) and not
+     * `dutyCycleQ32`, because the Q32 mirror is `(uint32_t)(duty * 2^32)` and
+     * therefore overflows at exactly `duty == 1.0` (2^32 does not fit in
+     * `uint32_t`) — a pre-existing property of `set_pulse_duty` that the
+     * continuous generator has always carried. The selector is armed instead of
+     * that comparison here, so a 100 % note still means "the 75 % step" rather
+     * than "the wrapped mirror", and snapping from the float keeps the two from
+     * disagreeing.
+     *
+     * `Legacy` answers the 255 sentinel — "keep the continuous generator" — for
+     * every duty. Every other value answers the nearest step, i.e. the
+     * NES-derived reading, which is the same treatment the profile defaults
+     * above give an unknown profile; `setSoundProfile` rejects unknown values,
+     * so this is a fallback and never a guess.
+     *
+     * Called once per note-on, never per sample: no float, division or
+     * transcendental is on the render path.
+     *
+     * @param profile Profile in force.
+     * @param duty The note's duty in [0, 1] (`AudioChannel::dutyCycle`).
+     * @return 0..3 to render a NES step, 255 to keep the continuous comparison.
+     */
+    static inline uint8_t profileDefaultPulseDutyIndex(SoundProfile profile,
+                                                       float duty) {
+        if (profile == SoundProfile::Legacy) {
+            return 255u;
+        }
+        // Midpoints of 12.5/25, 25/50 and 50/75 %, exactly representable.
+        constexpr float kMidStep0Step1 = 0.1875f;
+        constexpr float kMidStep1Step2 = 0.375f;
+        constexpr float kMidStep2Step3 = 0.625f;
+        if (duty < kMidStep0Step1) return 0u;
+        if (duty < kMidStep1Step2) return 1u;
+        if (duty < kMidStep2Step3) return 2u;
+        return 3u;
+    }
+
+    /**
      * @brief The mixer curve a sound profile selects (S4/D-3).
      *
      * Tier 1 of the D-3 precedence table owns the mix shape, so the profile is
@@ -2991,7 +3052,8 @@ namespace pixelroot32::audio {
     // has no per-voice field to write here and cannot be half-applied.
     //
     // E0 left this body empty because `Nes` and `Hybrid` were exact aliases.
-    // E1 gives it its first real assignment: the envelope curve.
+    // E1 gives it its real assignments: the envelope curve (S2), the noise
+    // character (S5) and the stepped PULSE duty (S6).
     void ApuCore::applyProfileCharacter(int slot) {
         Voice& ch = voices[slot];
 
@@ -3058,6 +3120,29 @@ namespace pixelroot32::audio {
                 // after a profile change would render the previous period.
                 retuneNoisePeriodFromSelector(ch, sampleRate);
             }
+        }
+
+        // S6 / D-3 tiers 1-3: PULSE duty. `Nes`/`Hybrid` arm the NES step
+        // nearest the note's own `duty`; `Legacy` keeps the continuous
+        // comparison. The writer is PULSE-only by construction — the index is
+        // read by the pulse generator alone, but resolving it for the other
+        // waveforms would still be wrong twice over: it would hand a NOISE or
+        // TRIANGLE voice a mode it can only inherit into a later PULSE note on
+        // the same slot, and it would make "the profile never touches the other
+        // waveforms" untrue to read.
+        if (ch.type == WaveType::PULSE && !ch.pulseDutyOverridden) {
+            // Tier 3, inside the duty domain: a note that ANIMATES its duty
+            // (a `dutySteps` table or a `dutySweep`) cannot be expressed by one
+            // static NES pattern — the renderer ignores `dutyCycleQ32` while an
+            // index is armed — so those notes keep the continuous generator.
+            // That is the note winning in its own domain (D-3), not an
+            // exception to it.
+            const bool animatedDuty = (ch.dutyStepCount > 0) ||
+                                      (ch.dutySweep != 0.0f) ||
+                                      (ch.dutySweepQ32 != 0);
+            ch.pulseDutyIndex = animatedDuty
+                ? 255u
+                : profileDefaultPulseDutyIndex(profile_, ch.dutyCycle);
         }
 
 #if defined(UNIT_TEST)
@@ -4089,6 +4174,10 @@ namespace pixelroot32::audio {
         } else {
             voices[slot].pulseDutyIndex = 255;
         }
+        // S6 / D-3 tier 2: an explicit mode pins the slot against the sound
+        // profile's default, so `255` here means "this voice keeps the
+        // continuous generator" for good, not only until the next note-on.
+        voices[slot].pulseDutyOverridden = true;
     }
 
     // Hito 3 M8: NES NOISE period LUT.

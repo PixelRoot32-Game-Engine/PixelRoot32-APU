@@ -81,12 +81,16 @@ if(PR32_APU_BUILD_TESTS)
     add_test(NAME test_apu_core_integer COMMAND test_apu_core_integer
              WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test)
 
-    # S9: the integer core's golden PCM. One source, two routes into the same
-    # core — `Nes` on an FPU build, `Legacy` on a no-FPU build — so a byte
-    # difference between the targets means the integer core still depends on
-    # the build, which is the defect the fixture exists to catch.
+    # S9: the integer core's golden PCM. One source, two builds into the same
+    # core — an FPU build with the float body compiled out, and a no-FPU build
+    # that has no float body at all — so a byte difference between the targets
+    # means the integer core still depends on the build, which is the defect the
+    # fixture exists to catch. Both reach it through `Legacy`: routing an FPU
+    # build through `Nes` was only equivalent while E0 kept the profiles
+    # byte-identical, and E1 makes `Nes` audibly different by design.
     add_executable(test_apu_integer_golden test/test_apu_integer_golden.cpp src/ApuCore.cpp)
-    target_compile_definitions(test_apu_integer_golden PRIVATE UNIT_TEST=1)
+    target_compile_definitions(test_apu_integer_golden PRIVATE
+        UNIT_TEST=1 PR32_APU_ENABLE_LEGACY_FLOAT=0)
     target_include_directories(test_apu_integer_golden PRIVATE include test test/support)
     target_link_libraries(test_apu_integer_golden PRIVATE pr32_apu_unity)
     add_test(NAME test_apu_integer_golden COMMAND test_apu_integer_golden

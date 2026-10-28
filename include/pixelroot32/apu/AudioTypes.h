@@ -591,6 +591,13 @@ namespace pixelroot32::audio {
          * values (1..254, >3 except 255) are treated as continuous by the
          * generator; set this per voice via `ApuCore::setVoicePulseDutyMode`.
          *
+         * S6: from E1 on this is also the field the sound profile writes.
+         * `Nes` and `Hybrid` arm a step (0..3) chosen from the note's own
+         * `duty`, and `Legacy` arms 255, so the value here is the RESOLVED mode
+         * the renderer reads rather than a caller-only opt-in. A voice-level
+         * write pins it (`pulseDutyOverridden`) and the profile then leaves it
+         * alone on every following note (D-3 tier 2).
+         *
          * Hito 1 M2.
          */
         uint8_t pulseDutyIndex = 255;
@@ -777,6 +784,28 @@ namespace pixelroot32::audio {
         EnvelopeCurve envelopeCurve = EnvelopeCurve::Linear;
 
         /**
+         * @brief Set once the caller pinned the PULSE duty mode of the slot.
+         *
+         * S6 / D-3 tier 2. `Nes` and `Hybrid` arm stepped duty by default
+         * (0..3, chosen from the note's own `duty`), so without this bit the
+         * profile would re-arm its own step on every note-on and
+         * `setVoicePulseDutyMode` could never outlive the note it was written
+         * on. Set by that setter — including through `setVoiceNesOptions`,
+         * which delegates to it — and cleared by `reset()` with the rest of the
+         * per-slot NES modes, so a recycled slot starts from the profile again.
+         *
+         * Pinning `255` is a real choice under a NES profile: it means "this
+         * slot keeps the continuous `dutyCycleQ32` comparison", and the profile
+         * must leave it alone.
+         *
+         * Declared here, after `envelopeCurve`, because that enum already
+         * forces one byte of alignment padding before the Q15 curve clocks
+         * below: this flag fills it, so `sizeof(AudioChannel)` — and therefore
+         * the pinned `ApuCore` size in test_apu_core.cpp — does not move.
+         */
+        bool pulseDutyOverridden = false;
+
+        /**
          * @brief Clock of the exponential curve (S2): one rate per stage plus a
          *        shared Q15 phase accumulator.
          *
@@ -856,6 +885,10 @@ namespace pixelroot32::audio {
             triangleQuantize4Bit = true;  // Hito 1 M1: 4-bit NES levels default ON
             triangleOctaveUp = false;     // Hito 1 M16: octave doubling opt-in
             pulseDutyIndex = 255;         // Hito 1 M2: 255 = continuous (legacy default)
+            // S6: the duty mode is per-slot state like the selectors above, so
+            // a reset slot goes back to "the profile decides" and the pin stops
+            // protecting a stale choice.
+            pulseDutyOverridden = false;
             nesNoiseLutIndex = 255;       // Hito 3 M8: 255 = derive period from frequency
             // S5: the noise character is per-slot state, so a reset slot goes
             // back to "the profile decides" — the resolved value falls back to
@@ -957,10 +990,10 @@ namespace pixelroot32::audio {
      * it — is its only per-voice owner.
      *
      * All defaults are "off", so a default-constructed instance disarms a
-     * voice completely. That includes the two character fields: writing this
-     * struct also PINS `noiseUnipolar` and `noiseLutIndex` against the sound
-     * profile's defaults (D-3 tier 2), which is exactly what "disarm" has to
-     * mean once a profile arms them.
+     * voice completely. That includes the three character fields: writing this
+     * struct also PINS `noiseUnipolar`, `noiseLutIndex` and `pulseDutyIndex`
+     * against the sound profile's defaults (D-3 tier 2), which is exactly what
+     * "disarm" has to mean once a profile arms them.
      *
      * NOTE: `noiseLfsrShort` is deliberately NOT here even though the
      * original M14 sketch listed it. That flag is owned per NOTE by
@@ -978,7 +1011,13 @@ namespace pixelroot32::audio {
         bool envelopeEnabled = false;
         /** Arms the M6 sweep unit (PULSE only). NOT the `$4001` E bit. */
         bool sweepUnitEnabled = false;
-        /** M2 duty mode: 0..3 select NES patterns, 255 = continuous. */
+        /**
+         * M2/S6 duty mode: 0..3 select NES patterns, 255 = continuous.
+         *
+         * Writing this struct also pins the mode against the profile's default,
+         * so `255` here means "this slot keeps the continuous generator" even
+         * under `Nes`/`Hybrid` — see `AudioChannel::pulseDutyOverridden`.
+         */
         uint8_t pulseDutyIndex = 255;
         /** M8 noise period: 0..15 select a LUT entry, 255 = from frequency. */
         uint8_t noiseLutIndex = 255;

@@ -184,6 +184,18 @@ namespace pixelroot32::audio {
          * The default `pulseDutyIndex == 255` keeps the legacy continuous
          * `dutyCycle` behaviour, so existing consumers are unaffected.
          *
+         * S6: since E1 the sound profile also owns this mode as its DEFAULT —
+         * `Nes` and `Hybrid` arm the step nearest the note's own `duty`, and
+         * `Legacy` arms continuous. A call here is a tier-2 override (D-3): it
+         * pins the mode for the slot, so the profile does NOT re-arm its own
+         * choice on the next note and the note's `duty` no longer selects the
+         * step. Passing 255 therefore means "this slot stays continuous" even
+         * under a NES-derived profile. The pin is per-slot state: it survives
+         * new notes and is cleared only by `Voice::reset()`.
+         *
+         * Like the other selectors, this is not safe to call concurrently with
+         * rendering.
+         *
          * @param slot Voice index [0, MAX_VOICES); out-of-range ignored.
          * @param nesDutyIndex 0..3 for NES discrete duty, 4..254 treated as
          *                     continuous (defensive), 255 for continuous.
@@ -292,6 +304,11 @@ namespace pixelroot32::audio {
          * own value on the next note. `noiseUnipolar` has no standalone setter,
          * which makes this method and `AudioCommandType::SET_NES_OPTIONS` its
          * only per-voice entry points.
+         *
+         * S6 adds `pulseDutyIndex` to that set: it is delegated to
+         * `setVoicePulseDutyMode`, which pins the duty mode against the
+         * profile's default, so applying a default-constructed struct returns a
+         * NES-profile PULSE voice to the continuous generator.
          *
          * Not safe to call concurrently with rendering. Use
          * `AudioCommandType::SET_NES_OPTIONS` from the game thread — it
@@ -1064,8 +1081,9 @@ namespace pixelroot32::audio {
          * to write for it and nothing that could be half-applied per voice.
          *
          * E0: `Nes`/`Hybrid` are exact aliases and therefore write nothing —
-         * the note path already leaves those values (S3). E1 changes only the
-         * body of this function.
+         * the note path already leaves those values (S3). E1 fills the body:
+         * the envelope curve (S2), the noise character (S5) and the stepped
+         * PULSE duty (S6), each as a DEFAULT the note or the voice may pin.
          *
          * @param slot Voice index [0, MAX_VOICES); the caller guarantees it is
          *             a valid voice of the pool.
