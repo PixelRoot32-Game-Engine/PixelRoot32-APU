@@ -92,4 +92,14 @@ if(PR32_APU_BUILD_TESTS)
     target_link_libraries(test_library_link PRIVATE pixelroot32-apu pr32_apu_unity)
     add_test(NAME test_library_link COMMAND test_library_link
              WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test)
+
+    # S2 clause 5: the integer core must compile on an FPU target with the
+    # float path switched off. Compile-only on purpose — there is no behaviour
+    # to assert, the build itself is the check, and it catches any integer-path
+    # symbol left inside a `#if !PR32_APU_HAS_FPU` guard.
+    add_library(pixelroot32-apu-integer-only-check STATIC src/ApuCore.cpp)
+    target_compile_definitions(pixelroot32-apu-integer-only-check PRIVATE
+        PR32_APU_HAS_FPU=1 PR32_APU_ENABLE_LEGACY_FLOAT=0)
+    target_include_directories(pixelroot32-apu-integer-only-check PRIVATE include)
+    target_compile_features(pixelroot32-apu-integer-only-check PRIVATE cxx_std_17)
 endif()

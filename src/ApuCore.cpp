@@ -2299,14 +2299,15 @@ namespace pixelroot32::audio {
         env.decayDelta   = (env.decaySamples > 0) ? (1.0f - sustainLevel) / (float)env.decaySamples : 0.0f;
         env.releaseDelta = (env.releaseSamples > 0) ? sustainLevel / (float)env.releaseSamples : 0.0f;
 
-#if !PR32_APU_HAS_FPU
-        // Initialize Q15 envelope fields for RISC-V fast path
+        // Initialize Q15 envelope fields. Unconditional: the integer core is
+        // compiled in every build (S2), so its envelope mirrors must always be
+        // in sync with the float fields above. On the float path they are
+        // simply unused.
         env.currentLevelQ15 = (int32_t)(env.currentLevel * 32768.0f);
         env.sustainLevelQ15 = (int32_t)(sustainLevel * 32768.0f);
         env.attackDeltaQ15 = (env.attackSamples > 0) ? (32768 / (int32_t)env.attackSamples) : 32768;
         env.decayDeltaQ15 = (env.decaySamples > 0) ? ((32768 - env.sustainLevelQ15) / (int32_t)env.decaySamples) : 0;
         env.releaseDeltaQ15 = (env.releaseSamples > 0) ? (env.sustainLevelQ15 / (int32_t)env.releaseSamples) : 0;
-#endif
 
         // LFO initialization
         ch->lfo.enabled = false;
@@ -2640,10 +2641,11 @@ namespace pixelroot32::audio {
         }
     }
 
-#if !PR32_APU_HAS_FPU
     // ------------------------------------------------------------------
-    // ADSR Envelope state machine (fixed-point Q15 for RISC-V)
+    // ADSR Envelope state machine (fixed-point Q15, portable integer core)
     // ------------------------------------------------------------------
+    // Compiled unconditionally: the integer core exists in every build (S2),
+    // so this tick must never be hidden behind an FPU guard again.
     static inline void tickEnvelopeQ15(AudioChannel& ch) {
         auto& env = ch.envelope;
         switch (env.stage) {
@@ -2686,7 +2688,6 @@ namespace pixelroot32::audio {
                 break;
         }
     }
-#endif
 
     // ------------------------------------------------------------------
     // LFO oscillator tick (triangle wave, per-sample)
@@ -2912,11 +2913,13 @@ namespace pixelroot32::audio {
         // HPF is `y[n] = x[n] - x[n-1] + R*y[n-1]`; R now lives in `hpfR_`
         // (Hito 4 M10) so the corner can be configured in Hz.
 
-#if PR32_APU_HAS_FPU
+#if PR32_APU_ENABLE_LEGACY_FLOAT
         // ---- Float path (native, ESP32 classic, ESP32-S3) ---------------
-        // Single float branch for every FPU-capable or desktop target; the
-        // integer/LUT branch below is reserved for no-FPU cores (and for
-        // native builds that force -DPR32_APU_HAS_FPU=0 in tests).
+        // Compiled when PR32_APU_ENABLE_LEGACY_FLOAT is set (defaults to
+        // PR32_APU_HAS_FPU). This is the frozen `Legacy` render body: no new
+        // functions, optimizations or sound fixes may land here. The
+        // integer/LUT branch below is the portable core and is compiled
+        // unconditionally, so an FPU build with the macro at 0 still links.
 
         // Hito 2 M3: APU cycles per render sample. Computed once per
         // generateSamples() call. When the frame counter is OFF (default)
@@ -2981,8 +2984,10 @@ namespace pixelroot32::audio {
             stream[i] = apply_master_bitcrush((int16_t)finalSample, masterBitcrushBits_);
         }
 #else
-        // ---- Integer / LUT path (ESP32-C3, RISC-V no-FPU) ---------------
-        // Uses the Q32 phase mirror + Q15 output per channel so the inner
+        // ---- Integer / LUT path (portable core: no-FPU targets, and FPU
+        // targets built with -DPR32_APU_ENABLE_LEGACY_FLOAT=0) --------------
+        // Unconditional body: it is the single core every platform can run
+        // (S2/S3). Uses the Q32 phase mirror + Q15 output per channel so the inner
         // loop contains zero soft-float operations. The LUT is pre-fitted
         // to the same compression curve as the FPU path, so both paths
         // produce numerically equivalent output.
