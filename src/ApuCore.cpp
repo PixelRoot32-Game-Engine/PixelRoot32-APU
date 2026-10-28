@@ -2022,6 +2022,13 @@ namespace pixelroot32::audio {
         return profileApplyCount_;
     }
 
+    int32_t ApuCore::getProfileTrimQ15ForTesting() const {
+        // `outTrimQ15_` is resolved with the chain's activation, so this reports
+        // unity when `setHpfCutoffHz` suppressed the chain (S8) — that is what
+        // the renderer applies, not what the profile would have applied.
+        return outTrimQ15_;
+    }
+
     EnvelopeCurve ApuCore::getVoiceEnvelopeCurveForTesting(int slot) const {
         if (slot < 0 || slot >= MAX_VOICES) {
             return EnvelopeCurve::ProfileDefault;

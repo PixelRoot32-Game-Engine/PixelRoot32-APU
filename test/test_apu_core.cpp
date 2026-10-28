@@ -5906,6 +5906,18 @@ static void renderCurveProbe(SoundProfile profile, EnvelopeCurve curve,
     apu.generateSamples(out, samples);
 }
 
+/// @brief The Q15 level trim a profile applies, as the renderer resolves it.
+///
+/// Reads the core instead of restating the constant, so a retune cannot leave
+/// this file asserting yesterday's gain.
+static int32_t trimForProfile(SoundProfile profile) {
+    ApuCore apu;
+    apu.init(44100);
+    apu.reset();
+    apu.setSoundProfile(profile);
+    return apu.getProfileTrimQ15ForTesting();
+}
+
 void profile_nes_and_hybrid_differ_only_by_the_envelope_curve(void) {
     constexpr int kSamples = 4096;
     static int16_t nesDefault[kSamples];
@@ -5932,13 +5944,16 @@ void profile_nes_and_hybrid_differ_only_by_the_envelope_curve(void) {
         "E1: Hybrid must no longer render the same bytes as Nes");
 
     // E2 changed what "same curve" means here. Bytes stopped matching when each
-    // audible profile got its own fixed level trim (`ApuCore.h`:
-    // `kProfileTrimNesQ15` = 47786 for `Nes`, `kProfileTrimHybridQ15` = 53854
-    // for `Hybrid`), so the same curve no longer produces the same samples.
-    // What still holds is the stronger claim: the two renders share one shape,
-    // and the trim ratio is the ONLY difference between them.
-    constexpr int kNesTrimQ15 = 47786;     // ApuCore::kProfileTrimNesQ15
-    constexpr int kHybridTrimQ15 = 53854;  // ApuCore::kProfileTrimHybridQ15
+    // audible profile got its own fixed level trim (`ApuCore.h`), so the same
+    // curve no longer produces the same samples. What still holds is the
+    // stronger claim: the two renders share one shape, and the trim ratio is the
+    // ONLY difference between them.
+    //
+    // The gains are READ from the core, never copied: the trim has already been
+    // retuned once on listening evidence, and a hand-copied constant only turns
+    // that into a silent stale assertion.
+    const int32_t kNesTrimQ15 = trimForProfile(SoundProfile::Nes);
+    const int32_t kHybridTrimQ15 = trimForProfile(SoundProfile::Hybrid);
 
     // Quantisation bound, derived rather than tuned. The renderer truncates
     // once per profile (`out = (raw * gain) >> 15`, toward zero), so comparing

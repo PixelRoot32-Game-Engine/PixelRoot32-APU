@@ -371,19 +371,27 @@ namespace pixelroot32::audio {
          * over all of this (S8).
          *
          * The stage also carries the profile's LEVEL TRIM, so a profile switch
-         * is a change of character and not of loudness. The chain alone put
-         * `Nes` 3.28 dB and `Hybrid` 4.31 dB below `Legacy` on the canonical
-         * track, so each of those profiles is lifted by exactly that much after
-         * the chain and before the master bitcrush. `Legacy` is the frozen
-         * anchor and stays at unity — it never runs the chain, so it never runs
-         * the multiply either. Both the amount and the activation are resolved
-         * once per configuration change. The trim is tied to the chain, so an
-         * explicit `setHpfCutoffHz()` suppresses it too: that caller asked for
-         * the historical one-pole, level included. The price is headroom —
-         * matched RMS on a 13–14 dB crest factor puts `Nes`/`Hybrid` peaks at
-         * roughly two thirds of full scale on a dense mix, where `Legacy` uses
-         * a third — so a consumer that mixes by peak rather than by ear should
-         * check its master level after switching.
+         * is a change of character and not of loudness. The trim is matched on
+         * crest-weighted loudness — `0.75 * RMS_dBFS + 0.25 * peak_dBFS`
+         * against `Legacy`, a documented heuristic rather than a standard —
+         * because matching RMS alone was tried first and sounded louder than
+         * `Legacy` on hardware: the chain's crest factor is 13–14 dB against
+         * `Legacy`'s 4.6 dB, so equal RMS lifts every transient by 3–4 dB. On
+         * the canonical track the two profiles are therefore lifted only
+         * **1.10 dB** (`Nes`) and **1.90 dB** (`Hybrid`) after the chain and
+         * before the master bitcrush, which leaves them about 2.2 / 2.4 dB
+         * BELOW `Legacy` in RMS — deliberately, since a crest-weighted match
+         * must never end up louder in RMS than the anchor. `Legacy` is the
+         * frozen anchor and stays at unity — it never runs the chain, so it
+         * never runs the multiply either. Both the amount and the activation
+         * are resolved once per configuration change. The trim is tied to the
+         * chain, so an explicit `setHpfCutoffHz()` suppresses it too: that
+         * caller asked for the historical one-pole, level included. Headroom
+         * is the price of the chain's transients: with these trims the
+         * canonical peaks are ~37 % of full scale (`Nes`) and ~41 %
+         * (`Hybrid`), against `Legacy`'s 18 %, and a dense mix reaches ~52 %
+         * and ~51 % — under the rail, but with less room than `Legacy`'s ~36 %,
+         * so a consumer mixing by peak should still check its master level.
          *
          * SAW is the one waveform whose TIMBRE the profile changes (S4): only
          * `Hybrid` reads a band-limited table, a mipmap of eight 256-point Q15
@@ -1052,6 +1060,20 @@ namespace pixelroot32::audio {
          */
         uint32_t getProfileApplyCountForTesting() const;
 
+        /**
+         * @brief Test-only: the Q15 level trim the active profile applies.
+         *
+         * The trim is profile character with no setter, so this is the only way
+         * to observe it. It exists so a test that derives a relation from the
+         * trim ratio reads the value the renderer used instead of keeping a
+         * second copy of the constant: a hand-copied constant goes stale the
+         * first time the trim is retuned, and that has already happened once.
+         *
+         * @return `kProfileTrimUnityQ15` under `Legacy`, the profile's gain
+         *         otherwise; unity when `setHpfCutoffHz` suppressed the chain.
+         */
+        int32_t getProfileTrimQ15ForTesting() const;
+
         // -- Envelope curve test diagnostics (E1/S2) -------------------
         /**
          * @brief Test-only: resolved ADSR curve of a voice slot.
@@ -1330,38 +1352,53 @@ namespace pixelroot32::audio {
          * Fixed per-profile output trim, Q15, applied after the chain and
          * before the master bitcrush.
          *
-         * The chain alone made a profile switch a level change, which is what
-         * the listener heard on hardware. Measured RMS of the committed
-         * canonical fixtures (22 050 samples at 44 100 Hz), with the INTEGER
-         * `Legacy` route as the anchor because the trim lives in that core:
+         * ANCHOR: crest-weighted loudness, `W = 0.75 * RMS_dBFS +
+         * 0.25 * peak_dBFS`, matched to `Legacy`. This is a documented
+         * heuristic, not a standard, and it is stated here so it can be argued
+         * with. It exists because pure RMS was tried first and the EAR
+         * rejected it: `Legacy`'s crest factor on the canonical track is
+         * 4.6 dB against the chain's 13.3 / 14.3 dB, so equal RMS lifts every
+         * transient by 3-4 dB and the two profiles sounded louder and clearer
+         * than `Legacy` on hardware (listening check, 2026-10-28). Pure peak
+         * would overcorrect below the un-trimmed level; 0.75 / 0.25 lands
+         * between the two and is what ships.
          *
-         *   Legacy  -19.70 dBFS   (frozen contract; exactly unity here)
-         *   Nes     -22.98 dBFS   -> +3.28 dB -> 47786  (x1.45831)
-         *   Hybrid  -24.01 dBFS   -> +4.31 dB -> 53854  (x1.64349)
+         * Measured on the canonical fixtures (22 050 samples at 44 100 Hz)
+         * BEFORE any trim, with the INTEGER `Legacy` route as the anchor
+         * because the trim lives in that core:
          *
-         * with `gainQ15 = round(10^(dB/20) * 32768)`. The integers below are
-         * that value; re-deriving it from the two-decimal dB figures printed
-         * here agrees within 0.01 dB. The float `Legacy` route reads -20.15
-         * dBFS and is 0.45 dB away, and is deliberately NOT matched: touching
-         * it would move the frozen path.
+         *            RMS dBFS   peak dBFS    W
+         *   Legacy    -19.70     -15.10    -18.55   (frozen contract; unity)
+         *   Nes       -22.98      -9.67    -19.65   -> +1.10 dB -> 37192
+         *   Hybrid    -24.01      -9.69    -20.43   -> +1.90 dB -> 40780
+         *
+         * with `gainQ15 = round(10^(dB/20) * 32768)`: the two integers below
+         * are exactly that value for 1.10 dB and 1.90 dB, so a reader can
+         * re-derive them from the dB figures above. Both trims are SMALLER
+         * than the equal-RMS trims that shipped first and were walked back
+         * (+3.28 / +4.31 dB, constants 47786 / 53854); the resulting RMS sits
+         * about 2.2 / 2.4 dB BELOW `Legacy`, which is the intended landing
+         * zone — a crest-weighted match must be quieter in RMS than the
+         * anchor, never louder. The float `Legacy` route reads -20.15 dBFS and
+         * is deliberately NOT matched: touching it would move the frozen path.
          *
          * `Legacy` never pays for this. The trim is applied only on the chain
          * branch of the render path, and `Legacy` never takes that branch, so
          * the multiply cannot reach the frozen arithmetic even as a no-op.
          *
          * The product bound is the same class as the coefficients above:
-         * |sample| <= 32767 and the largest trim is 53854, so
-         * 32767 * 53854 = 1 764 634 018 < 2^31 and the product fits `int32_t`.
+         * |sample| <= 32767 and the largest trim is 40780, so
+         * 32767 * 40780 = 1 336 238 260 < 2^31 and the product fits `int32_t`.
          * The result is clamped to the int16 rail like every other stage
          * output — the trim is the only stage that can push a legal chain
          * output back over it.
          */
         static constexpr int32_t kProfileTrimUnityQ15 = 32768;   ///< 1.0, `Legacy`
-        static constexpr int32_t kProfileTrimNesQ15 = 47786;     ///< +3.28 dB
-        static constexpr int32_t kProfileTrimHybridQ15 = 53854;  ///< +4.31 dB
+        static constexpr int32_t kProfileTrimNesQ15 = 37192;     ///< +1.10 dB
+        static constexpr int32_t kProfileTrimHybridQ15 = 40780;  ///< +1.90 dB
         static_assert(
             static_cast<int64_t>(32767) * kProfileTrimHybridQ15 <= 2147483647LL,
-            "trim * sample must fit int32_t (32767 * 53854 = 1764634018)");
+            "trim * sample must fit int32_t (32767 * 40780 = 1336238260)");
 
         /** True when the profile owns the stage and no caller override exists. */
         bool outputFilterActive_ = false;

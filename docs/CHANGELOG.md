@@ -98,28 +98,43 @@ first.
     historical one-pole keeps running at that corner. `reset()` clears the
     override. This mirrors the `pulseDutyOverridden` / `noiseUnipolarOverridden`
     convention of the character work above.
-  - **Level trim: switching profile is no longer a loudness change.** The
-    chain left `Nes` at **−22.98 dBFS** and `Hybrid` at **−24.01 dBFS** RMS on
-    the canonical track, against the integer `Legacy` anchor's **−19.70 dBFS** —
-    a 3.28 / 4.31 dB drop that a listener hears as a volume change, not as
-    character. Both profiles now carry a fixed Q15 gain after the chain and
-    before the master bitcrush (**+3.28 dB**, ×1.45837, and **+4.31 dB**,
-    ×1.64346), resolved once per configuration change with the chain's
-    activation. A rendered A/B measures `Nes` −19.70 and `Hybrid` −19.69 dBFS,
-    **within 0.01 dB of `Legacy`**. `Legacy` is the frozen anchor and stays at
-    exact unity — it does not take the chain branch, so it never runs the
-    multiply — and both of its fixtures are byte-identical. The trim is part of
-    the chain: `setHpfCutoffHz()` suppresses chain and trim together, because
-    that caller asked for the historical one-pole, level included.
-    **The price is headroom.** The chain's crest factor is 13–14 dB against
-    `Legacy`'s 4.6 dB, so matching RMS raises peaks by the same gain: canonical
-    peaks go **10 758 → 15 688** (`Nes`) and **10 744 → 17 657** (`Hybrid`), and
-    on the listening demo's denser `complex` piece 14 946 → **≈21 800** and
-    13 356 → **≈21 950**, two thirds of full scale against `Legacy`'s 11 763.
-    Nothing clips on that material, but there is much less room than `Legacy`
-    leaves: check the master level on a dense mix instead of assuming it. The
-    per-sample cost is one multiply and the clamp the loop already performs, on
-    the two profiles that run the chain; `Legacy`'s work is unchanged.
+  - **Level trim: switching profile is no longer a loudness change — and the
+    first attempt at it was wrong.** The chain left `Nes` at **−22.98 dBFS** and
+    `Hybrid` at **−24.01 dBFS** RMS on the canonical track, against the integer
+    `Legacy` anchor's **−19.70 dBFS**. The trim that ships is matched on
+    **crest-weighted loudness, `0.75 × RMS dBFS + 0.25 × peak dBFS`**, a
+    documented heuristic rather than a standard: **+1.10 dB** (`Nes`,
+    37192/32768) and **+1.90 dB** (`Hybrid`, 40780/32768), applied after the
+    chain and before the master bitcrush, resolved once per configuration
+    change with the chain's activation.
+    **The failed first attempt is part of the record.** It matched raw RMS
+    instead: +3.28 dB and +4.31 dB, landing both profiles at −19.70 dBFS, within
+    0.01 dB of `Legacy`. It measured perfect and it was wrong — on hardware the
+    user reported `Nes` and `Hybrid` as **louder and clearer than `Legacy` in
+    every sample**. The crest factors are why: 13.3 / 14.3 dB for the chain
+    against 4.6 dB for `Legacy`, so an RMS match lifts every transient by 3–4 dB
+    and the ear reads that as more power. Equal RMS is only a proxy for equal
+    loudness when the crest factors are comparable. A metric can pass while the
+    sound is wrong; that is why the test now asserts the weighted figure, prints
+    RMS/peak/crest beside it, and separately forbids RMS from rising above
+    `Legacy`'s.
+    **Where it landed.** Measured on the canonical track, `Nes` reads
+    −18.554 weighted against `Legacy`'s −18.549 (**−0.005 dB**) and `Hybrid`
+    −18.528 (**+0.021 dB**), with RMS **2.18 / 2.41 dB below** `Legacy` — between
+    the un-trimmed state and the rejected RMS-matched one, which is the intended
+    zone. Canonical peaks are now **12 210** (`Nes`, 37 % of full scale) and
+    **13 370** (`Hybrid`, 41 %) against `Legacy`'s 5 758 (18 %); on the listening
+    demo's denser `complex` piece they land near **16 960** and **16 620**
+    (about half scale), against the rejected attempt's ≈21 800 / ≈21 950. Still
+    less room than `Legacy` leaves, but nothing clips: check the master level on
+    a dense mix instead of assuming it. `Legacy` is the frozen anchor and stays
+    at exact unity — it does not take the chain branch, so it never runs the
+    multiply — and both of its fixtures are byte-identical through both
+    attempts. The trim is part of the chain: `setHpfCutoffHz()` suppresses chain
+    and trim together, because that caller asked for the historical one-pole,
+    level included. The per-sample cost is one multiply and the clamp the loop
+    already performs, on the two profiles that run the chain; `Legacy`'s work is
+    unchanged.
   - **Band-limited SAW (`Hybrid` only).** Eight 256-point Q15 tables keyed on
     `q = f / fs` (never on absolute Hz, because the band limit is Nyquist), one
     per octave, with harmonic counts 128 down to 1 taken from the band's worst
@@ -177,7 +192,7 @@ first.
 - Consumers on `PR32_APU_HAS_FPU=0` targets that calibrated levels or wrote PCM references against the integer path must regenerate them: the path no longer leaves a −199 DC offset behind a silenced voice.
 - Consumers that sized a buffer from `AUDIO_COMMAND_QUEUE_CAPACITY` should read it rather than hard-coding 128; the default is now 64, and more than 63 outstanding commands between consumer passes will be dropped.
 - Consumers that selected `Nes` or `Hybrid` while this release sat unreleased should re-check their levels: the mix balance changed on purpose (a triangle is +1.07 dB against a pulse, noise −3.65 dB), `Hybrid` envelopes now decay exponentially, PULSE duty snaps to the nearest NES step, and noise percussion follows the NES period LUT instead of the preset's own `noisePeriod`. No released version ever exposed those profiles as aliases, so there is nothing to migrate from.
-- Consumers already using `Nes`/`Hybrid` must re-check their levels **again** after E2: the output chain takes the canonical track from -19.7/-20.7 dBFS to -23.0/-24.0 dBFS RMS while nearly doubling the peak, because the 440 Hz high-pass removes low-mid energy and the two cascaded high-passes spike on every edge. E2 ships a fixed per-profile trim that puts the RMS back on the `Legacy` anchor (-19.7 dBFS), so the loudness loss is compensated; the peak growth is not, and after the trim `Nes`/`Hybrid` peak near two thirds of full scale on a dense mix where `Legacy` uses a third. Anything calibrated against a `Nes`/`Hybrid` render before this release - including recorded references and loudness budgets - must be re-measured, not inherited.
+- Consumers already using `Nes`/`Hybrid` must re-check their levels **again** after E2: the output chain takes the canonical track from -19.7/-20.7 dBFS to -23.0/-24.0 dBFS RMS while nearly doubling the peak, because the 440 Hz high-pass removes low-mid energy and the two cascaded high-passes spike on every edge. E2 ships a fixed per-profile trim matched on crest-weighted loudness (0.75 x RMS + 0.25 x peak) to the `Legacy` anchor, so the profiles end up 2.2/2.4 dB BELOW `Legacy` in RMS while level with it on the weighted figure - deliberately, because an earlier RMS-matched trim (+3.28/+4.31 dB) measured equal and sounded louder on hardware. Peak growth is reduced but not gone: `Nes`/`Hybrid` peak at ~37 %/41 % of full scale on the canonical track and ~52 %/51 % on a dense mix, against `Legacy`'s 18 %/36 %. Anything calibrated against a `Nes`/`Hybrid` render before this release - including recorded references and loudness budgets - must be re-measured, not inherited.
 - Consumers on FPU builds that set `setHpfCutoffHz()` to a custom corner keep exactly that one-pole filter under every profile: the profile chain does not install over an explicit corner, and `reset()` clears the override. That is the escape hatch if the NES chain is not wanted on a specific build.
 - Nothing else changes: the default profile is `Legacy`, and on FPU builds it still renders the same bytes as 2.0.0.
 
