@@ -31,15 +31,23 @@
  *             plus a four-voice PLAY_EVENT layer on the SFX slots (eight voices
  *             at the peak), the same partition the gate harness exercises.
  *
- * No display, no buttons, no dynamic allocation in the audio path: every note
- * table is `constexpr` and lives in flash.
+ * A status panel (TFT_eSPI, ILI9341) is repainted once per block with the piece
+ * and the profile, so the listener can see from across the room what the serial
+ * log already says. The panel is optional by construction: the audio starts
+ * before the display is touched and every draw is gated on a ready flag, so a
+ * missing or broken screen can never silence the harness.
+ *
+ * No buttons, no dynamic allocation in the audio path: every note table is
+ * `constexpr` and lives in flash.
  */
 
 #include <Arduino.h>
+#include <TFT_eSPI.h>
 
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 
 #include <audio/AudioConfig.h>
 #include <audio/AudioEngine.h>
@@ -88,6 +96,14 @@ constexpr int kI2sLrck = 21;
 constexpr int kI2sDout = 19;
 /** @brief Sample rate the comparison runs at. */
 constexpr int kSampleRate = 22050;
+
+/** @brief Logical panel size after the quarter turn (TFT_WIDTH/HEIGHT are 240x320). */
+constexpr int kScreenWidth = 320;
+constexpr int kScreenHeight = 240;
+/** @brief Quarter turn applied to the physical portrait mounting. */
+constexpr uint8_t kDisplayRotation = DISPLAY_ROTATION;
+static_assert(kScreenWidth == TFT_HEIGHT && kScreenHeight == TFT_WIDTH,
+              "the status layout is written for the 240x320 panel after its quarter turn");
 
 /** @brief One block per piece x profile combination. */
 constexpr uint32_t kBlockMs = 12000;
@@ -349,6 +365,10 @@ constexpr Piece kPieces[] = {
 constexpr SoundProfile kProfiles[] = {SoundProfile::Legacy, SoundProfile::Nes,
                                       SoundProfile::Hybrid};
 constexpr const char* kProfileNames[] = {"Legacy", "Nes", "Hybrid"};
+/** @brief Uppercase piece names for the panel; the serial lines keep lower case. */
+constexpr const char* kPieceLabels[] = {"SIMPLE", "MEDIUM", "COMPLEX"};
+/** @brief Uppercase profile names for the panel. */
+constexpr const char* kProfileLabels[] = {"LEGACY", "NES", "HYBRID"};
 
 // ---------------------------------------------------------------------------
 // Engine wiring.
@@ -416,6 +436,39 @@ void postMixMono(int16_t* mono, int length, void* user)
 }
 
 AudioEngine gEngine(gConfig);
+
+// ---------------------------------------------------------------------------
+// Status panel.
+//
+// Used directly instead of through the engine's Renderer: this is one static
+// screen per block, not a game, and pulling the renderer/scene/input stack in
+// would cost flash and bring configuration the harness does not need.
+// ---------------------------------------------------------------------------
+
+/** @brief One drawing target for the whole firmware. */
+TFT_eSPI gTft;
+
+/**
+ * @brief True only after a completed display init.
+ *
+ * `TFT_eSPI::init()` returns void, so there is no failure code to branch on and
+ * no panel probe is safe to trust (a read can fail on a healthy panel and would
+ * then disable a working screen). What this flag does guarantee is that no draw
+ * is ever attempted before the bus and controller were configured, and every
+ * draw returns immediately while it is false: a missing panel costs the screen
+ * and nothing else.
+ */
+bool gDisplayReady = false;
+
+/** @brief Per-block numbers carried from the report to the next block's panel. */
+struct BlockStats {
+    uint32_t underruns = 0;      ///< Backend underrun delta of the block.
+    int32_t peak = 0;            ///< Largest absolute mixed sample.
+    uint32_t hash = 0;           ///< FNV-1a of the block's mixed samples.
+    bool valid = false;          ///< False until at least one block has ended.
+};
+
+BlockStats gLastStats;
 
 // ---------------------------------------------------------------------------
 // Block state.
@@ -587,6 +640,139 @@ void serveComplexGrid()
 }
 
 /**
+ * @brief Colour the profile is coded with on the panel.
+ *
+ * The three colours are the "read it from across the room" part of the screen,
+ * so they are fixed here and not derived from the theme: white is the flat
+ * reference, green the stepped-NES profile and cyan the exponential one.
+ * @param profileIndex Index into `kProfiles`.
+ * @return RGB565 colour for that profile.
+ */
+uint16_t profileColor(uint8_t profileIndex)
+{
+    switch (profileIndex) {
+        case 1:
+            return TFT_GREEN;
+        case 2:
+            return TFT_CYAN;
+        case 0:
+        default:
+            return TFT_WHITE;
+    }
+}
+
+/**
+ * @brief Configures the panel, if there is one.
+ *
+ * Called after the first block is already playing, so nothing here can delay
+ * the audio. `init()` returns void and shifts its commands out over SPI without
+ * waiting for an answer, so it cannot block on an absent panel either.
+ * @return true when the panel reported the expected logical size.
+ */
+bool initDisplay()
+{
+    gTft.init();
+    gTft.setRotation(kDisplayRotation);
+
+    // The dimension check catches a mis-set driver or rotation, which would make
+    // the fixed 320x240 layout overflow. It says nothing about an absent panel:
+    // that case still "succeeds" and simply draws into nothing.
+    const int width = gTft.width();
+    const int height = gTft.height();
+    if (width != kScreenWidth || height != kScreenHeight) {
+        Serial.printf("# WARN display reports %dx%d, expected %dx%d; screen disabled\n", width,
+                      height, kScreenWidth, kScreenHeight);
+        Serial.flush();
+        return false;
+    }
+    gTft.fillScreen(TFT_BLACK);
+    return true;
+}
+
+/**
+ * @brief Repaints the whole status screen for the block that is starting.
+ *
+ * Called once per block and never from the audio path. The SPI burst is one
+ * screen of work (a few tens of milliseconds at 55 MHz), and it runs on the main
+ * task while the audio task keeps feeding I2S on its own, so a redraw cannot
+ * starve DMA; that is also why there is no animation and no delay here.
+ */
+void drawStatusScreen()
+{
+    if (!gDisplayReady || gTft.width() != kScreenWidth || gTft.height() != kScreenHeight) {
+        return;
+    }
+
+    const uint8_t profileIndex = static_cast<uint8_t>(gBlockIndex % kProfileCount);
+    const uint16_t colour = profileColor(profileIndex);
+    const int centreX = kScreenWidth / 2;
+
+    gTft.fillScreen(TFT_BLACK);
+    gTft.setTextDatum(TL_DATUM);
+    gTft.setTextSize(1);
+
+    // Alive line first: it is on screen even before the first report exists,
+    // so a black panel is a display problem and never mistaken for a dead board.
+    gTft.setTextFont(1);
+    gTft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    gTft.drawString("APU LISTEN  22050 Hz  I2S 5/21/19", 8, 4);
+
+    gTft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    gTft.drawString("PIECE", 8, 18);
+
+    // 26 px letters at x2: blocky enough to read across a room, and the built-in
+    // font 6 is digits-only, so the height has to come from scaling, not fatter
+    // glyphs.
+    gTft.setTextDatum(TC_DATUM);
+    gTft.setTextFont(4);
+    gTft.setTextSize(2);
+    gTft.setTextColor(TFT_WHITE, TFT_BLACK);
+    gTft.drawString(kPieceLabels[gPieceIndex], centreX, 28);
+
+    gTft.setTextDatum(TL_DATUM);
+    gTft.setTextSize(1);
+    gTft.setTextFont(1);
+    gTft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    gTft.drawString("PROFILE", 8, 86);
+
+    gTft.setTextDatum(TC_DATUM);
+    gTft.setTextFont(4);
+    gTft.setTextSize(3);
+    gTft.setTextColor(colour, TFT_BLACK);
+    gTft.drawString(kProfileLabels[profileIndex], centreX, 96);
+
+    // The bar repeats the profile colour in a shape that reads without letters.
+    gTft.fillRect(0, 178, kScreenWidth, 6, colour);
+
+    gTft.setTextDatum(TL_DATUM);
+    gTft.setTextSize(1);
+    gTft.setTextFont(2);
+    gTft.setTextColor(TFT_WHITE, TFT_BLACK);
+    char line[48];
+    std::snprintf(line, sizeof(line), "BLOCK %u/%u",
+                  static_cast<unsigned>(gBlockIndex) + 1u,
+                  static_cast<unsigned>(kBlockCount));
+    gTft.drawString(line, 8, 190);
+
+    gTft.setTextFont(1);
+    gTft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    if (gLastStats.valid) {
+        std::snprintf(line, sizeof(line), "PREV UNDERRUNS %lu   PEAK %ld",
+                      static_cast<unsigned long>(gLastStats.underruns),
+                      static_cast<long>(gLastStats.peak));
+        gTft.drawString(line, 8, 210);
+        std::snprintf(line, sizeof(line), "PREV HASH %08lX",
+                      static_cast<unsigned long>(gLastStats.hash));
+        gTft.drawString(line, 8, 221);
+    } else {
+        gTft.drawString("PREV none yet - first block", 8, 210);
+    }
+
+    gTft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    gTft.drawString("prev = the block that just ended; serial is the record", 8, 230);
+}
+
+/**
  * @brief Prints the block banner and starts everything the block needs.
  * @param blockIndex 0-based programme position (piece x profile).
  */
@@ -658,6 +844,11 @@ void startBlock(uint8_t blockIndex)
         Serial.flush();
     }
 
+    // The audio commands are already queued; the panel is painted while the
+    // audio task starts the block, so the two agree within one screen's worth of
+    // SPI time (and a screen-less board simply returns here).
+    drawStatusScreen();
+
     gBlockStartMs = millis();
     gGridLastServed = -1;
 }
@@ -680,6 +871,13 @@ void reportBlock()
     const long peak = static_cast<long>(gBlockPeak.load(std::memory_order_relaxed));
     const unsigned long hash = static_cast<unsigned long>(
         gBlockHash.load(std::memory_order_relaxed));
+
+    // Keep the same numbers for the next block's panel, so the screen and the
+    // serial report can never disagree.
+    gLastStats.underruns = underruns;
+    gLastStats.peak = static_cast<int32_t>(peak);
+    gLastStats.hash = static_cast<uint32_t>(hash);
+    gLastStats.valid = true;
 
     Serial.printf("REPORT piece=%s profile=%s underruns=%lu worst_render_us=%lu peak=%ld hash=%08lX\n",
                   kPieces[gPieceIndex].name,
@@ -772,7 +970,22 @@ void setup()
 
     gEngine.init();
     attachPeakMeter();
+
+    // Audio before the panel: the display is optional, so nothing about it may
+    // stand between the engine starting and the first block being queued. The
+    // first screen is painted right after, once the panel has been configured.
     startBlock(0);
+
+    gDisplayReady = initDisplay();
+    if (gDisplayReady) {
+        drawStatusScreen();
+        Serial.printf("# display ILI9341 %dx%d rot=%u, one repaint per block\n",
+                      kScreenWidth, kScreenHeight,
+                      static_cast<unsigned>(kDisplayRotation));
+    } else {
+        Serial.println("# display disabled; audio continues without a screen");
+    }
+    Serial.flush();
 }
 
 void loop()
