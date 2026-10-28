@@ -20,7 +20,7 @@ Replaces the old manually-maintained "FPU mirror" in the Tool Suite: as of versi
 
 Two render paths: **float** (desktop, classic ESP32/S3) and **integer Q15 + LUT** (ESP32-C3 / RISC-V without FPU). The Q15 path has native CI coverage (`test_q15_smoke` with `-DPR32_APU_HAS_FPU=0`).
 
-Both bodies now live in the same binary and a runtime **`SoundProfile`** (`Legacy`, `Nes`, `Hybrid`) selects which one renders. `Legacy` is the default and a **frozen contract** (byte-identical to its golden PCM); `Nes`/`Hybrid` currently render the integer core and are byte-identical aliases of it. `PR32_APU_ENABLE_LEGACY_FLOAT` (default `PR32_APU_HAS_FPU`) controls whether the float body is compiled at all. See `docs/ABI.md` §6 for the full selection matrix.
+Both bodies now live in the same binary and a runtime **`SoundProfile`** (`Legacy`, `Nes`, `Hybrid`) selects which one renders. `Legacy` is the default and a **frozen contract** (byte-identical to its golden PCM); `Nes` and `Hybrid` render the integer core everywhere and own an audible character — default envelope curve, weighted NES mix, unipolar noise on the NES period LUT and stepped PULSE duty, with `Hybrid` alone on the exponential envelope. Each profile is pinned by its own golden. `PR32_APU_ENABLE_LEGACY_FLOAT` (default `PR32_APU_HAS_FPU`) controls whether the float body is compiled at all. See `docs/ABI.md` §6 for the full selection matrix and the per-profile character table.
 
 ## Usage
 
@@ -68,22 +68,24 @@ cd build && ctest --output-on-failure    # run ctest from build/, not the repo r
 
 On a Windows host with MSYS2 MinGW and no `nmake`, CMake picks a generator it cannot run; there the configure line is `cmake -S . -B build -G "MinGW Makefiles" --fresh -DPR32_APU_BUILD_TESTS=ON`.
 
-**Measured on 2026-10-27: 467 cases across 9 targets**, `0 Failures 0 Ignored` in every one, `100% tests passed out of 9`. These are Unity's own summary lines, taken by running each binary from `test/`:
+**Measured on 2026-10-28: 517 cases across 11 targets**, `0 Failures 0 Ignored` in every one, `100% tests passed out of 11`. These are Unity's own summary lines, taken by running each binary from `test/`:
 
 | Target | Cases | Suite |
 |---|---|---|
-| `test_apu_core` | 182 | Engine core behaviour — float core |
-| `test_apu_core_integer` | 182 | The same source against the integer core (`PR32_APU_HAS_FPU=0`) |
+| `test_apu_core` | 205 | Engine core behaviour — float core |
+| `test_apu_core_integer` | 205 | The same source against the integer core (`PR32_APU_HAS_FPU=0`) |
 | `test_audio_command_queue` | 10 | SPSC queue: capacity, drop policy, `AudioCommand` ABI pins |
 | `test_audio_music_types` | 35 | Music types, `InstrumentPreset` layout, shipped presets |
 | `test_apu_mirror` | 37 | Tool Suite parity, byte-for-byte against the float golden |
 | `test_q15_smoke` | 15 | Integer/Q15 path smoke coverage |
-| `test_apu_integer_golden` | 1 | Integer core against the integer golden (`Nes`, FPU build) |
-| `test_apu_integer_golden_no_fpu` | 1 | Integer core against the integer golden (`Legacy`, no-FPU build) |
+| `test_apu_integer_golden` | 1 | Integer core against the `Legacy` integer golden (FPU build, float body off) |
+| `test_apu_integer_golden_no_fpu` | 1 | The same golden on the no-FPU build |
+| `test_apu_profile_golden` | 2 | `Nes` and `Hybrid` against their own goldens (FPU build, float body off) |
+| `test_apu_profile_golden_no_fpu` | 2 | The same two goldens on the no-FPU build |
 | `test_library_link` | 4 | The public surface links from the shipped artifact (no `UNIT_TEST`) |
-| **Total** | **467** | |
+| **Total** | **517** | |
 
-Two targets run the same test source against a different render core, which is why the case count is larger than the number of distinct behaviours. `test_apu_mirror` and both `test_apu_integer_golden*` targets compare rendered PCM against the two immutable fixtures in `test/golden/fixtures/`.
+Three pairs of targets compile the same test source with a different core configuration, which is why the case count is larger than the number of distinct behaviours. `test_apu_mirror` and the four `*_golden*` targets compare rendered PCM against the immutable fixtures in `test/golden/fixtures/`.
 
 ## Tools
 
@@ -93,8 +95,9 @@ Two targets run the same test source against a different render core, which is w
 | `tools/apu_bench` | Host CPU baseline for both cores: p50/p99 µs per 512-sample block and µs per sample over `{Legacy, Nes} × {22 050, 32 000} × {1, 8 voices}`. No CMake; `python tools/apu_bench/run.py`. |
 | `tools/apu_bench_firmware` | The same matrix on real boards (PlatformIO, `esp_timer_get_time()`), plus the target `sizeof` of the core. |
 | `tools/loudness_probe` | Renders a real track through both routes and compares their levels. |
+| `tools/profiles_ab` | Blind A/B of the three profiles: one excerpt rendered three times as 16-bit mono 44 100 Hz WAVs matched to the same RMS, named `a/b/c` with the key in a separate file. `python tools/profiles_ab/run.py`. |
 
-The two goldens are `test/golden/fixtures/apu_mirror_canonical_s16le_44100.pcm` (float route, `7FF568A5…5DE9`) and `test/golden/fixtures/apu_integer_core_canonical_s16le_44100.pcm` (integer core, `F59501D6…3902D`).
+The four goldens are `test/golden/fixtures/apu_mirror_canonical_s16le_44100.pcm` (float route, `7FF568A5…5DE9`), `apu_integer_core_canonical_s16le_44100.pcm` (integer core, `F59501D6…3902D`), and one per audible profile: `apu_nes_canonical_s16le_44100.pcm` (`225CE203…B18B8`) and `apu_hybrid_canonical_s16le_44100.pcm` (`7E77507E…72343`).
 
 ## Documentation
 

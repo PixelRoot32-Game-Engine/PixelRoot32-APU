@@ -1,12 +1,13 @@
-/// test_apu_integer_golden.cpp — S9 golden PCM of the integer render core.
+/// test_apu_integer_golden.cpp - S9 golden PCM of the integer render core.
 ///
-/// The integer core must produce exactly the bytes in the committed fixture no
-/// matter which build reaches it. An FPU build gets there through the `Nes`
-/// profile (the frozen `Legacy` body stays float); a no-FPU build gets there
-/// through `Legacy`. That is why this one source is compiled twice — see the
-/// `test_apu_integer_golden` / `test_apu_integer_golden_no_fpu` targets in
-/// CMakeLists.txt — and why the profile is selected per build instead of being
-/// hard-coded: the assertion is about the core, not about the profile name.
+/// The integer core must produce exactly the bytes in the committed fixture, and
+/// the route to it must not change them. Both targets compile this source and
+/// both select `Legacy`: the no-FPU target has no float body, and the FPU target
+/// defines `PR32_APU_ENABLE_LEGACY_FLOAT=0` so that `Legacy` means the integer
+/// core there too. Routing an FPU build through `Nes` was only equivalent while
+/// E0 kept every profile byte-identical; E1 makes `Nes` differ on purpose, so the
+/// assertion has to be about the core, not about picking a different profile.
+/// See the `test_apu_integer_golden` / `test_apu_integer_golden_no_fpu` targets.
 
 #include "golden/apu_mirror_canonical_track.h"
 #include "pixelroot32/apu/ApuCore.h"
@@ -79,11 +80,11 @@ void test_apu_integer_golden_pcm_parity(void)
     // float body is what `Legacy` means, so only `Nes` routes to the integer
     // core there. Without an FPU both profiles already render integer, and
     // `Legacy` is the reference the fixture was generated from (S9).
-#if PR32_APU_HAS_FPU
-    const SoundProfile profile = SoundProfile::Nes;
-#else
+    // Both targets reach the integer core through `Legacy`: the no-FPU build has
+    // no float body, and this build compiles the float body out with
+    // `PR32_APU_ENABLE_LEGACY_FLOAT=0`. Selecting a different profile to get here
+    // would stop the test from asserting anything about `Legacy`.
     const SoundProfile profile = SoundProfile::Legacy;
-#endif
 
     int16_t actual[apu_golden::kGoldenSampleCount] = {};
     ApuCore apu;

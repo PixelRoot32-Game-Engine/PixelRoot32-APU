@@ -34,6 +34,14 @@ namespace pixelroot32::audio {
       *   output:      y * masterVolume * 32767, passed through a single-pole
       *                DC-blocker to remove offset + transient clicks.
       *
+      * `Nes`/`Hybrid` replace the uniform per-channel weighting with
+      * `MixerCurve::NesWeighted` (S4): the voices are summed per group and the
+      * published NES ratios decide how much each group contributes, with the
+      * PULSE group anchored at exactly the level above so the change is
+      * balance, not loudness. The weighted sum then enters the same compressor,
+      * master volume and DC blocker chain. `Legacy` keeps the formula above
+      * unchanged, byte for byte.
+      *
       * On cores without an FPU (ESP32-C3) the integer-optimised path uses
       * `audio_mixer_lut`, which is pre-fitted to the same curve and renders
       * at the same level (Hito 5 M12). It applies MIXER_SCALE once, after
@@ -176,6 +184,18 @@ namespace pixelroot32::audio {
          * The default `pulseDutyIndex == 255` keeps the legacy continuous
          * `dutyCycle` behaviour, so existing consumers are unaffected.
          *
+         * S6: since E1 the sound profile also owns this mode as its DEFAULT —
+         * `Nes` and `Hybrid` arm the step nearest the note's own `duty`, and
+         * `Legacy` arms continuous. A call here is a tier-2 override (D-3): it
+         * pins the mode for the slot, so the profile does NOT re-arm its own
+         * choice on the next note and the note's `duty` no longer selects the
+         * step. Passing 255 therefore means "this slot stays continuous" even
+         * under a NES-derived profile. The pin is per-slot state: it survives
+         * new notes and is cleared only by `Voice::reset()`.
+         *
+         * Like the other selectors, this is not safe to call concurrently with
+         * rendering.
+         *
          * @param slot Voice index [0, MAX_VOICES); out-of-range ignored.
          * @param nesDutyIndex 0..3 for NES discrete duty, 4..254 treated as
          *                     continuous (defensive), 255 for continuous.
@@ -277,6 +297,18 @@ namespace pixelroot32::audio {
          * so their validation and side effects apply unchanged: invalid
          * selector indices land on the documented sentinels, and selecting
          * a noise LUT entry retunes a live NOISE voice immediately.
+         *
+         * S5: two of the bundled fields — `noiseUnipolar` and `noiseLutIndex` —
+         * are also the per-slot override of a sound-profile default (D-3 tier
+         * 2), so applying this struct pins them: a profile will not re-arm its
+         * own value on the next note. `noiseUnipolar` has no standalone setter,
+         * which makes this method and `AudioCommandType::SET_NES_OPTIONS` its
+         * only per-voice entry points.
+         *
+         * S6 adds `pulseDutyIndex` to that set: it is delegated to
+         * `setVoicePulseDutyMode`, which pins the duty mode against the
+         * profile's default, so applying a default-constructed struct returns a
+         * NES-profile PULSE voice to the continuous generator.
          *
          * Not safe to call concurrently with rendering. Use
          * `AudioCommandType::SET_NES_OPTIONS` from the game thread — it
@@ -893,6 +925,20 @@ namespace pixelroot32::audio {
          */
         uint8_t getVoiceNesNoiseLutIndexForTesting(int slot) const;
 
+        // -- Unipolar NOISE test diagnostics (E1/S5) -------------------
+        /**
+         * @brief Test-only: resolved unipolar gate of a voice slot.
+         *
+         * Reports the per-voice mirror the integer core renders with, i.e. the
+         * value after `applyProfileCharacter` resolved the profile default and
+         * after any voice-level override. Never "undecided": the mirror is a
+         * plain flag, not a tri-state.
+         *
+         * @param slot Voice index [0, MAX_VOICES); out-of-range returns false.
+         * @return true when a NOISE voice gates between 0 and the level.
+         */
+        bool isVoiceNoiseUnipolarForTesting(int slot) const;
+
         // -- Master HPF test diagnostics (Hito 4 M10) ------------------
         /** @brief Test-only: current HPF feedback coefficient R. */
         float getHpfRForTesting() const;
@@ -907,6 +953,20 @@ namespace pixelroot32::audio {
         /** @brief Test-only: current master output shaping curve. */
         SoftClipMode getSoftClipModeForTesting() const;
 
+        // -- Mixer curve test diagnostics (E1/S4) -----------------------
+        /**
+         * @brief Test-only: mixer curve the active profile selects.
+         *
+         * Reports the value the renderer will use, derived from the profile
+         * selector. There is no matching setter on purpose: the curve is
+         * profile character (D-3 tier 1), so `setSoundProfile` is the only way
+         * to change it and this accessor is the way to observe that.
+         *
+         * @return `Rational` under `Legacy`, `NesWeighted` under `Nes` and
+         *         `Hybrid`.
+         */
+        MixerCurve getMixerCurveForTesting() const;
+
         // -- Sound profile test diagnostics (S4/S5) --------------------
         /**
          * @brief Test-only: number of `applyProfileCharacter` applications so far.
@@ -917,6 +977,31 @@ namespace pixelroot32::audio {
          * @return Monotonic count since construction.
          */
         uint32_t getProfileApplyCountForTesting() const;
+
+        // -- Envelope curve test diagnostics (E1/S2) -------------------
+        /**
+         * @brief Test-only: resolved ADSR curve of a voice slot.
+         *
+         * Reports the per-voice mirror after `initVoiceFromEvent` has run, i.e.
+         * the value the renderer will use: never `ProfileDefault`.
+         *
+         * @param slot Voice index [0, MAX_VOICES); out-of-range returns
+         *             `EnvelopeCurve::ProfileDefault`.
+         * @return Resolved curve of the slot.
+         */
+        EnvelopeCurve getVoiceEnvelopeCurveForTesting(int slot) const;
+
+        /**
+         * @brief Test-only: current Q15 ADSR level of a voice slot.
+         *
+         * Exposes the mirror the integer core actually renders with, so the
+         * envelope curve can be compared against its analytic model sample by
+         * sample instead of being inferred from PCM.
+         *
+         * @param slot Voice index [0, MAX_VOICES); out-of-range returns 0.
+         * @return Envelope level in Q15 (0..32768), or 0 if invalid.
+         */
+        int32_t getVoiceEnvelopeLevelQ15ForTesting(int slot) const;
 #endif
 
     private:
@@ -990,9 +1075,15 @@ namespace pixelroot32::audio {
          * `initVoiceFromEvent`, after the `nesAccurate` / `initNesSafe` block,
          * so the note's own values are already in place when it runs.
          *
+         * The mix weighting is profile character too, but it has no per-voice
+         * field: `renderIntegerCore` resolves the `MixerCurve` from the
+         * profile once per block (S4), so there is nothing for this function
+         * to write for it and nothing that could be half-applied per voice.
+         *
          * E0: `Nes`/`Hybrid` are exact aliases and therefore write nothing —
-         * the note path already leaves those values (S3). E1 changes only the
-         * body of this function.
+         * the note path already leaves those values (S3). E1 fills the body:
+         * the envelope curve (S2), the noise character (S5) and the stepped
+         * PULSE duty (S6), each as a DEFAULT the note or the voice may pin.
          *
          * @param slot Voice index [0, MAX_VOICES); the caller guarantees it is
          *             a valid voice of the pool.

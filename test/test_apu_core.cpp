@@ -17,8 +17,10 @@
 
 #include <unity.h>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include "test_config.h"
+#include "golden/apu_mirror_canonical_track.h"
 #include "pixelroot32/apu/ApuCore.h"
 #include "pixelroot32/apu/ApuConfig.h"
 #include "pixelroot32/apu/AudioTypes.h"
@@ -5586,8 +5588,10 @@ void test_sound_profile_survives_init(void) {
 // Both suite binaries run this file, so every case below has to hold whichever
 // core the build contains: `test_apu_core` has the float body, while
 // `test_apu_core_integer` is built with PR32_APU_HAS_FPU=0. `Nes` and `Hybrid`
-// select the integer core in both builds (S3) and, in E0, are exact aliases of
-// `Legacy`'s sound, so no case here may expect them to differ audibly.
+// select the integer core in both builds (S3), so a case may say what those two
+// profiles sound like without knowing which core the build compiled. Since E1
+// they are no longer aliases of `Legacy` — `Hybrid` carries the exponential
+// envelope — and the cases below pin what each one renders.
 
 // Queues one looping SINE note. Split from the render calls so the caller can
 // put a `setSoundProfile` call between two blocks: a profile change cannot land
@@ -5629,10 +5633,17 @@ static int32_t maxAdjacentStep(const int16_t* pcm, int from, int to) {
 // after the `nesAccurate` / `initNesSafe` block. The counter is the structural
 // proof: exactly one application per note-on, and the canonical safe state the
 // block installed is still what the voice reports afterwards.
+//
+// E1 extends the same case instead of adding a sibling: the character the
+// profile writes is now visible (the envelope curve), so the ordering claim is
+// checked twice — once structurally (the counter) and once by observing a value
+// only the last step can produce. Run under `Hybrid`, whose exponential curve
+// differs from everything the note path leaves behind.
 void profile_apply_runs_after_nes_accurate_init(void) {
     ApuCore apu;
     apu.init(44100);
     apu.reset();
+    apu.setSoundProfile(SoundProfile::Hybrid);
 
     TEST_ASSERT_EQUAL_UINT32(0, apu.getProfileApplyCountForTesting());
 
@@ -5644,6 +5655,10 @@ void profile_apply_runs_after_nes_accurate_init(void) {
     TEST_ASSERT_EQUAL_UINT32(1, apu.getProfileApplyCountForTesting());
     // Ordering: the profile did not undo the safe state the note left behind.
     assertNesSafeCommon(apu, slot);
+    // S2: `initNesSafe` cleared every NES sub-unit above and still did not
+    // erase the profile's curve, which is what "applied last" has to mean.
+    TEST_ASSERT_EQUAL_INT((int)EnvelopeCurve::Exponential,
+                          (int)apu.getVoiceEnvelopeCurveForTesting(slot));
 
     // Silence the voice without starting a note: the counter must not move.
     AudioCommand stop{};
@@ -5658,40 +5673,89 @@ void profile_apply_runs_after_nes_accurate_init(void) {
     const int slot2 = playPresetNote(apu, buffer, WaveType::PULSE, preset);
     TEST_ASSERT_EQUAL_UINT32(2, apu.getProfileApplyCountForTesting());
     assertNesSafeCommon(apu, slot2);
+    TEST_ASSERT_EQUAL_INT((int)EnvelopeCurve::Exponential,
+                          (int)apu.getVoiceEnvelopeCurveForTesting(slot2));
 }
 
-// S3: in E0 `Nes` and `Hybrid` are aliases — same core, same bytes. This is
-// also the E0 promise of S15.3, pinned where the dispatch lives.
-void profile_nes_and_hybrid_render_identical_bytes(void) {
+// S3, E1 contract change. E0 pinned `Nes` == `Hybrid` byte for byte because
+// neither profile had any character yet. E1 gives `Hybrid` the exponential
+// envelope, so that aliasing is broken on purpose and the assertion that goes
+// with it is replaced by the two claims underneath it:
+//
+//   * `Nes` still renders the `Legacy` curve — its own character is the 4-bit
+//     `nesEnvelope` at 240 Hz, which is not wired in T1 (T3/T4 complete it).
+//     The committed integer golden is what pins its bytes; here we pin that it
+//     resolves to `Linear` and therefore renders the same bytes as an explicit
+//     linear override, while an exponential override does change them.
+//   * `Hybrid` defaults to `Exponential`, and the exponential is exactly the
+//     curve it renders: same bytes as an explicit exponential override,
+//     different bytes from a linear one.
+//
+// The E0 claim that is still true is kept: both profiles run the same integer
+// core, so forcing the same curve on both makes their bytes identical again.
+static void renderCurveProbe(SoundProfile profile, EnvelopeCurve curve,
+                             int16_t* out, int samples) {
+    ApuCore apu;
+    apu.init(44100);
+    apu.reset();
+    apu.setSoundProfile(profile);
+
+    // Every parameter of the note is identical across probes; only the profile
+    // and the preset's curve change, so a byte difference can only come from
+    // the curve. `INSTR_PULSE_LEAD` decays (0.18 s) and releases (0.22 s), so
+    // both curved stages are exercised inside the window.
+    InstrumentPreset preset = INSTR_PULSE_LEAD;
+    preset.envelopeCurve = curve;
+
+    AudioCommand cmd{};
+    cmd.type = AudioCommandType::PLAY_EVENT;
+    cmd.event.type = WaveType::PULSE;
+    cmd.event.frequency = 440.0f;
+    cmd.event.duration = 1.0f;
+    cmd.event.volume = 0.8f;
+    cmd.event.duty = 0.25f;
+    cmd.event.loop = true;
+    cmd.event.preset = &preset;
+    TEST_ASSERT_TRUE(apu.submitCommand(cmd));
+    apu.generateSamples(out, samples);
+}
+
+void profile_nes_and_hybrid_differ_only_by_the_envelope_curve(void) {
     constexpr int kSamples = 4096;
-    static int16_t nes[kSamples];
-    static int16_t hybrid[kSamples];
+    static int16_t nesDefault[kSamples];
+    static int16_t hybridDefault[kSamples];
+    static int16_t nesLinear[kSamples];
+    static int16_t hybridLinear[kSamples];
+    static int16_t nesExponential[kSamples];
 
-    auto render = [](SoundProfile profile, int16_t* out) {
-        ApuCore apu;
-        apu.init(44100);
-        apu.reset();
-        apu.setSoundProfile(profile);
-
-        AudioCommand cmd{};
-        cmd.type = AudioCommandType::PLAY_EVENT;
-        cmd.event.type = WaveType::PULSE;
-        cmd.event.frequency = 440.0f;
-        cmd.event.duration = 1.0f;
-        cmd.event.volume = 0.8f;
-        cmd.event.duty = 0.25f;
-        cmd.event.loop = true;
-        TEST_ASSERT_TRUE(apu.submitCommand(cmd));
-        apu.generateSamples(out, kSamples);
-    };
-
-    render(SoundProfile::Nes, nes);
-    render(SoundProfile::Hybrid, hybrid);
+    renderCurveProbe(SoundProfile::Nes, EnvelopeCurve::ProfileDefault, nesDefault, kSamples);
+    renderCurveProbe(SoundProfile::Hybrid, EnvelopeCurve::ProfileDefault, hybridDefault, kSamples);
+    renderCurveProbe(SoundProfile::Nes, EnvelopeCurve::Linear, nesLinear, kSamples);
+    renderCurveProbe(SoundProfile::Hybrid, EnvelopeCurve::Linear, hybridLinear, kSamples);
+    renderCurveProbe(SoundProfile::Nes, EnvelopeCurve::Exponential, nesExponential, kSamples);
 
     // Guard against comparing two silent buffers: two equal silences prove
     // nothing about the core, only that nothing rendered.
-    TEST_ASSERT_TRUE(peakMagnitude(nes, kSamples) > 1000);
-    TEST_ASSERT_EQUAL_INT(0, std::memcmp(nes, hybrid, sizeof(nes)));
+    TEST_ASSERT_TRUE(peakMagnitude(nesDefault, kSamples) > 1000);
+    TEST_ASSERT_TRUE(peakMagnitude(hybridDefault, kSamples) > 1000);
+
+    // E1: the defaults are no longer aliases. `Hybrid`'s exponential is the
+    // only difference in T1, so the curve is what has to show up here.
+    TEST_ASSERT_TRUE_MESSAGE(
+        std::memcmp(nesDefault, hybridDefault, sizeof(nesDefault)) != 0,
+        "E1: Hybrid must no longer render the same bytes as Nes");
+
+    // Same curve -> same bytes: the two profiles still share one core.
+    TEST_ASSERT_EQUAL_INT(0, std::memcmp(nesLinear, hybridLinear, sizeof(nesLinear)));
+
+    // `Nes` in T1 renders the `Legacy` curve: its default is byte-identical to
+    // an explicit linear override, and an exponential override *would* move it
+    // (which is what keeps the equality above from being vacuous).
+    TEST_ASSERT_EQUAL_INT(0, std::memcmp(nesDefault, nesLinear, sizeof(nesLinear)));
+    TEST_ASSERT_TRUE(std::memcmp(nesDefault, nesExponential, sizeof(nesExponential)) != 0);
+
+    // `Hybrid`'s default IS the exponential curve, not something in between.
+    TEST_ASSERT_TRUE(std::memcmp(hybridDefault, hybridLinear, sizeof(hybridLinear)) != 0);
 }
 
 // S6: the measurable no-click criterion. 0.5 s at 44100 Hz, profile switched
@@ -5808,6 +5872,1390 @@ void profile_setter_is_idempotent_for_state(void) {
     // And the seam is continuous in absolute terms, so the equality above is
     // not simply two identically-broken renders.
     TEST_ASSERT_TRUE(maxAdjacentStep(repeated, kBlock, kBlock + 8) < (32767 / 4));
+}
+
+// =============================================================================
+// S2 / S3: envelope curve, its profile default and the D-3 precedence (E1/T1)
+// =============================================================================
+
+// S2: the new field is appended, so a positional literal written against the
+// 19-field layout keeps meaning exactly what it meant, and the zero value is
+// the "the profile decides" sentinel rather than a third curve. If this ever
+// becomes non-zero, every shipped `INSTR_*` preset silently changes shape.
+void instrument_preset_envelope_curve_is_appended_and_zero(void) {
+    TEST_ASSERT_EQUAL_UINT8(0, (uint8_t)EnvelopeCurve::ProfileDefault);
+
+    // The same literal the published-ABI case uses: 17 positional values,
+    // stopping at `pitchSweepDurationSec`. Everything after it is defaulted.
+    constexpr InstrumentPreset positional{
+        0.8f, 0.5f, 4, 0.25f, 7,
+        0.01f, 0.02f, 0.75f, 0.03f,
+        LfoTarget::VOLUME, 6.0f, 0.4f, 0.05f,
+        true, 0.125f, 880.0f, 1.5f
+    };
+    TEST_ASSERT_EQUAL_INT((int)EnvelopeCurve::ProfileDefault,
+                          (int)positional.envelopeCurve);
+    // The shipped presets are positional too, and none of them opts in.
+    TEST_ASSERT_EQUAL_INT((int)EnvelopeCurve::ProfileDefault,
+                          (int)INSTR_PULSE_LEAD.envelopeCurve);
+    TEST_ASSERT_EQUAL_INT((int)EnvelopeCurve::ProfileDefault,
+                          (int)INSTR_KICK.envelopeCurve);
+}
+
+// D-3, three tiers: the profile supplies the default curve, the note may
+// override it, and the `nesAccurate` safe state must not erase either — it
+// clears NES sub-units, not the character the profile resolved.
+//
+// The observable is the resolved per-voice mirror. Under `Legacy` the frozen
+// float body ignores the curve by design (S1), so what is asserted there is the
+// contract `initVoiceFromEvent` owes the integer core, not a PCM claim.
+void profile_envelope_curve_precedence_matches_d3(void) {
+    struct CurveCase {
+        SoundProfile profile;
+        EnvelopeCurve presetCurve;
+        bool nesAccurate;
+        EnvelopeCurve expected;
+        const char* name;
+    };
+    static const CurveCase cases[] = {
+        {SoundProfile::Legacy, EnvelopeCurve::ProfileDefault, false,
+         EnvelopeCurve::Linear,
+         "Legacy default is the frozen linear ramp"},
+        {SoundProfile::Legacy, EnvelopeCurve::Exponential, false,
+         EnvelopeCurve::Exponential,
+         "a note overrides the Legacy default"},
+        {SoundProfile::Hybrid, EnvelopeCurve::ProfileDefault, false,
+         EnvelopeCurve::Exponential,
+         "Hybrid default is exponential"},
+        {SoundProfile::Hybrid, EnvelopeCurve::Linear, false,
+         EnvelopeCurve::Linear,
+         "a note overrides the Hybrid default"},
+        {SoundProfile::Hybrid, EnvelopeCurve::ProfileDefault, true,
+         EnvelopeCurve::Exponential,
+         "nesAccurate must not erase the profile character"},
+        {SoundProfile::Nes, EnvelopeCurve::ProfileDefault, false,
+         EnvelopeCurve::Linear,
+         "Nes keeps the Legacy curve until its 4-bit envelope lands"},
+        {SoundProfile::Nes, EnvelopeCurve::ProfileDefault, true,
+         EnvelopeCurve::Linear,
+         "nesAccurate must not change Nes either"},
+        {SoundProfile::Nes, EnvelopeCurve::Exponential, true,
+         EnvelopeCurve::Exponential,
+         "initNesSafe must not erase a note override"},
+    };
+
+    for (const CurveCase& c : cases) {
+        ApuCore apu;
+        apu.init(44100);
+        apu.reset();
+        apu.setSoundProfile(c.profile);
+
+        InstrumentPreset preset = INSTR_PULSE_LEAD;
+        preset.envelopeCurve = c.presetCurve;
+        preset.nesAccurate = c.nesAccurate;
+
+        int16_t scratch[256] = {0};
+        const int slot = playPresetNote(apu, scratch, WaveType::PULSE, preset);
+        TEST_ASSERT_EQUAL_INT_MESSAGE((int)c.expected,
+                                      (int)apu.getVoiceEnvelopeCurveForTesting(slot),
+                                      c.name);
+    }
+}
+
+// Plays a note and advances the render by exactly one sample, so the caller
+// owns the envelope clock: every further `generateSamples(1)` is one
+// `tickEnvelopeQ15` step and the level can be read between them.
+static int startOneSampleNote(ApuCore& apu, WaveType type,
+                              const InstrumentPreset& preset,
+                              float durationSec, bool loop) {
+    AudioCommand cmd{};
+    cmd.type = AudioCommandType::PLAY_EVENT;
+    cmd.event.type = type;
+    cmd.event.frequency = 440.0f;
+    cmd.event.duration = durationSec;
+    cmd.event.volume = 0.5f;
+    cmd.event.duty = 0.5f;
+    cmd.event.loop = loop;
+    cmd.event.preset = &preset;
+    TEST_ASSERT_TRUE(apu.submitCommand(cmd));
+
+    int16_t tick[1] = {0};
+    apu.generateSamples(tick, 1);
+
+    for (int s = ApuCore::SFX_VOICE_BASE; s < ApuCore::MAX_VOICES; ++s) {
+        if (apu.isVoiceEnabledForTesting(s)) {
+            return s;
+        }
+    }
+    TEST_FAIL_MESSAGE("the envelope probe did not land on an SFX slot");
+    return -1;
+}
+
+// The decay the exponential curve is checked against, in Q15 samples.
+static constexpr int kEnvelopeDecaySamples = 4410;  // 0.1 s at 44100 Hz
+
+// Reference iteration of the shape, used by the tests below to know what the
+// curve is expected to do without duplicating the renderer's clock.
+static int32_t stepShapeOnce(int32_t level) {
+    return level - (((level - 1) >> 8) + 1);
+}
+
+// S9.2 / S2: the exponential decay reaches −60 dB in the **stage's own time**,
+// within ±5 %, and keeps its shape while doing it.
+//
+// That is the clause the first E1 cut broke: the plain recurrence runs at τ =
+// 256 samples (5.8 ms at 44.1 kHz) no matter what `decayTime` says, so a
+// 0.1 s decay hit −60 dB after ~30 ms and then sat silent until the stage
+// ended, where it jumped back up to the sustain level. The shape is now clocked
+// from the stage duration (`exponentialCurveRateQ15`), so the configured time
+// means exactly what it says.
+//
+// Two properties are pinned here:
+//   * the −60 dB crossing lands on the stage duration;
+//   * the ramp is still the exponential shape, not a linear one: the level
+//     halves after 176 of the 1 356 shape iterations that span −60 dB, i.e.
+//     after ~572 of 4 410 samples, where a linear ramp would halve at 2 205.
+void envelope_exponential_decay_reaches_minus_60_db_at_the_stage_end(void) {
+    ApuCore apu;
+    apu.init(44100);
+    apu.reset();
+    apu.setSoundProfile(SoundProfile::Hybrid);
+
+    InstrumentPreset preset = INSTR_PULSE_LEAD;
+    preset.attackTime = 0.0f;      // one sample: the decay starts at full scale
+    preset.decayTime = 0.1f;       // kEnvelopeDecaySamples
+    preset.sustainLevel = 0.0f;    // −60 dB of full scale is the stage's target
+    preset.releaseTime = 0.005f;
+
+    const int slot = startOneSampleNote(apu, WaveType::PULSE, preset, 0.0f, true);
+
+    TEST_ASSERT_EQUAL_INT((int)EnvelopeCurve::Exponential,
+                          (int)apu.getVoiceEnvelopeCurveForTesting(slot));
+    // The attack stays linear (S2) and the one-sample ramp lands on full scale.
+    TEST_ASSERT_EQUAL_INT32(32768, apu.getVoiceEnvelopeLevelQ15ForTesting(slot));
+
+    // −60 dB of a Q15 envelope: 32768 × 10^(-60/20) ≈ 33.
+    constexpr int32_t kMinus60DbQ15 = 33;
+
+    // What the shape does in iterations: the half-level point and the −60 dB
+    // point, both counted on the same recurrence the renderer runs.
+    int32_t model = 32768;
+    int halfSteps = -1;
+    int fullSteps = 0;
+    while (model > kMinus60DbQ15 / 2) {
+        model = stepShapeOnce(model);
+        ++fullSteps;
+        if (halfSteps < 0 && model <= 16384) {
+            halfSteps = fullSteps;
+        }
+    }
+    const int expectedHalf = (kEnvelopeDecaySamples * halfSteps) / fullSteps;
+
+    int halfSample = -1;
+    int crossing = -1;
+    int32_t previous = 32768;
+    for (int n = 1; n <= kEnvelopeDecaySamples; ++n) {
+        int16_t tick[1] = {0};
+        apu.generateSamples(tick, 1);
+        const int32_t level = apu.getVoiceEnvelopeLevelQ15ForTesting(slot);
+        // The curve never rises and never parks: every change is a decrease.
+        TEST_ASSERT_TRUE_MESSAGE(level <= previous, "the envelope rose");
+        TEST_ASSERT_TRUE_MESSAGE(level >= 0, "the envelope went negative");
+        if (halfSample < 0 && level <= 16384) {
+            halfSample = n;
+        }
+        if (crossing < 0 && level <= kMinus60DbQ15) {
+            crossing = n;
+        }
+        previous = level;
+    }
+
+    TEST_ASSERT_TRUE_MESSAGE(crossing > 0,
+                             "the envelope never reached -60 dB inside the stage");
+    const int tolerance = (kEnvelopeDecaySamples * 5) / 100;  // ±5 %
+    TEST_ASSERT_INT_WITHIN(tolerance, kEnvelopeDecaySamples, crossing);
+
+    TEST_ASSERT_TRUE_MESSAGE(halfSample > 0, "the envelope never fell by half");
+    TEST_ASSERT_INT_WITHIN((expectedHalf * 5) / 100, expectedHalf, halfSample);
+    // ... and it is not a linear ramp wearing an exponential's name.
+    TEST_ASSERT_TRUE(halfSample < (kEnvelopeDecaySamples / 2));
+}
+
+// S2: the release uses the same clock and the same shape, calibrated on its own
+// stage. The span is the sustain level (the release starts there), so −60 dB
+// lands at the end of `releaseTime` instead of ~30 ms into it.
+void envelope_exponential_release_reaches_minus_60_db_at_the_stage_end(void) {
+    ApuCore apu;
+    apu.init(44100);
+    apu.reset();
+    apu.setSoundProfile(SoundProfile::Hybrid);
+
+    InstrumentPreset preset = INSTR_PULSE_LEAD;
+    preset.attackTime = 0.0f;
+    preset.decayTime = 0.0f;       // attack -> sustain directly
+    preset.sustainLevel = 0.5f;    // the release starts at 16384
+    preset.releaseTime = 0.1f;     // 4410 samples (equal to the sr/10 clamp)
+
+    constexpr int kReleaseSamples = 4410;
+    // 0.01 s = 441 samples of sustain, then the automatic release.
+    const int slot = startOneSampleNote(apu, WaveType::PULSE, preset, 0.01f, false);
+    TEST_ASSERT_EQUAL_INT((int)EnvelopeCurve::Exponential,
+                          (int)apu.getVoiceEnvelopeCurveForTesting(slot));
+    TEST_ASSERT_EQUAL_INT32(16384, apu.getVoiceEnvelopeLevelQ15ForTesting(slot));
+
+    int releaseStart = -1;
+    int crossing = -1;
+    int32_t previous = apu.getVoiceEnvelopeLevelQ15ForTesting(slot);
+    for (int n = 1; n <= kReleaseSamples + 512; ++n) {
+        int16_t tick[1] = {0};
+        apu.generateSamples(tick, 1);
+        const int32_t level = apu.getVoiceEnvelopeLevelQ15ForTesting(slot);
+        if (releaseStart < 0) {
+            if (level < previous) {
+                releaseStart = n;
+            }
+        } else if (crossing < 0 && level <= 33) {
+            crossing = n - releaseStart;
+            break;
+        }
+        previous = level;
+    }
+
+    TEST_ASSERT_TRUE_MESSAGE(releaseStart > 0, "the release never began");
+    TEST_ASSERT_TRUE_MESSAGE(crossing > 0,
+                             "the release never reached -60 dB inside the stage");
+    const int tolerance = (kReleaseSamples * 5) / 100;
+    TEST_ASSERT_INT_WITHIN(tolerance, kReleaseSamples, crossing);
+    // The note is still above the noise floor at the end of the stage, i.e. the
+    // release no longer goes silent early (the defect this correction fixes).
+    TEST_ASSERT_TRUE(apu.getVoiceEnvelopeLevelQ15ForTesting(slot) > 0);
+}
+
+// S2: a stage shorter than the shape's own −60 dB span cannot hold the shape at
+// one step per sample. Stepping once per sample anyway would leave the level far
+// above its target and snap there at the boundary — a 5 ms release would jump
+// ~7 dB — so such a stage keeps the frozen linear ramp, which lands exactly on
+// its target. This is the documented fallback, not an accident.
+void envelope_exponential_short_stage_keeps_the_linear_ramp(void) {
+    ApuCore apu;
+    apu.init(44100);
+    apu.reset();
+    apu.setSoundProfile(SoundProfile::Hybrid);
+
+    InstrumentPreset preset = INSTR_PULSE_LEAD;
+    preset.attackTime = 0.0f;
+    preset.decayTime = 0.002f;     // 88 samples, far below the 1356 step span
+    preset.sustainLevel = 0.0f;
+
+    constexpr int kShortStage = 88;
+    constexpr int32_t kLinearDelta = 32768 / kShortStage;  // 372
+
+    const int slot = startOneSampleNote(apu, WaveType::PULSE, preset, 0.0f, true);
+    TEST_ASSERT_EQUAL_INT((int)EnvelopeCurve::Exponential,
+                          (int)apu.getVoiceEnvelopeCurveForTesting(slot));
+    TEST_ASSERT_EQUAL_INT32(32768, apu.getVoiceEnvelopeLevelQ15ForTesting(slot));
+
+    int32_t previous = 32768;
+    // The last sample is the stage-end snap, so the constant-step claim covers
+    // the 87 samples before it.
+    for (int n = 1; n < kShortStage; ++n) {
+        int16_t tick[1] = {0};
+        apu.generateSamples(tick, 1);
+        const int32_t level = apu.getVoiceEnvelopeLevelQ15ForTesting(slot);
+        // A constant step per sample is the linear ramp.
+        TEST_ASSERT_EQUAL_INT32_MESSAGE(previous - kLinearDelta, level,
+                                        "a short stage must keep the linear ramp");
+        previous = level;
+    }
+
+    int16_t tick[1] = {0};
+    apu.generateSamples(tick, 1);
+    // The stage ends at its target with nothing left to snap: the linear ramp
+    // already brought the level to the noise floor, so there is no click.
+    TEST_ASSERT_TRUE(previous < 512);
+    TEST_ASSERT_EQUAL_INT32(0, apu.getVoiceEnvelopeLevelQ15ForTesting(slot));
+}
+
+// The defect this correction fixes, measured where it was audible: the canonical
+// track's lead under `Hybrid`. `INSTR_PULSE_LEAD` decays for 0.18 s (7938
+// samples) down to a 0.88 sustain, so the mix must never fall silent inside that
+// window. The broken cut silenced the note for ~145 ms of every note and then
+// jumped back up to the sustain level.
+void profile_hybrid_canonical_note_never_falls_silent_before_decay_ends(void) {
+    constexpr int kNoteSamples = 11025;  // 0.25 s of the first note at 120 bpm
+    constexpr int kDecayEnd = 7938;      // 0.18 s of DECAY
+    static int16_t hybrid[kNoteSamples];
+
+    ApuCore apu;
+    apu.init(44100);
+    apu.setSoundProfile(SoundProfile::Hybrid);
+    // render_canonical() resets and re-initialises the core, which is fine: the
+    // profile is configuration, so init() keeps it.
+    apu_golden::render_canonical(apu, hybrid, kNoteSamples);
+
+    // Past the attack ramp, inside the decay window: the longest run of exact
+    // zeros. A pulse wave at 440 Hz alternates every ~50 samples, so a run this
+    // long can only mean the envelope is at zero, not a waveform crossing.
+    int run = 0;
+    int longest = 0;
+    for (int i = 128; i < kDecayEnd; ++i) {
+        if (hybrid[i] == 0) {
+            ++run;
+            if (run > longest) longest = run;
+        } else {
+            run = 0;
+        }
+    }
+    TEST_ASSERT_TRUE_MESSAGE(longest < 256,
+                             "the envelope fell silent inside its decay stage");
+
+    // And it is still sounding when the decay ends (sustain 0.88).
+    TEST_ASSERT_TRUE(peakMagnitude(hybrid + kDecayEnd - 1024, 1024) > 1000);
+}
+
+// =============================================================================
+// S4: mixer curve and the NES-weighted groups (E1/T2)
+// =============================================================================
+
+// Every probe below shares one instrument and one render shape, so the only
+// input that differs between two renders is the sound profile — the mixer
+// curve's sole owner (D-3 tier 1). A flat envelope keeps the group weights the
+// only thing that can move the level: one-sample attack, no decay, sustain 1.0.
+static InstrumentPreset mixerProbePreset() {
+    InstrumentPreset preset{};
+    preset.baseVolume = 1.0f;
+    preset.duty = 0.5f;
+    preset.defaultOctave = 4;
+    preset.attackTime = 0.0f;
+    preset.decayTime = 0.0f;
+    preset.sustainLevel = 1.0f;
+    preset.releaseTime = 0.005f;
+    return preset;
+}
+
+// Puts the shaping stage out of the way: `None` plus a bypassed DC blocker
+// means the output IS the mix scaled by MIXER_SCALE, which is what lets the
+// weights be read off the PCM. The default HPF would remove the DC of an
+// unbalanced waveform and hide the very number under test.
+static void configureMixerProbe(ApuCore& apu, SoundProfile profile) {
+    apu.init(44100);
+    apu.reset();
+    apu.setSoundProfile(profile);
+    apu.setSoftClipMode(SoftClipMode::None);
+    apu.setHpfCutoffHz(0.0f);
+}
+
+static void queueMixerProbeVoice(ApuCore& apu, WaveType type, float volume,
+                                 float duty, const InstrumentPreset& preset) {
+    AudioCommand cmd{};
+    cmd.type = AudioCommandType::PLAY_EVENT;
+    cmd.event.type = type;
+    cmd.event.frequency = 440.0f;
+    cmd.event.duration = 0.0f;
+    cmd.event.volume = volume;
+    cmd.event.duty = duty;
+    cmd.event.loop = true;
+    cmd.event.preset = &preset;
+    TEST_ASSERT_TRUE(apu.submitCommand(cmd));
+}
+
+static constexpr int kMixerProbeSamples = 2048;
+static int16_t gMixerProbe[kMixerProbeSamples];
+
+// Peak of the settled part of a one-voice render. The envelope reaches full
+// scale on its first sample (attack = 0), and the first 256 samples are still
+// skipped so the reading can never be a transient.
+//
+// A NOISE probe pins the BIPOLAR gate on purpose (S5/T3): the published weight
+// table was calibrated against a voice that swings between -level and +level,
+// and the unipolar gate the profiles now arm carries an exact x2 level
+// compensation (`ApuCore`'s `kNoiseUnipolarCompensationShift`). Measuring the
+// ratio on the compensated, half-wave-rectified waveform would report twice the
+// weight and say nothing about the mixer.
+static int32_t renderMixerProbePeak(SoundProfile profile, WaveType type,
+                                    float volume, float duty) {
+    ApuCore apu;
+    configureMixerProbe(apu, profile);
+    const InstrumentPreset preset = mixerProbePreset();
+    if (type == WaveType::NOISE) {
+        AudioCommand opts{};
+        opts.type = AudioCommandType::SET_NES_OPTIONS;
+        opts.channelIndex = (uint8_t)ApuCore::SFX_VOICE_BASE;
+        opts.nesOptions.noiseUnipolar = false;
+        // BEFORE the note: the bundled write also disarms the `$4015` channel
+        // enable, which would silence a voice that is already sounding.
+        TEST_ASSERT_TRUE(apu.submitCommand(opts));
+    }
+    queueMixerProbeVoice(apu, type, volume, duty, preset);
+    apu.generateSamples(gMixerProbe, kMixerProbeSamples);
+    return peakMagnitude(gMixerProbe + 256, kMixerProbeSamples - 256);
+}
+
+// Relative error of a measured peak ratio against the published weight ratio.
+static void assertWeightRatio(double baseWeight, double groupWeight,
+                              int32_t basePeak, int32_t groupPeak,
+                              const char* label) {
+    const double expected = groupWeight / baseWeight;
+    const double actual = (double)groupPeak / (double)basePeak;
+    const double error = (actual - expected) / expected;
+    char message[192];
+    std::snprintf(message, sizeof(message),
+                  "%s: measured ratio %.6f, published %.6f (%.3f %%, limit 1 %%)",
+                  label, actual, expected, error * 100.0);
+    TEST_ASSERT_TRUE_MESSAGE(error <= 0.01 && error >= -0.01, message);
+}
+
+// S4/T2: the three published group weights must survive as RATIOS in the
+// rendered PCM. Each probe is one full-scale voice of one group, so the peak
+// ratio is the weight ratio: 0.00752 : 0.00851 : 0.00494 within ±1 %.
+void mixer_nes_weighted_group_balance_matches_the_published_ratios(void) {
+    const int32_t pulse = renderMixerProbePeak(SoundProfile::Nes, WaveType::PULSE, 1.0f, 0.5f);
+    const int32_t triangle = renderMixerProbePeak(SoundProfile::Nes, WaveType::TRIANGLE, 1.0f, 0.5f);
+    const int32_t noise = renderMixerProbePeak(SoundProfile::Nes, WaveType::NOISE, 1.0f, 0.5f);
+
+    // Guard against three silences: every ratio would be 0/0.
+    TEST_ASSERT_TRUE_MESSAGE(pulse > 1000, "the pulse probe rendered silence");
+    TEST_ASSERT_TRUE_MESSAGE(triangle > 1000, "the triangle probe rendered silence");
+    TEST_ASSERT_TRUE_MESSAGE(noise > 1000, "the noise probe rendered silence");
+
+    assertWeightRatio(0.00752, 0.00851, pulse, triangle, "triangle/pulse");
+    assertWeightRatio(0.00752, 0.00494, pulse, noise, "noise/pulse");
+}
+
+// S4/T2: two full-scale pulses must not change level. `Legacy` applies
+// MIXER_SCALE = 0.4 to each voice, so two of them land on 2 * 0.4 * 32767 =
+// 26213.6; the NES-weighted curve anchors its pulse group at exactly that,
+// which is the normalisation constant this test pins (S4 asks for balance, not
+// level).
+//
+// Same frequency on purpose: the two voices stay phase-aligned, so the mix is
+// exactly 2 x 32767 and the peak reads the level, not a beat.
+static int32_t renderTwoPulsePeak(SoundProfile profile) {
+    ApuCore apu;
+    configureMixerProbe(apu, profile);
+    const InstrumentPreset preset = mixerProbePreset();
+    queueMixerProbeVoice(apu, WaveType::PULSE, 1.0f, 0.5f, preset);
+    queueMixerProbeVoice(apu, WaveType::PULSE, 1.0f, 0.5f, preset);
+    apu.generateSamples(gMixerProbe, kMixerProbeSamples);
+    return peakMagnitude(gMixerProbe + 256, kMixerProbeSamples - 256);
+}
+
+void mixer_nes_weighted_pulses_match_legacy_level(void) {
+    const int32_t legacy = renderTwoPulsePeak(SoundProfile::Legacy);
+    const int32_t nes = renderTwoPulsePeak(SoundProfile::Nes);
+
+    TEST_ASSERT_TRUE_MESSAGE(legacy > 1000, "the Legacy two-pulse probe rendered silence");
+    // Absolute anchor first: 2 * 0.4 * 32767 = 26213.6, +/-1 for the int16 cast.
+    TEST_ASSERT_INT32_WITHIN(2, 26213, legacy);
+    // Then the claim that matters for S4: the profile changed the balance, not
+    // the level, so the same two voices must stay within 2 % of each other.
+    TEST_ASSERT_INT32_WITHIN_MESSAGE((legacy * 2) / 100, legacy, nes,
+        "NesWeighted moved the level of two pulses instead of only their balance");
+}
+
+// A PULSE at duty 0 is a constant -32767 (the phase never falls inside the
+// pulse), so the mix under test is one known number for every sample and the
+// whole output stage can be checked against the model. `out` is the last
+// sample of a settled block.
+static int32_t renderDcPulseLevel(SoundProfile profile, SoftClipMode mode, float volume) {
+    ApuCore apu;
+    apu.init(44100);
+    apu.reset();
+    apu.setSoundProfile(profile);
+    apu.setSoftClipMode(mode);
+    apu.setHpfCutoffHz(0.0f);
+    const InstrumentPreset preset = mixerProbePreset();
+    queueMixerProbeVoice(apu, WaveType::PULSE, volume, 0.0f, preset);
+    apu.generateSamples(gMixerProbe, 128);
+    return gMixerProbe[127];
+}
+
+// S4/T2: the weighting is folded into the mix the output stage receives, not
+// applied to the finished int16 afterwards. With the shaping at `None` and the
+// DC blocker bypassed, the output is exactly MIXER_SCALE * weighted sum, so the
+// stage is checkable to the LSB — and the same voice under `Legacy` must land
+// on the same number, which is the pulse anchor made visible.
+void mixer_nes_weighted_applies_before_the_hpf(void) {
+    // Full scale: the weighted sum is -32767, i.e. 0.4 * -32767 = -13106.8.
+    const int32_t full = renderDcPulseLevel(SoundProfile::Nes, SoftClipMode::None, 1.0f);
+    const int32_t expectedFull = (int32_t)(((int64_t)(-32767) * 13107) >> 15);
+    TEST_ASSERT_INT32_WITHIN_MESSAGE(1, expectedFull, full,
+        "the weighted sum did not reach the output stage unchanged");
+
+    // Half volume: the volume and the envelope are applied per voice, BEFORE
+    // the weighting, so the sum halves to -16384 and the output with it. A
+    // weight applied to the finished sample would not scale this way.
+    const int32_t half = renderDcPulseLevel(SoundProfile::Nes, SoftClipMode::None, 0.5f);
+    const int32_t expectedHalf = (int32_t)(((int64_t)(-16384) * 13107) >> 15);
+    TEST_ASSERT_INT32_WITHIN_MESSAGE(1, expectedHalf, half,
+        "the volume scaling must sit upstream of the weighting");
+
+    // And the pulse anchor: `Legacy` renders the same voice at the same level.
+    const int32_t legacy = renderDcPulseLevel(SoundProfile::Legacy, SoftClipMode::None, 1.0f);
+    TEST_ASSERT_INT32_WITHIN_MESSAGE(1, legacy, full,
+        "the pulse group must anchor at exactly the Legacy level");
+
+    // A non-unity group in absolute terms: the triangle probe peaks at the
+    // 4-bit extreme (-32768), and its weighted sum is that value times the
+    // triangle weight. Reading it back through the same 0.4 scale closes the
+    // loop: the weight is inside the value the output stage receives.
+    const int32_t triangle = renderMixerProbePeak(SoundProfile::Nes, WaveType::TRIANGLE,
+                                                 1.0f, 0.5f);
+    const int32_t triangleSum = (int32_t)(((int64_t)(4635 * 32768)) >> 12);
+    const int32_t expectedTriangle = (int32_t)(((int64_t)triangleSum * 13107) >> 15);
+    TEST_ASSERT_INT32_WITHIN_MESSAGE(1, expectedTriangle, triangle,
+        "the triangle weight did not reach the output stage");
+}
+
+// Loud four-triangle mix, phase-aligned: each voice contributes the triangle
+// weight, so the sum is driven past unity and every curve has to bound it.
+static int32_t renderLoudWeightedMixPeak(SoftClipMode mode) {
+    ApuCore apu;
+    apu.init(44100);
+    apu.reset();
+    apu.setSoundProfile(SoundProfile::Nes);
+    apu.setSoftClipMode(mode);
+    apu.setHpfCutoffHz(0.0f);
+    const InstrumentPreset preset = mixerProbePreset();
+    for (int i = 0; i < 4; ++i) {
+        queueMixerProbeVoice(apu, WaveType::TRIANGLE, 1.0f, 0.5f, preset);
+    }
+    apu.generateSamples(gMixerProbe, kMixerProbeSamples);
+    return peakMagnitude(gMixerProbe + 256, kMixerProbeSamples - 256);
+}
+
+// S4/T2: the weighting is orthogonal to `SoftClipMode` (S4), so every mode has
+// to keep working on the weighted mix — bounded, monotonic where the mode is
+// monotonic, and without a sign inversion or a wrap-around that the mode did
+// not introduce itself.
+void mixer_nes_weighted_stays_bounded_and_monotonic_per_clip_mode(void) {
+    const SoftClipMode modes[4] = {
+        SoftClipMode::None, SoftClipMode::Rational,
+        SoftClipMode::Tanh, SoftClipMode::HardClip
+    };
+    const char* names[4] = {"None", "Rational", "Tanh", "HardClip"};
+
+    // A constant-level voice makes monotonicity and sign a pure comparison:
+    // raising the volume may only raise the magnitude of a negative sample,
+    // never flip its sign and never make it smaller.
+    for (int m = 0; m < 4; ++m) {
+        int32_t previousMagnitude = 0;
+        for (int step = 1; step <= 10; ++step) {
+            const float volume = 0.1f * (float)step;
+            const int32_t out = renderDcPulseLevel(SoundProfile::Nes, modes[m], volume);
+            char message[192];
+            std::snprintf(message, sizeof(message),
+                          "%s: the weighted mix inverted the sign at volume %.1f",
+                          names[m], (double)volume);
+            TEST_ASSERT_TRUE_MESSAGE(out < 0, message);
+            std::snprintf(message, sizeof(message),
+                          "%s: |output| fell from %d to %d while the volume rose to %.1f",
+                          names[m], (int)previousMagnitude, (int)(-out), (double)volume);
+            TEST_ASSERT_GREATER_OR_EQUAL_INT32_MESSAGE(previousMagnitude, -out, message);
+            previousMagnitude = -out;
+        }
+    }
+
+    // Bounded on an overdriven mix, and no shaped mode may pass more level than
+    // the unshaped one: a wrap in the weighted sum would break that ordering.
+    const int32_t none = renderLoudWeightedMixPeak(SoftClipMode::None);
+    TEST_ASSERT_TRUE_MESSAGE(none > 1000, "the loud weighted mix rendered silence");
+    const int32_t shaped[3] = {
+        renderLoudWeightedMixPeak(SoftClipMode::Rational),
+        renderLoudWeightedMixPeak(SoftClipMode::Tanh),
+        renderLoudWeightedMixPeak(SoftClipMode::HardClip)
+    };
+    for (int m = 0; m < 3; ++m) {
+        char message[192];
+        std::snprintf(message, sizeof(message),
+                      "%s passed more level than the unshaped weighted mix (%d > %d)",
+                      names[m + 1], (int)shaped[m], (int)none);
+        TEST_ASSERT_GREATER_OR_EQUAL_INT32_MESSAGE(shaped[m], none, message);
+        // |int16| reaches 32768 on the negative rail, so that is the bound.
+        TEST_ASSERT_TRUE_MESSAGE(shaped[m] >= 0 && shaped[m] <= 32768,
+                                 "the weighted mix left the int16 range");
+    }
+}
+
+// D-3 tier 1: the mixer curve belongs to the profile. There is no per-voice
+// setter and no command for it on purpose — mixing is a property of the whole
+// mix, so a voice-level owner would let one note change another one's level.
+void mixer_curve_is_owned_by_the_profile(void) {
+    ApuCore apu;
+    // Before anything selects a profile: the frozen Legacy curve.
+    TEST_ASSERT_EQUAL_INT((int)MixerCurve::Rational, (int)apu.getMixerCurveForTesting());
+
+    apu.setSoundProfile(SoundProfile::Nes);
+    TEST_ASSERT_EQUAL_INT((int)MixerCurve::NesWeighted, (int)apu.getMixerCurveForTesting());
+    apu.setSoundProfile(SoundProfile::Hybrid);
+    TEST_ASSERT_EQUAL_INT((int)MixerCurve::NesWeighted, (int)apu.getMixerCurveForTesting());
+    apu.setSoundProfile(SoundProfile::Legacy);
+    TEST_ASSERT_EQUAL_INT((int)MixerCurve::Rational, (int)apu.getMixerCurveForTesting());
+
+    // A stream restart must not discard the caller's choice, the same contract
+    // the profile itself has (S4).
+    apu.setSoundProfile(SoundProfile::Hybrid);
+    apu.init(22050);
+    TEST_ASSERT_EQUAL_INT((int)MixerCurve::NesWeighted, (int)apu.getMixerCurveForTesting());
+}
+
+// PRESERVE (T2): the voice-loop change must not move the `Legacy` mix. Its
+// historical anchors are MIXER_SCALE * 32767 = 13106.8 for one voice and twice
+// that for two, and the committed PCM fixtures pin the same bytes end to end.
+void mixer_legacy_keeps_its_historical_level(void) {
+    const int32_t one = renderMixerProbePeak(SoundProfile::Legacy, WaveType::PULSE, 1.0f, 0.5f);
+    TEST_ASSERT_INT32_WITHIN_MESSAGE(1, 13107, one,
+        "one full-scale pulse must still leave the mixer at 0.4 * 32767");
+
+    const int32_t two = renderTwoPulsePeak(SoundProfile::Legacy);
+    TEST_ASSERT_INT32_WITHIN_MESSAGE(2, 26213, two,
+        "two full-scale pulses must still leave the mixer at 2 * 0.4 * 32767");
+
+    // The same render through the weighted curve matches on a pulse-only
+    // programme, which is what keeps the committed integer golden (rendered
+    // through `Nes` on an FPU build) green without regenerating it. One LSB of
+    // slack: an FPU build reaches `Legacy` through the float body, whose
+    // `(int16_t)` cast truncates toward zero where the integer core floors.
+    TEST_ASSERT_INT32_WITHIN_MESSAGE(1, one, renderMixerProbePeak(SoundProfile::Nes,
+                                                                 WaveType::PULSE, 1.0f, 0.5f),
+        "the pulse anchor must be exactly the Legacy weight");
+}
+
+// =============================================================================
+// S5 / P9: unipolar NOISE, the profile's period LUT and level compensation (E1/T3)
+// =============================================================================
+//
+// Every probe below reads the mixer's BARE output: `SoftClipMode::None` plus a
+// bypassed DC blocker (`configureMixerProbe`). That is not a convenience — the
+// default blocker is exactly the stage S5 argues about (it is what removes the
+// unipolar offset), so leaving it in would hide both the sign structure and the
+// amplitude the compensation has to restore.
+
+static constexpr int kNoiseCharacterSamples = 8192;
+
+/**
+ * @brief Renders one full-scale looping NOISE voice and returns its slot.
+ *
+ * @param profile Profile in force for the render.
+ * @param unipolarOverride -1 leaves the profile default in force; 0 or 1 pins
+ *        the gate through the queued `SET_NES_OPTIONS` path. The command goes
+ *        in BEFORE the note because the bundled write also disarms the `$4015`
+ *        channel enable, which would silence a voice that is already sounding.
+ *        The note-on that follows is then the thing that must respect the pin.
+ * @param out Destination buffer.
+ * @param samples Number of samples to render.
+ * @return Slot the voice landed on (a fresh core always uses the first SFX one).
+ */
+static int renderNoiseCharacter(SoundProfile profile, int unipolarOverride,
+                                int16_t* out, int samples) {
+    ApuCore apu;
+    configureMixerProbe(apu, profile);
+
+    if (unipolarOverride >= 0) {
+        AudioCommand opts{};
+        opts.type = AudioCommandType::SET_NES_OPTIONS;
+        opts.channelIndex = (uint8_t)ApuCore::SFX_VOICE_BASE;
+        opts.nesOptions.noiseUnipolar = (unipolarOverride != 0);
+        TEST_ASSERT_TRUE(apu.submitCommand(opts));
+    }
+
+    const InstrumentPreset preset = mixerProbePreset();
+    queueMixerProbeVoice(apu, WaveType::NOISE, 1.0f, 0.5f, preset);
+    apu.generateSamples(out, samples);
+    return ApuCore::SFX_VOICE_BASE;
+}
+
+/** @brief Mean and AC RMS of `pcm[from, to)`, in int16 units. */
+static void acRmsOf(const int16_t* pcm, int from, int to, double& mean, double& rms) {
+    double sum = 0.0;
+    double sumSq = 0.0;
+    for (int i = from; i < to; ++i) {
+        const double v = (double)pcm[i];
+        sum += v;
+        sumSq += v * v;
+    }
+    const double n = (double)(to - from);
+    mean = sum / n;
+    // AC power = E[x^2] - E[x]^2. Subtracting the mean is what makes a unipolar
+    // signal comparable with a bipolar one: the DC is not audio, it is the part
+    // the output blocker removes.
+    const double variance = (sumSq / n) - (mean * mean);
+    rms = std::sqrt(variance > 0.0 ? variance : 0.0);
+}
+
+/** @brief Ratio of two amplitudes in dB, for level assertions. */
+static double ratioDb(double reference, double measured) {
+    return 20.0 * std::log10(measured / reference);
+}
+
+/** @brief Bounds of a PCM range, plus how many samples sit at exactly 0. */
+struct NoiseShape {
+    int32_t minValue;
+    int32_t maxValue;
+    int32_t zeroCount;
+};
+
+static NoiseShape noiseShape(const int16_t* pcm, int from, int to) {
+    NoiseShape shape{0, 0, 0};
+    for (int i = from; i < to; ++i) {
+        const int32_t v = (int32_t)pcm[i];
+        if (v < shape.minValue) shape.minValue = v;
+        if (v > shape.maxValue) shape.maxValue = v;
+        if (v == 0) shape.zeroCount++;
+    }
+    return shape;
+}
+
+// S5/P9 shape: the unipolar gate can only ever produce 0 or the envelope level,
+// so a long render contains no negative sample at all — while the same voice
+// under `Legacy` swings both ways. Both runs are full scale with a flat
+// envelope, so "0 or positive" is the whole claim, not a level claim.
+void noise_unipolar_voice_never_renders_negative(void) {
+    static int16_t unipolar[kNoiseCharacterSamples];
+    static int16_t bipolar[kNoiseCharacterSamples];
+
+    renderNoiseCharacter(SoundProfile::Nes, -1, unipolar, kNoiseCharacterSamples);
+    renderNoiseCharacter(SoundProfile::Legacy, -1, bipolar, kNoiseCharacterSamples);
+
+    // Skip the attack/settling samples, exactly like the mixer probes.
+    const NoiseShape u = noiseShape(unipolar, 256, kNoiseCharacterSamples);
+    char message[192];
+    std::snprintf(message, sizeof(message),
+                  "the unipolar gate rendered a negative sample (%d)", (int)u.minValue);
+    TEST_ASSERT_GREATER_OR_EQUAL_INT32_MESSAGE(0, u.minValue, message);
+    TEST_ASSERT_GREATER_THAN_INT32_MESSAGE(1000, u.maxValue,
+        "the unipolar probe rendered silence");
+    // Both states must appear: a voice stuck at the level would also be
+    // "never negative" and would prove nothing about the gate.
+    TEST_ASSERT_GREATER_THAN_INT32_MESSAGE(0, u.zeroCount,
+        "the unipolar gate never closed");
+    TEST_ASSERT_GREATER_THAN_INT32_MESSAGE(u.zeroCount, kNoiseCharacterSamples - 256,
+        "the unipolar gate never opened");
+
+    // The reference: the same note under `Legacy` is bipolar, i.e. the shape
+    // above is the profile's doing and not a property of the noise source.
+    const NoiseShape b = noiseShape(bipolar, 256, kNoiseCharacterSamples);
+    TEST_ASSERT_LESS_THAN_INT32_MESSAGE(0, b.minValue,
+        "the Legacy noise voice must stay bipolar");
+    TEST_ASSERT_GREATER_THAN_INT32_MESSAGE(0, b.maxValue,
+        "the Legacy noise voice must stay bipolar");
+}
+
+// S5 level: the compensation is measured, not guessed. The gate halves the AC
+// amplitude (mean A/2, AC RMS A/2 against the bipolar A), so the renderer
+// restores it with one x2 shift — measured below as 0 dB against the SAME voice
+// with the gate off, under the same profile and therefore the same weighting.
+//
+// The second measurement is the cross-profile one: `Nes` unipolar against
+// `Legacy` bipolar lands 3.65 dB down, and that residual is nothing but S4's
+// published noise weight (0.00494 / 0.00752 = 0.6569). It is pinned here so the
+// number is a measured contract instead of a claim: matching `Legacy` exactly
+// would require doubling that weight, which is the mixer's (T2's) decision and
+// not T3's.
+void noise_unipolar_level_is_compensated(void) {
+    static int16_t unipolarNes[kNoiseCharacterSamples];
+    static int16_t bipolarNes[kNoiseCharacterSamples];
+    static int16_t bipolarLegacy[kNoiseCharacterSamples];
+
+    // The gate is pinned in BOTH directions on purpose. The published weight is
+    // measured over a window that holds only a few dozen LFSR clocks, so the
+    // run-length bias of that window is audible in the RMS; giving the two runs
+    // different periods would compare two different sample streams and swamp
+    // the 0 dB the compensation is supposed to show. Same clock, same stream,
+    // only the gate differs.
+    renderNoiseCharacter(SoundProfile::Nes, 1, unipolarNes, kNoiseCharacterSamples);
+    renderNoiseCharacter(SoundProfile::Nes, 0, bipolarNes, kNoiseCharacterSamples);
+    renderNoiseCharacter(SoundProfile::Legacy, -1, bipolarLegacy, kNoiseCharacterSamples);
+
+    double meanUni = 0.0, rmsUni = 0.0;
+    double meanBipolarNes = 0.0, rmsBipolarNes = 0.0;
+    double meanLegacy = 0.0, rmsLegacy = 0.0;
+    acRmsOf(unipolarNes, 256, kNoiseCharacterSamples, meanUni, rmsUni);
+    acRmsOf(bipolarNes, 256, kNoiseCharacterSamples, meanBipolarNes, rmsBipolarNes);
+    acRmsOf(bipolarLegacy, 256, kNoiseCharacterSamples, meanLegacy, rmsLegacy);
+
+    TEST_ASSERT_GREATER_THAN_MESSAGE(100.0, rmsUni, "the unipolar probe rendered silence");
+    TEST_ASSERT_GREATER_THAN_MESSAGE(100.0, rmsBipolarNes, "the bipolar probe rendered silence");
+    TEST_ASSERT_GREATER_THAN_MESSAGE(100.0, rmsLegacy, "the Legacy probe rendered silence");
+
+    char message[256];
+    const double compensationDb = ratioDb(rmsBipolarNes, rmsUni);
+    std::snprintf(message, sizeof(message),
+                  "unipolar %.2f RMS vs bipolar %.2f RMS at the same weighting: %.3f dB "
+                  "(limit 1 dB)", rmsUni, rmsBipolarNes, compensationDb);
+    TEST_ASSERT_TRUE_MESSAGE(compensationDb <= 1.0 && compensationDb >= -1.0, message);
+
+    // Cross-profile, measured and explained by the published weight.
+    const double crossDb = ratioDb(rmsLegacy, rmsUni);
+    const double weightDb = ratioDb(1.0, 0.00494 / 0.00752);
+    std::snprintf(message, sizeof(message),
+                  "Nes unipolar %.2f RMS vs Legacy bipolar %.2f RMS: %.3f dB, the "
+                  "published noise weight is %.3f dB", rmsUni, rmsLegacy, crossDb, weightDb);
+    TEST_ASSERT_TRUE_MESSAGE(crossDb <= weightDb + 0.3 && crossDb >= weightDb - 0.3, message);
+
+    // And the residual really is S4's weight applied to the same amplitude: the
+    // two bipolar renders differ by exactly that weight as well.
+    const double legacyVsNesDb = ratioDb(rmsLegacy, rmsBipolarNes);
+    std::snprintf(message, sizeof(message),
+                  "the bipolar Nes/Legacy gap is %.3f dB, expected %.3f dB",
+                  legacyVsNesDb, weightDb);
+    TEST_ASSERT_TRUE_MESSAGE(legacyVsNesDb <= weightDb + 0.3 && legacyVsNesDb >= weightDb - 0.3,
+                             message);
+}
+
+// S5 period + gate, D-3 tier 1: the profile supplies both defaults. `Nes` and
+// `Hybrid` arm the canonical `$400E = $00` entry — index 0 of
+// `nes_apu::kNesNoisePeriodLutNtsc` — so the note's own 1000 Hz clock (44
+// samples) does not decide the period; `Legacy` keeps both the bipolar gate and
+// the frequency-derived period.
+void profile_defaults_arm_the_nes_noise_character(void) {
+    int16_t buffer[256] = {0};
+
+    const SoundProfile nesProfiles[2] = {SoundProfile::Nes, SoundProfile::Hybrid};
+    for (int i = 0; i < 2; ++i) {
+        ApuCore apu;
+        apu.init(44100);
+        apu.reset();
+        apu.setSoundProfile(nesProfiles[i]);
+
+        const int slot = startLoopingNoiseVoice(apu, buffer);
+        TEST_ASSERT_EQUAL_UINT8_MESSAGE(0, apu.getVoiceNesNoiseLutIndexForTesting(slot),
+            "a NES-profile noise voice must arm the canonical LUT entry");
+        // `kNesNoisePeriodLutNtsc[0]` is 4 CPU cycles, which collapses onto the
+        // one-sample floor at 44.1 kHz — and is still 44x faster than the note.
+        TEST_ASSERT_EQUAL_UINT32(nes_apu::nesNoisePeriodToSamples(0, 44100),
+                                 apu.getVoiceNoisePeriodForTesting(slot));
+        TEST_ASSERT_NOT_EQUAL_UINT32(44u, apu.getVoiceNoisePeriodForTesting(slot));
+        TEST_ASSERT_TRUE_MESSAGE(apu.isVoiceNoiseUnipolarForTesting(slot),
+            "a NES-profile noise voice must gate between 0 and the level");
+    }
+
+    ApuCore legacy;
+    legacy.init(44100);
+    legacy.reset();
+    const int legacySlot = startLoopingNoiseVoice(legacy, buffer);
+    TEST_ASSERT_FALSE(legacy.isVoiceNoiseUnipolarForTesting(legacySlot));
+    TEST_ASSERT_EQUAL_UINT8(255, legacy.getVoiceNesNoiseLutIndexForTesting(legacySlot));
+    // 44100 / 1000 Hz = 44 samples: the legacy frequency-derived period.
+    TEST_ASSERT_EQUAL_UINT32(44u, legacy.getVoiceNoisePeriodForTesting(legacySlot));
+}
+
+// S5 period + gate, D-3 tier 2: an explicit voice-level selector beats the
+// profile's default for as long as the slot lives, not just for one note. The
+// slot is never reset here (the note simply ends), which is exactly the
+// lifetime a per-slot mode is documented to have.
+void profile_noise_defaults_yield_to_a_voice_override(void) {
+    ApuCore apu;
+    apu.init(44100);
+    apu.reset();
+    apu.setSoundProfile(SoundProfile::Nes);
+
+    static int16_t buffer[1024];
+    const int slot = startLoopingNoiseVoice(apu, buffer);
+    TEST_ASSERT_TRUE(apu.isVoiceNoiseUnipolarForTesting(slot));
+
+    // Index 12 is 762 CPU cycles: distinctive at 44.1 kHz, unlike entry 0.
+    apu.setVoiceNesNoiseLutMode(slot, 12);
+    TEST_ASSERT_EQUAL_UINT8(12, apu.getVoiceNesNoiseLutIndexForTesting(slot));
+    TEST_ASSERT_EQUAL_UINT32(nes_apu::nesNoisePeriodToSamples(12, 44100),
+                             apu.getVoiceNoisePeriodForTesting(slot));
+
+    // Explicitly off (255) also survives: "derive the period from the note".
+    apu.setVoiceNesNoiseLutMode(slot, 255);
+    TEST_ASSERT_EQUAL_UINT8(255, apu.getVoiceNesNoiseLutIndexForTesting(slot));
+    TEST_ASSERT_EQUAL_UINT32(44u, apu.getVoiceNoisePeriodForTesting(slot));
+
+    // Now let the voice die and re-trigger the same slot: the profile default
+    // must not be re-armed over the pinned selector.
+    AudioCommand stop{};
+    stop.type = AudioCommandType::STOP_CHANNEL;
+    stop.channelIndex = (uint8_t)slot;
+    TEST_ASSERT_TRUE(apu.submitCommand(stop));
+    apu.generateSamples(buffer, 64);
+
+    // STOP_CHANNEL resets the slot, so the per-slot mode is gone by contract —
+    // re-arm it and prove a note-on keeps it.
+    apu.setVoiceNesNoiseLutMode(slot, 12);
+    const int slot2 = startLoopingNoiseVoice(apu, buffer);
+    TEST_ASSERT_EQUAL_INT(slot, slot2);
+    TEST_ASSERT_EQUAL_UINT8(12, apu.getVoiceNesNoiseLutIndexForTesting(slot));
+    TEST_ASSERT_EQUAL_UINT32(nes_apu::nesNoisePeriodToSamples(12, 44100),
+                             apu.getVoiceNoisePeriodForTesting(slot));
+}
+
+// Queues one short NOISE note and renders past its end. No preset release, so
+// the voice is idle (not lingering in RELEASE) when this returns, and the next
+// note on the slot reuses it WITHOUT a reset — which is what makes the per-slot
+// override test meaningful.
+static void playShortNoiseNote(ApuCore& apu, int16_t* scratch, int samples) {
+    InstrumentPreset preset = mixerProbePreset();
+    preset.releaseTime = 0.0f;
+
+    AudioCommand cmd{};
+    cmd.type = AudioCommandType::PLAY_EVENT;
+    cmd.event.type = WaveType::NOISE;
+    cmd.event.frequency = 1000.0f;
+    cmd.event.duration = 0.002f;   // ~88 samples at 44.1 kHz
+    cmd.event.volume = 1.0f;
+    cmd.event.loop = false;
+    cmd.event.preset = &preset;
+    TEST_ASSERT_TRUE(apu.submitCommand(cmd));
+    apu.generateSamples(scratch, samples);
+}
+
+// S5 / D-3 tier 2, the case the precedence table exists to protect:
+// `SET_NES_OPTIONS` with the flag off returns a `Nes` noise voice to bipolar
+// noise, and the profile does NOT re-arm its own default on the next note.
+void noise_unipolar_override_survives_the_next_note(void) {
+    ApuCore apu;
+    apu.init(44100);
+    apu.reset();
+    apu.setSoundProfile(SoundProfile::Nes);
+    apu.setSoftClipMode(SoftClipMode::None);
+    apu.setHpfCutoffHz(0.0f);
+
+    static int16_t buffer[1024];
+    const int slot = ApuCore::SFX_VOICE_BASE;
+
+    playShortNoiseNote(apu, buffer, 256);
+    TEST_ASSERT_FALSE_MESSAGE(apu.isVoiceEnabledForTesting(slot),
+        "the short note must idle the slot for the next note to reuse it");
+    TEST_ASSERT_TRUE_MESSAGE(apu.isVoiceNoiseUnipolarForTesting(slot),
+        "the profile default must arm the gate on the first note");
+
+    AudioCommand opts{};
+    opts.type = AudioCommandType::SET_NES_OPTIONS;
+    opts.channelIndex = (uint8_t)slot;
+    opts.nesOptions.noiseUnipolar = false;
+    TEST_ASSERT_TRUE(apu.submitCommand(opts));
+    apu.generateSamples(buffer, 256);
+    TEST_ASSERT_FALSE_MESSAGE(apu.isVoiceNoiseUnipolarForTesting(slot),
+        "SET_NES_OPTIONS with the flag off must return the voice to bipolar noise");
+
+    // Next note on the same slot: still bipolar.
+    playShortNoiseNote(apu, buffer, 256);
+    TEST_ASSERT_FALSE_MESSAGE(apu.isVoiceNoiseUnipolarForTesting(slot),
+        "the profile must not re-arm a gate the voice pinned off");
+
+    // And audibly so. A looping note on the same slot makes the gate visible;
+    // the re-triggered LFSR starts on an all-ones run, so the window has to
+    // cover more than 15 clocks to contain a negative sample — the period here
+    // is the note's own 1000 Hz (44 samples), so 2 048 samples is 46 clocks.
+    const int loopSlot = startLoopingNoiseVoice(apu, buffer);
+    TEST_ASSERT_EQUAL_INT(slot, loopSlot);
+    static int16_t longPcm[2048];
+    apu.generateSamples(longPcm, 2048);
+    const NoiseShape shape = noiseShape(longPcm, 0, 2048);
+    TEST_ASSERT_LESS_THAN_INT32_MESSAGE(0, shape.minValue,
+        "the pinned-off voice must render bipolar noise again");
+}
+
+// PRESERVE (T3): `Legacy` keeps the bipolar gate at its historical level, the
+// frequency-derived period and no LUT. The committed fixtures and both integer
+// goldens pin the same bytes end to end; this case pins the voice-level claims
+// so a future profile default cannot quietly reach the frozen path.
+void noise_legacy_character_is_unchanged(void) {
+    ApuCore apu;
+    apu.init(44100);
+    apu.reset();
+
+    int16_t buffer[256] = {0};
+    const int slot = startLoopingNoiseVoice(apu, buffer);
+    TEST_ASSERT_FALSE(apu.isVoiceNoiseUnipolarForTesting(slot));
+    TEST_ASSERT_EQUAL_UINT8(255, apu.getVoiceNesNoiseLutIndexForTesting(slot));
+    TEST_ASSERT_EQUAL_UINT32(44u, apu.getVoiceNoisePeriodForTesting(slot));
+
+    static int16_t pcm[kNoiseCharacterSamples];
+    renderNoiseCharacter(SoundProfile::Legacy, -1, pcm, kNoiseCharacterSamples);
+    const NoiseShape shape = noiseShape(pcm, 256, kNoiseCharacterSamples);
+    TEST_ASSERT_LESS_THAN_INT32(0, shape.minValue);
+    TEST_ASSERT_GREATER_THAN_INT32(0, shape.maxValue);
+    // 0.4 * 32767 = 13106.8: the historical Legacy level, untouched by the
+    // compensation (which only ever applies to a unipolar voice).
+    TEST_ASSERT_INT32_WITHIN_MESSAGE(1, 13107, peakMagnitude(pcm + 256,
+                                                            kNoiseCharacterSamples - 256),
+        "the Legacy noise level must stay at MIXER_SCALE * 32767");
+}
+
+// =============================================================================
+// S6: stepped PULSE duty, its profile default and the D-3 overrides (E1/T4)
+// =============================================================================
+//
+// A NES duty pattern is eight phase steps long, so every probe below renders at
+// exactly eight output samples per period (44 100 / 8 = 5 512.5 Hz): one PCM
+// sample per phase step, with the oscillator reset to phase 0 on the note, which
+// makes the pattern readable straight off the sign of an aligned window.
+//
+// `configureMixerProbe` puts the shaping stage out of the way (HPF bypassed, no
+// soft clip) so the sign is the generator's own output and nothing else, and the
+// probe preset attacks in one sample with a flat sustain, so no window sample is
+// scaled by a moving envelope.
+
+static constexpr int kDutyProbeSamples = 256;
+static constexpr float kDutyProbeHz = 5512.5f;  // = 44 100 / 8, one sample per step
+// Sample 8 is the first cycle boundary that is already past the one-sample
+// attack: sample n carries phase step n % 8.
+static constexpr int kDutyProbeWindow = 8;
+
+/** @brief One duty probe: the resolved index plus the PCM it rendered. */
+struct DutyProbe {
+    uint8_t index = 255;
+    int16_t pcm[kDutyProbeSamples] = {};
+};
+
+/**
+ * @brief Renders one looping probe note and reports the resolved duty index.
+ * @param profile Sound profile in force for the note.
+ * @param type Waveform of the probe note.
+ * @param duty The note's own `duty` (and the preset's, so the two agree).
+ * @param pinIndex -1 leaves the profile default in force; 0..3 or 255 pins the
+ *        mode through `setVoicePulseDutyMode` BEFORE the note, which is the
+ *        order that makes the note-on the thing under test.
+ * @param out Probe result.
+ */
+static void probeDutyVoice(SoundProfile profile, WaveType type, float duty,
+                           int pinIndex, DutyProbe& out) {
+    ApuCore apu;
+    configureMixerProbe(apu, profile);
+    const int slot = ApuCore::SFX_VOICE_BASE;
+    if (pinIndex >= 0) {
+        apu.setVoicePulseDutyMode(slot, (uint8_t)pinIndex);
+    }
+
+    InstrumentPreset preset = mixerProbePreset();
+    preset.duty = duty;
+
+    AudioCommand cmd{};
+    cmd.type = AudioCommandType::PLAY_EVENT;
+    cmd.event.type = type;
+    cmd.event.frequency = kDutyProbeHz;
+    cmd.event.duration = 0.0f;
+    cmd.event.volume = 1.0f;
+    cmd.event.duty = duty;
+    cmd.event.loop = true;
+    cmd.event.preset = &preset;
+    TEST_ASSERT_TRUE(apu.submitCommand(cmd));
+
+    apu.generateSamples(out.pcm, kDutyProbeSamples);
+    out.index = apu.getVoiceNesOptions(slot).pulseDutyIndex;
+}
+
+/** @brief Sign of `pcm[i]` as +1/-1, or 0 for silence. */
+static int signOfSample(int16_t value) {
+    return (value > 0) ? 1 : ((value < 0) ? -1 : 0);
+}
+
+/**
+ * @brief Asserts the aligned window of a render matches an 8-step duty table.
+ *
+ * @param pcm Rendered PCM.
+ * @param pattern Table entry, 1 = high phase step, 0 = low.
+ * @param label Case name for the failure message.
+ */
+static void assertDutyPattern(const int16_t* pcm, const uint8_t (&pattern)[8],
+                              const char* label) {
+    for (int step = 0; step < 8; ++step) {
+        const int expected = pattern[step] ? 1 : -1;
+        const int actual = signOfSample(pcm[kDutyProbeWindow + step]);
+        char message[192];
+        std::snprintf(message, sizeof(message),
+                      "%s: phase step %d must be %s", label, step,
+                      pattern[step] ? "high" : "low");
+        TEST_ASSERT_EQUAL_INT_MESSAGE(expected, actual, message);
+    }
+}
+
+// S6 / D-3 tier 1: under a NES-derived profile a PULSE note renders the stepped
+// NES pattern chosen from its own `duty` — not the continuous `phaseQ32 <
+// dutyCycleQ32` comparison. A 0.5 note selects index 2, whose table entry is
+// {0,1,1,1,1,0,0,0}: 4 high of 8 (50 %), rotated one step from the continuous
+// square. Both halves are asserted, because the duty percentage alone cannot
+// tell the two generators apart.
+void duty_nes_profile_arms_the_stepped_pattern(void) {
+    static const uint8_t kIndex2Pattern[8] = {0, 1, 1, 1, 1, 0, 0, 0};
+
+    DutyProbe defaulted;
+    probeDutyVoice(SoundProfile::Nes, WaveType::PULSE, 0.5f, -1, defaulted);
+    TEST_ASSERT_EQUAL_UINT8_MESSAGE(2, defaulted.index,
+        "a 0.5 duty note under Nes must resolve to the 50 % NES step");
+
+    int highSteps = 0;
+    for (int step = 0; step < 8; ++step) {
+        if (signOfSample(defaulted.pcm[kDutyProbeWindow + step]) > 0) ++highSteps;
+    }
+    TEST_ASSERT_EQUAL_INT_MESSAGE(4, highSteps,
+        "the 50 % NES step must be high on 4 of the 8 phase steps");
+    assertDutyPattern(defaulted.pcm, kIndex2Pattern, "Nes 0.5 duty");
+
+    // The profile default IS the pinned pattern: same generator, same bytes.
+    DutyProbe pinned;
+    probeDutyVoice(SoundProfile::Nes, WaveType::PULSE, 0.5f, 2, pinned);
+    TEST_ASSERT_EQUAL_INT_MESSAGE(0, std::memcmp(defaulted.pcm, pinned.pcm,
+                                                sizeof(defaulted.pcm)),
+        "the profile default must render exactly the pattern its index selects");
+
+    // And it is not the continuous comparison: the same note under `Legacy`
+    // holds the first four steps high instead of steps 1..4.
+    DutyProbe legacy;
+    probeDutyVoice(SoundProfile::Legacy, WaveType::PULSE, 0.5f, -1, legacy);
+    TEST_ASSERT_TRUE_MESSAGE(std::memcmp(defaulted.pcm, legacy.pcm,
+                                        sizeof(defaulted.pcm)) != 0,
+        "the stepped 50 % pattern must differ from the continuous square");
+    static const uint8_t kContinuousPattern[8] = {1, 1, 1, 1, 0, 0, 0, 0};
+    assertDutyPattern(legacy.pcm, kContinuousPattern, "Legacy continuous 0.5");
+}
+
+// S6: the step is the NEAREST of the four NES duties, computed from the note's
+// own `duty` against the three midpoints:
+//
+//   0.1875 = (12.5 + 25) / 2 -> between step 0 and step 1
+//   0.375  = (25 + 50)   / 2 -> between step 1 and step 2
+//   0.625  = (50 + 75)   / 2 -> between step 2 and step 3
+//
+// A value below a midpoint rounds down, a value AT or above it rounds up, so an
+// exact tie picks the HIGHER duty: the comparison is `<` against each
+// midpoint, i.e. round-half-up. Every case below is a boundary of that rule.
+void duty_snapping_selects_the_nearest_nes_step(void) {
+    struct SnappingCase {
+        float duty;
+        uint8_t expected;
+        const char* why;
+    };
+    static const SnappingCase cases[] = {
+        {0.0f,   0, "below the first step clamps to 12.5 %"},
+        {0.0625f, 0, "half of the first step"},
+        {0.125f, 0, "12.5 % is step 0"},
+        {0.1874f, 0, "just below the 12.5/25 midpoint rounds down"},
+        {0.1875f, 1, "the exact midpoint rounds up to 25 %"},
+        {0.25f,  1, "25 % is step 1"},
+        {0.3749f, 1, "just below the 25/50 midpoint rounds down"},
+        {0.375f, 2, "the exact midpoint rounds up to 50 %"},
+        {0.5f,   2, "50 % is step 2"},
+        {0.6249f, 2, "just below the 50/75 midpoint rounds down"},
+        {0.625f, 3, "the exact midpoint rounds up to 75 %"},
+        {0.75f,  3, "75 % is step 3"},
+        {1.0f,   3, "above the last step clamps to 75 %"},
+    };
+
+    for (const SnappingCase& c : cases) {
+        DutyProbe probe;
+        probeDutyVoice(SoundProfile::Nes, WaveType::PULSE, c.duty, -1, probe);
+        char message[192];
+        std::snprintf(message, sizeof(message),
+                      "duty %.4f must snap to index %u: %s", (double)c.duty,
+                      (unsigned)c.expected, c.why);
+        TEST_ASSERT_EQUAL_UINT8_MESSAGE(c.expected, probe.index, message);
+    }
+
+    // Both NES-derived profiles share the rule, and neither one is a guess.
+    DutyProbe hybrid;
+    probeDutyVoice(SoundProfile::Hybrid, WaveType::PULSE, 0.25f, -1, hybrid);
+    TEST_ASSERT_EQUAL_UINT8(1, hybrid.index);
+}
+
+// S6 / D-3 tier 2: `setVoicePulseDutyMode` pins the pattern for the slot, and
+// the profile does NOT re-arm its own default over it on the next note. The pin
+// ignores the note's `duty` too: the selector owns the waveform mode, which is
+// the M2 contract ("ignored when pulseDutyIndex < 4").
+void duty_voice_override_survives_the_next_note(void) {
+    static const uint8_t kIndex3Pattern[8] = {1, 0, 1, 1, 1, 1, 1, 0};
+    static const uint8_t kContinuousPattern[8] = {1, 1, 1, 1, 0, 0, 0, 0};
+
+    ApuCore apu;
+    configureMixerProbe(apu, SoundProfile::Nes);
+    const int slot = ApuCore::SFX_VOICE_BASE;
+
+    // Every note below carries `duty` 0.5, i.e. the value that snaps to index 2:
+    // a profile re-arm would therefore be visible as 2, never as the pin.
+    InstrumentPreset preset = mixerProbePreset();
+    preset.duty = 0.5f;
+    preset.releaseTime = 0.0f;  // no release tail: the slot goes idle in place
+
+    static int16_t pcm[kDutyProbeSamples];
+    // A SHORT note rather than a looping one: it leaves the slot idle without
+    // resetting it, so the next note lands on the same slot and the per-slot
+    // mode is the only thing that can carry over (this is T3's pattern).
+    auto playShortNote = [&]() {
+        AudioCommand cmd{};
+        cmd.type = AudioCommandType::PLAY_EVENT;
+        cmd.event.type = WaveType::PULSE;
+        cmd.event.frequency = kDutyProbeHz;
+        cmd.event.duration = 0.002f;  // ~88 samples at 44.1 kHz
+        cmd.event.volume = 1.0f;
+        cmd.event.duty = 0.5f;
+        cmd.event.loop = false;
+        cmd.event.preset = &preset;
+        TEST_ASSERT_TRUE(apu.submitCommand(cmd));
+        apu.generateSamples(pcm, kDutyProbeSamples);
+    };
+    auto playLoopingNote = [&]() {
+        AudioCommand cmd{};
+        cmd.type = AudioCommandType::PLAY_EVENT;
+        cmd.event.type = WaveType::PULSE;
+        cmd.event.frequency = kDutyProbeHz;
+        cmd.event.duration = 0.0f;
+        cmd.event.volume = 1.0f;
+        cmd.event.duty = 0.5f;
+        cmd.event.loop = true;
+        cmd.event.preset = &preset;
+        TEST_ASSERT_TRUE(apu.submitCommand(cmd));
+        apu.generateSamples(pcm, kDutyProbeSamples);
+    };
+
+    playShortNote();
+    TEST_ASSERT_FALSE_MESSAGE(apu.isVoiceEnabledForTesting(slot),
+        "the short note must idle the slot for the next note to reuse it");
+    TEST_ASSERT_EQUAL_UINT8_MESSAGE(2, apu.getVoiceNesOptions(slot).pulseDutyIndex,
+        "the profile default must arm the note's own step first");
+
+    // Tier 2 wins: 75 %.
+    apu.setVoicePulseDutyMode(slot, 3);
+    TEST_ASSERT_EQUAL_UINT8(3, apu.getVoiceNesOptions(slot).pulseDutyIndex);
+
+    // The next note on the same slot carries duty 0.5, i.e. it would snap to
+    // index 2. The pinned selector must survive it: that is the whole point of
+    // the tier-2 marker, without which a voice-level choice dies on the next
+    // note-on.
+    playShortNote();
+    TEST_ASSERT_EQUAL_UINT8_MESSAGE(3, apu.getVoiceNesOptions(slot).pulseDutyIndex,
+        "the profile must not overwrite a pinned duty mode on the next note");
+
+    // And it is audible: the same pinned slot renders index 3's table.
+    playLoopingNote();
+    assertDutyPattern(pcm, kIndex3Pattern, "Nes pinned 75 % after a second note");
+
+    // Pinning the continuous sentinel works the same way: it is an explicit
+    // "this slot keeps the continuous generator", not a request to be re-armed.
+    // The selector is read per sample, so the sounding voice switches without a
+    // new note; 256 samples is a whole number of 8-sample periods, which keeps
+    // the window aligned to phase step 0.
+    apu.setVoicePulseDutyMode(slot, 255);
+    TEST_ASSERT_EQUAL_UINT8(255, apu.getVoiceNesOptions(slot).pulseDutyIndex);
+    apu.generateSamples(pcm, kDutyProbeSamples);
+    assertDutyPattern(pcm, kContinuousPattern, "Nes pinned continuous");
+
+    // `reset()` is what gives the slot back to the profile (it is per-slot
+    // state, exactly like the M2/M8 selectors it sits beside).
+    AudioCommand stop{};
+    stop.type = AudioCommandType::STOP_CHANNEL;
+    stop.channelIndex = (uint8_t)slot;
+    TEST_ASSERT_TRUE(apu.submitCommand(stop));
+    apu.generateSamples(pcm, 64);
+    playShortNote();
+    TEST_ASSERT_EQUAL_UINT8_MESSAGE(2, apu.getVoiceNesOptions(slot).pulseDutyIndex,
+        "a reset slot must fall back to the profile default");
+}
+
+// S6: PULSE only. The duty step is a property of the pulse generator, so for
+// every other waveform two notes that differ ONLY in `duty` must render the
+// same bytes — under both profiles — and no index may be armed.
+//
+// The comparison is within one profile on purpose: T2's weighting and T3's
+// unipolar noise already make `Nes` and `Legacy` differ for TRIANGLE and NOISE
+// by design, and repeating those assertions here would test the mixer instead
+// of the duty path. SINE and SAW join the pulse group at unity weight and carry
+// no other character, so for them the cross-profile half is exact and is
+// checked as well.
+void duty_profile_default_leaves_non_pulse_voices_untouched(void) {
+    static const WaveType types[] = {
+        WaveType::SINE, WaveType::SAW, WaveType::TRIANGLE, WaveType::NOISE,
+    };
+    static const char* const names[] = {"SINE", "SAW", "TRIANGLE", "NOISE"};
+    static const float duties[2] = {0.125f, 0.75f};  // opposite ends of the rule
+
+    for (int t = 0; t < 4; ++t) {
+        DutyProbe across[2];
+        for (int d = 0; d < 2; ++d) {
+            char label[128];
+            std::snprintf(label, sizeof(label), "%s under Nes at duty %.3f",
+                          names[t], (double)duties[d]);
+            probeDutyVoice(SoundProfile::Nes, types[t], duties[d], -1, across[d]);
+            TEST_ASSERT_EQUAL_UINT8_MESSAGE(255, across[d].index, label);
+            TEST_ASSERT_GREATER_THAN_INT32_MESSAGE(0,
+                peakMagnitude(across[d].pcm, kDutyProbeSamples), label);
+        }
+        char message[192];
+        std::snprintf(message, sizeof(message),
+                      "%s: changing the note duty must not change the render",
+                      names[t]);
+        TEST_ASSERT_EQUAL_INT_MESSAGE(0,
+            std::memcmp(across[0].pcm, across[1].pcm, sizeof(across[0].pcm)),
+            message);
+    }
+
+    // SINE and SAW: measured cross-profile agreement is 1 LSB in the settled
+    // window, and that residual is the two render cores' own rounding (the FPU
+    // build renders `Legacy` in float and both NES profiles integer), not the
+    // duty path — it is identical before and after this change, and it vanishes
+    // in `test_apu_core_integer`, where both profiles run the integer core.
+    // Asserted within that 1 LSB so a duty leak, which would move whole duty
+    // percentages, still fails loudly. TRIANGLE and NOISE are excluded on
+    // purpose: T2 gives TRIANGLE a 1.1316 weight and NOISE a 0.6569 one, and T3
+    // arms the NES noise period LUT, so those two differ across profiles by
+    // design and comparing them here would test the mixer instead.
+    static const WaveType unityTypes[] = {WaveType::SINE, WaveType::SAW};
+    static const char* const unityNames[] = {"SINE", "SAW"};
+    for (int t = 0; t < 2; ++t) {
+        DutyProbe nes;
+        DutyProbe legacy;
+        probeDutyVoice(SoundProfile::Nes, unityTypes[t], 0.5f, -1, nes);
+        probeDutyVoice(SoundProfile::Legacy, unityTypes[t], 0.5f, -1, legacy);
+        int32_t worst = 0;
+        for (int i = 8; i < kDutyProbeSamples; ++i) {
+            const int32_t delta = (int32_t)nes.pcm[i] - (int32_t)legacy.pcm[i];
+            const int32_t magnitude = (delta < 0) ? -delta : delta;
+            if (magnitude > worst) worst = magnitude;
+        }
+        char message[192];
+        std::snprintf(message, sizeof(message),
+                      "%s: Legacy and Nes differ by %d LSB per sample (limit 1)",
+                      unityNames[t], (int)worst);
+        TEST_ASSERT_LESS_OR_EQUAL_INT32_MESSAGE(1, worst, message);
+    }
+}
+
+// PRESERVE (T4): `Legacy` never arms a step. The index stays at the continuous
+// sentinel for every duty, and the rendered waveform is the continuous
+// comparison — which is what the two committed goldens and the canonical mirror
+// fixture pin byte for byte end to end.
+void duty_legacy_profile_keeps_continuous_duty(void) {
+    static const float duties[4] = {0.125f, 0.25f, 0.5f, 0.75f};
+
+    for (float duty : duties) {
+        DutyProbe probe;
+        probeDutyVoice(SoundProfile::Legacy, WaveType::PULSE, duty, -1, probe);
+        char message[160];
+        std::snprintf(message, sizeof(message),
+                      "Legacy must keep the continuous generator at duty %.3f",
+                      (double)duty);
+        TEST_ASSERT_EQUAL_UINT8_MESSAGE(255, probe.index, message);
+    }
+
+    // The preset's `duty` is still honoured as a continuous value: the phase
+    // comparison starts each period high and turns low at `duty`, so a 75 %
+    // note is high on 6 of the 8 steps and a 12.5 % one on 1. A stepped index
+    // cannot express this: its patterns start low at step 0 for 25/50 %.
+    for (float duty : duties) {
+        DutyProbe probe;
+        probeDutyVoice(SoundProfile::Legacy, WaveType::PULSE, duty, -1, probe);
+        int high = 0;
+        for (int i = kDutyProbeWindow; i < kDutyProbeWindow + 8; ++i) {
+            if (signOfSample(probe.pcm[i]) > 0) ++high;
+        }
+        char message[160];
+        std::snprintf(message, sizeof(message),
+                      "Legacy duty %.3f rendered %d high steps of 8", (double)duty,
+                      high);
+        if (duty == 0.125f) {
+            TEST_ASSERT_EQUAL_INT_MESSAGE(1, high, message);
+        } else if (duty == 0.25f) {
+            TEST_ASSERT_EQUAL_INT_MESSAGE(2, high, message);
+        } else if (duty == 0.5f) {
+            TEST_ASSERT_EQUAL_INT_MESSAGE(4, high, message);
+        } else {
+            TEST_ASSERT_EQUAL_INT_MESSAGE(6, high, message);
+        }
+    }
 }
 
 // =============================================================================
@@ -6046,11 +7494,42 @@ int main(int argc, char** argv) {
     RUN_TEST(test_sound_profile_survives_init);
 
     // S3 / S5 / S6: core dispatch, profile character and the hot switch
-    RUN_TEST(profile_nes_and_hybrid_render_identical_bytes);
+    RUN_TEST(profile_nes_and_hybrid_differ_only_by_the_envelope_curve);
     RUN_TEST(profile_apply_runs_after_nes_accurate_init);
     RUN_TEST(profile_hot_switch_does_not_click);
     RUN_TEST(profile_accessors_follow_the_active_core);
     RUN_TEST(profile_setter_is_idempotent_for_state);
+
+    // S2 / S3: envelope curve, profile default and D-3 precedence (E1/T1)
+    RUN_TEST(instrument_preset_envelope_curve_is_appended_and_zero);
+    RUN_TEST(profile_envelope_curve_precedence_matches_d3);
+    RUN_TEST(envelope_exponential_decay_reaches_minus_60_db_at_the_stage_end);
+    RUN_TEST(envelope_exponential_release_reaches_minus_60_db_at_the_stage_end);
+    RUN_TEST(envelope_exponential_short_stage_keeps_the_linear_ramp);
+    RUN_TEST(profile_hybrid_canonical_note_never_falls_silent_before_decay_ends);
+
+    // S4: mixer curve and the NES-weighted groups (E1/T2)
+    RUN_TEST(mixer_curve_is_owned_by_the_profile);
+    RUN_TEST(mixer_nes_weighted_group_balance_matches_the_published_ratios);
+    RUN_TEST(mixer_nes_weighted_pulses_match_legacy_level);
+    RUN_TEST(mixer_nes_weighted_applies_before_the_hpf);
+    RUN_TEST(mixer_nes_weighted_stays_bounded_and_monotonic_per_clip_mode);
+    RUN_TEST(mixer_legacy_keeps_its_historical_level);
+
+    // S5: unipolar NOISE, the profile period LUT and level compensation (E1/T3)
+    RUN_TEST(noise_unipolar_voice_never_renders_negative);
+    RUN_TEST(noise_unipolar_level_is_compensated);
+    RUN_TEST(profile_defaults_arm_the_nes_noise_character);
+    RUN_TEST(profile_noise_defaults_yield_to_a_voice_override);
+    RUN_TEST(noise_unipolar_override_survives_the_next_note);
+    RUN_TEST(noise_legacy_character_is_unchanged);
+
+    // S6: stepped duty, profile default and the D-3 overrides (E1/T4)
+    RUN_TEST(duty_nes_profile_arms_the_stepped_pattern);
+    RUN_TEST(duty_snapping_selects_the_nearest_nes_step);
+    RUN_TEST(duty_voice_override_survives_the_next_note);
+    RUN_TEST(duty_profile_default_leaves_non_pulse_voices_untouched);
+    RUN_TEST(duty_legacy_profile_keeps_continuous_duty);
 
     // Integration tests
     RUN_TEST(test_apu_core_integration_full_pipeline);

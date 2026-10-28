@@ -85,6 +85,339 @@ namespace pixelroot32::audio {
     // Internal helper functions
     // ============================================================================
 
+    /**
+     * @brief The envelope curve a sound profile supplies as its default (S2/D-2).
+     *
+     * The profile is the first tier of the D-3 precedence table: it owns the
+     * default, and a note that names a curve of its own wins over it. This is
+     * the single place that mapping lives, so `applyProfileCharacter` cannot
+     * drift from what the profiles are documented to sound like.
+     *
+     * `Nes` deliberately answers `Linear`: its character is the 4-bit
+     * `nesEnvelope` clocked at 240 Hz, which is a different mechanism and not
+     * the exponential ramp. `Legacy` answers `Linear` because its curve is
+     * frozen (S1), and any unknown value is treated as `Legacy` rather than
+     * guessed.
+     *
+     * @param profile Profile in force.
+     * @return Curve the profile supplies when the note asks for none.
+     */
+    static inline EnvelopeCurve profileDefaultEnvelopeCurve(SoundProfile profile) {
+        return (profile == SoundProfile::Hybrid) ? EnvelopeCurve::Exponential
+                                                 : EnvelopeCurve::Linear;
+    }
+
+    /**
+     * @brief The unipolar NOISE gate a sound profile arms by default (S5/D-3).
+     *
+     * Tier 1 of the D-3 table owns the default and the voice may pin it. `Nes`
+     * and `Hybrid` gate the noise between 0 and the envelope level, which is
+     * what the hardware does and what makes the noise sit "on top of" the mix
+     * instead of subtracting as much energy as it adds; `Legacy` keeps the
+     * bipolar output frozen (S1), and any unknown value answers `Legacy`
+     * rather than being guessed.
+     *
+     * @param profile Profile in force.
+     * @return true when a NOISE voice should render the unipolar gate.
+     */
+    static inline bool profileDefaultNoiseUnipolar(SoundProfile profile) {
+        return profile != SoundProfile::Legacy;
+    }
+
+    /**
+     * @brief NOISE period LUT index the `Nes`/`Hybrid` profiles arm (S5).
+     *
+     * `$400E = $00`: the write the canonical NES init performs (see
+     * `initNesSafe`), i.e. the fastest of the sixteen published periods. The
+     * `Legacy` profile answers the 255 sentinel instead — "derive the period
+     * from the note" — so its noise keeps the frequency-derived clock.
+     */
+    static constexpr uint8_t kProfileNesNoiseLutIndex = 0;
+
+    /**
+     * @brief NOISE period LUT index a sound profile arms by default (S5).
+     *
+     * @param profile Profile in force.
+     * @return 0..15 for a LUT entry, 255 to derive the period from the note.
+     */
+    static inline uint8_t profileDefaultNoiseLutIndex(SoundProfile profile) {
+        return (profile == SoundProfile::Legacy) ? 255u : kProfileNesNoiseLutIndex;
+    }
+
+    /**
+     * @brief PULSE duty step a NES-derived profile arms for a note (S6).
+     *
+     * `Nes` and `Hybrid` render the four discrete NES duty patterns instead of
+     * the continuous `phaseQ32 < dutyCycleQ32` comparison, because that is what
+     * the hardware does: the pulse channel has no duty register, only a 2-bit
+     * selector. The selector is chosen by NEAREST STEP from the note's own
+     * `duty`, so a composer who asks for 40 % gets the closest NES timbre (50 %)
+     * rather than silence or a made-up fifth pattern.
+     *
+     * The rule is round-half-up over the three midpoints:
+     *
+     *   | `duty`                | index       |
+     *   |-----------------------|-------------|
+     *   | `[0, 0.1875)`         | 0 (12.5 %)  |
+     *   | `[0.1875, 0.375)`     | 1 (25 %)    |
+     *   | `[0.375, 0.625)`      | 2 (50 %)    |
+     *   | `[0.625, 1]`          | 3 (75 %)    |
+     *
+     * An exact TIE (0.1875, 0.375, 0.625) rounds UP to the higher duty, because
+     * the comparison is `<` against each midpoint. All three midpoints are
+     * exactly representable in float, so the documented behaviour is
+     * reproducible, not a rounding accident.
+     *
+     * The input is the note's clamped `dutyCycle` (float) and not
+     * `dutyCycleQ32`, because the Q32 mirror is `(uint32_t)(duty * 2^32)` and
+     * therefore overflows at exactly `duty == 1.0` (2^32 does not fit in
+     * `uint32_t`) — a pre-existing property of `set_pulse_duty` that the
+     * continuous generator has always carried. The selector is armed instead of
+     * that comparison here, so a 100 % note still means "the 75 % step" rather
+     * than "the wrapped mirror", and snapping from the float keeps the two from
+     * disagreeing.
+     *
+     * `Legacy` answers the 255 sentinel — "keep the continuous generator" — for
+     * every duty. Every other value answers the nearest step, i.e. the
+     * NES-derived reading, which is the same treatment the profile defaults
+     * above give an unknown profile; `setSoundProfile` rejects unknown values,
+     * so this is a fallback and never a guess.
+     *
+     * Called once per note-on, never per sample: no float, division or
+     * transcendental is on the render path.
+     *
+     * @param profile Profile in force.
+     * @param duty The note's duty in [0, 1] (`AudioChannel::dutyCycle`).
+     * @return 0..3 to render a NES step, 255 to keep the continuous comparison.
+     */
+    static inline uint8_t profileDefaultPulseDutyIndex(SoundProfile profile,
+                                                       float duty) {
+        if (profile == SoundProfile::Legacy) {
+            return 255u;
+        }
+        // Midpoints of 12.5/25, 25/50 and 50/75 %, exactly representable.
+        constexpr float kMidStep0Step1 = 0.1875f;
+        constexpr float kMidStep1Step2 = 0.375f;
+        constexpr float kMidStep2Step3 = 0.625f;
+        if (duty < kMidStep0Step1) return 0u;
+        if (duty < kMidStep1Step2) return 1u;
+        if (duty < kMidStep2Step3) return 2u;
+        return 3u;
+    }
+
+    /**
+     * @brief The mixer curve a sound profile selects (S4/D-3).
+     *
+     * Tier 1 of the D-3 precedence table owns the mix shape, so the profile is
+     * its only input and this is the single place that mapping lives: `Legacy`
+     * keeps the historical equal-weight sum, and the two NES-derived profiles
+     * share the published NES weighting. Any other value answers `Rational`,
+     * i.e. the frozen behaviour, rather than a guess.
+     *
+     * @param profile Profile in force.
+     * @return Curve the mix stage must apply.
+     */
+    static inline MixerCurve profileMixerCurve(SoundProfile profile) {
+        return (profile == SoundProfile::Legacy) ? MixerCurve::Rational
+                                                 : MixerCurve::NesWeighted;
+    }
+
+    // --- NES-weighted mixer (S4 / P2a) -------------------------------------
+    //
+    // Published linear approximation of the NES mixer (nesdev "APU Mixer"),
+    // per group:
+    //
+    //   pulses   : 0.00752 * (p1 + p2)
+    //   triangle : 0.00851 * tri
+    //   noise    : 0.00494 * noise
+    //   DMC      : 0.00335 * dmc          <- reserved, see kNesMixWeightDmc
+    //
+    // Those are ABSOLUTE DAC weights, and the renderer needs two things the
+    // published numbers do not give directly: the RATIO between the groups and
+    // one normalisation, with no division in the per-sample loop.
+    //
+    // Both are folded into the weight table. Every published weight is
+    // multiplied by 1 / 0.00752 = 132.979... and rounded to the nearest Q12
+    // integer, with the PULSE group pinned at Q12 unity:
+    //
+    //   pulse    : 1 / 0.00752       = 1.0000  -> 4096   (exact)
+    //   triangle : 0.00851 / 0.00752 = 1.1316  -> 4635  (-0.005 %)
+    //   noise    : 0.00494 / 0.00752 = 0.6569  -> 2691  (+0.010 %)
+    //   DMC      : 0.00335 / 0.00752 = 0.4456  -> 1825  (+0.016 %)
+    //
+    // Pinning the pulse group is the whole normalisation story: a full-scale
+    // pulse contributes exactly the amplitude `Legacy` gives it
+    // (MIXER_SCALE * level), so two full-scale pulses keep the historical
+    // 2 * 0.4 * 32767 = 26213.6 and switching profile rebalances the groups
+    // instead of changing the overall level. The `>> 12` in the per-block fold
+    // IS the 1/0.00752 factor applied to the pulse group, so the residual there
+    // is zero and every other group carries only its own rounding.
+    //
+    // WHERE the weight is applied is a cost question, not a mix question. It is
+    // a constant per voice for a whole block, so `renderIntegerCore` applies it
+    // ONCE per voice per block — inside the same Q15 gain the sample loop
+    // already multiplies by — instead of summing into per-group buckets and
+    // collapsing them once per sample. Distributing one constant over a sum is
+    // exact in the reals; only the truncation moves, and that is worth < 1 LSB
+    // per voice (see the fold in `renderIntegerCore`).
+
+    /** Q12 weight of one full-scale PULSE voice: the anchor, exactly 1.0. */
+    static constexpr int32_t kNesMixWeightPulse = 4096;
+    /** Q12 weight of one full-scale TRIANGLE voice. */
+    static constexpr int32_t kNesMixWeightTriangle = 4635;
+    /** Q12 weight of one full-scale NOISE voice. */
+    static constexpr int32_t kNesMixWeightNoise = 2691;
+    /**
+     * Q12 weight of a full-scale DMC voice.
+     *
+     * RESERVED: E1 has no DMC voice model — `WaveType` has no DMC member and
+     * nothing in this library synthesises one — so no group feeds this term
+     * yet. It stays next to the table so the published approximation is
+     * complete in one place; a future DMC voice only has to add its
+     * `NesMixGroup` and its weight here, and the fold already applies whatever
+     * this table answers.
+     */
+    [[maybe_unused]] static constexpr int32_t kNesMixWeightDmc = 1825;
+    /** Fixed-point divisor of the weight table: 2^12 = one full-scale pulse. */
+    static constexpr int kNesMixWeightShift = 12;
+
+    /** Weight groups of the NES mixer (S4). */
+    enum class NesMixGroup : uint8_t {
+        Pulse = 0,     ///< PULSE, plus SINE and SAW (see nesMixGroupOf).
+        Triangle = 1,
+        Noise = 2
+    };
+
+    /**
+     * @brief NES mixer group a voice feeds (S4).
+     *
+     * `SINE` and `SAW` have no NES counterpart, so which group they join is a
+     * modelling choice, and this is it: they join PULSE. All three are band-
+     * limited melodic voices, and PULSE is the only melodic group the published
+     * approximation has. Weighing them as triangle would boost every sine SFX
+     * by 13 %, and as noise would cut it by 34 %; neither is a property of the
+     * waveform, both would be accidents of the grouping. Any unknown type falls
+     * back to the same group, so a future waveform inherits the safest weight
+     * instead of a silent zero.
+     *
+     * @param type Voice waveform.
+     * @return Group the voice accumulates into.
+     */
+    static inline NesMixGroup nesMixGroupOf(WaveType type) {
+        switch (type) {
+            case WaveType::TRIANGLE: return NesMixGroup::Triangle;
+            case WaveType::NOISE:    return NesMixGroup::Noise;
+            default:                 return NesMixGroup::Pulse;
+        }
+    }
+
+    /**
+     * @brief Q12 weight the NES mixer applies to one accumulation group (S4).
+     *
+     * The table is consulted ONCE per voice per block, from the fold in
+     * `renderIntegerCore`; the per-sample loop only sees the resulting Q15 gain
+     * and never a weight. Any unknown group answers the PULSE weight, the same
+     * fallback `nesMixGroupOf` gives an unknown waveform, so a future group
+     * cannot silently render as a zero.
+     *
+     * @param group Group the voice belongs to.
+     * @return Q12 weight, where one full-scale PULSE voice is 2^12.
+     */
+    static inline int32_t nesMixWeightQ12(NesMixGroup group) {
+        switch (group) {
+            case NesMixGroup::Triangle: return kNesMixWeightTriangle;
+            case NesMixGroup::Noise:    return kNesMixWeightNoise;
+            default:                    return kNesMixWeightPulse;
+        }
+    }
+
+    /** Q15 envelope scale: 1.0. */
+    static constexpr int32_t kEnvelopeFullScaleQ15 = 32768;
+    /** Q15 clock phase that means "one shape step per sample". */
+    static constexpr uint32_t kCurveFullRateQ15 = 32768u;
+    /**
+     * Upper bound for one stage's shape-step count.
+     *
+     * The count is computed from a level in Q15, so the tight bound is ~1 500
+     * steps (a full-scale span to −60 dB takes 1 356); the constant only exists
+     * so a corrupt preset can never turn the note-on helper into an unbounded
+     * loop.
+     */
+    static constexpr uint16_t kMaxCurveSteps = 2048;
+
+    /**
+     * @brief Shape iterations the exponential curve needs to fall 60 dB.
+     *
+     * Runs the very recurrence the renderer runs
+     * (`level -= ((level - 1) >> 8) + 1`) until the level is 60 dB below
+     * `spanQ15`. A closed form is not available: the recurrence's `+1` term is
+     * a fixed-size step that dominates once the level is small, so the exact
+     * count (1 356 for a full-scale span) is far below the continuous estimate
+     * (1 766 for τ = 256 samples). Calibrating with the continuous estimate
+     * would make every −60 dB time 30 % short.
+     *
+     * Called once per note-on per stage, never per sample.
+     *
+     * @param spanQ15 Distance the stage has to travel, in Q15.
+     * @return Shape iterations to −60 dB of that span (at least 1).
+     */
+    static uint16_t curveStepsForSpanQ15(int32_t spanQ15) {
+        if (spanQ15 <= 1) {
+            return 1;
+        }
+        const int32_t target = spanQ15 / 1000;  // −60 dB
+        int32_t level = spanQ15;
+        uint16_t steps = 0;
+        while (level > target && steps < kMaxCurveSteps) {
+            level -= ((level - 1) >> 8) + 1;
+            ++steps;
+        }
+        return (steps == 0) ? 1 : steps;
+    }
+
+    /**
+     * @brief Clock rate that spreads the exponential's −60 dB span over a stage.
+     *
+     * The S-DSP recurrence is the SHAPE; this is its RATE. The shape's natural
+     * rate is one step per sample (τ = 256 samples = 5.8 ms at 44.1 kHz), which
+     * ignores `decayTime`/`releaseTime` and therefore cannot satisfy S2's
+     * "−60 dB in the theoretical time": a note would fall silent in ~30 ms and
+     * then jump back to its sustain level. Deriving the rate from the stage
+     * duration makes the configured time mean what it says — the time to fall
+     * 60 dB — and the stage ends ON its target instead of sailing past it.
+     *
+     * The clock never steps more than once per sample (rate ≤ 32768). A stage
+     * shorter than the shape's own span cannot hold the shape at that limit, so
+     * it returns 0 and the caller keeps the frozen linear ramp: stepping once
+     * per sample instead would leave the level far above its target and snap
+     * there at the stage boundary, which is exactly the audible discontinuity
+     * this calibration exists to remove (a 5 ms release would snap ~7 dB).
+     *
+     * @param spanQ15 Distance the stage has to travel, in Q15.
+     * @param stageSamples Duration of the stage in samples (0 = no stage).
+     * @return Shape steps per sample in Q15, or 0 to keep the linear ramp.
+     */
+    static uint16_t exponentialCurveRateQ15(int32_t spanQ15, uint32_t stageSamples) {
+        if (stageSamples == 0 || spanQ15 <= 0) {
+            return 0;  // no distance to travel, or no stage: nothing to clock
+        }
+        const uint16_t steps = curveStepsForSpanQ15(spanQ15);
+        if (stageSamples < (uint32_t)steps) {
+            return 0;  // shape does not fit: the linear ramp is the continuous one
+        }
+        // Rounded UP so that a stage of exactly `steps` samples performs the
+        // whole span instead of stopping one step short of the target.
+        const uint64_t rate =
+            (((uint64_t)steps << 15) + (uint64_t)stageSamples - 1u) / (uint64_t)stageSamples;
+        if (rate < 1u) {
+            return 1;  // slowest representable clock; a stall is impossible
+        }
+        if (rate > kCurveFullRateQ15) {
+            return (uint16_t)kCurveFullRateQ15;
+        }
+        return (uint16_t)rate;
+    }
+
     static inline uint32_t frequency_hz_to_phase_inc_q32(float hz, int sr) {
         if (sr <= 0) return 0u;
         if (hz < 0.0f) hz = 0.0f;
@@ -229,6 +562,61 @@ namespace pixelroot32::audio {
         if (period < 1u) period = 1u;
         return period;
     }
+
+    /**
+     * @brief Retune a NOISE voice from its period selector (S5 / Hito 3 M8).
+     *
+     * The single place that turns `nesNoiseLutIndex` into
+     * `noisePeriodSamples`, shared by the selector setter and by
+     * `applyProfileCharacter` so a profile default and an explicit write can
+     * never disagree about what an index means. 0..15 read the published NES
+     * table at the current rate; 255 (and any other sentinel) derives the
+     * period from the voice's own clock in Hz.
+     *
+     * No-op for every waveform other than NOISE, whose period the LFSR does
+     * not use. The countdown is clamped so a shorter period takes effect
+     * immediately instead of after the old, longer one elapses.
+     *
+     * @param v Voice to retune.
+     * @param sampleRate Output rate in Hz.
+     */
+    static inline void retuneNoisePeriodFromSelector(Voice& v, int sampleRate) {
+        if (v.type != WaveType::NOISE) return;
+        if (v.nesNoiseLutIndex < 16u) {
+            v.noisePeriodSamples =
+                nes_apu::nesNoisePeriodToSamples(v.nesNoiseLutIndex, sampleRate);
+        } else {
+            v.noisePeriodSamples = noise_clock_hz_to_period(v.frequency, sampleRate);
+        }
+        if (v.noiseCountdown > v.noisePeriodSamples) {
+            v.noiseCountdown = v.noisePeriodSamples;
+        }
+    }
+
+    /**
+     * @brief Level compensation of the unipolar NOISE gate, as a shift (S5/P9).
+     *
+     * A bipolar noise voice swings between -A and +A and carries AC RMS `A`. A
+     * unipolar one swings between 0 and A, so its mean is `A/2` — the DC the
+     * output blocker removes — and what is left is AC RMS `A/2`: the gate half
+     * the amplitude, i.e. -6.02 dB of energy.
+     *
+     * The compensation is therefore exactly x2 (`1 << 1`), applied once per
+     * voice per BLOCK: it is a constant of the whole block, so the renderer
+     * folds it into the same Q15 gain that already carries the voice's volume
+     * and its mix weight (see the fold in `renderIntegerCore`) instead of
+     * shifting each sample. Multiplying by 2 and shifting by 1 are the same
+     * operation here — `sv << 1` IS `sv * 2` — so the factor is unchanged; only
+     * its position in the multiply chain moved, and it is still never a repeat
+     * of the volume or envelope multiplies. It is not a taste knob: after it,
+     * the unipolar voice's AC RMS is `A` again, so the profile's MIXER weight
+     * (`kNesMixWeightNoise`, 0.00494/0.00752 of the pulse group) is the only
+     * thing that decides the noise group's level — which is what keeps S4's
+     * published ratio intact. Measured: 0.00 dB between the unipolar and the
+     * bipolar render of the same voice under the same weighting, and -3.65 dB
+     * from `Legacy`'s bipolar noise, that residual being exactly that weight.
+     */
+    static constexpr int kNoiseUnipolarCompensationShift = 1;
 
     static inline uint32_t time_sec_to_samples(float timeSec, int sr) {
         if (sr <= 0 || timeSec <= 0.0f) {
@@ -734,7 +1122,15 @@ namespace pixelroot32::audio {
         setVoiceNesEnvelopeEnabled(slot, opts.envelopeEnabled);
         setVoiceNesSweepUnitEnabled(slot, opts.sweepUnitEnabled);
         setVoicePulseDutyMode(slot, opts.pulseDutyIndex);
+        // S5: the selector setter also pins the selector against the profile's
+        // default, so the delegated call already records the tier-2 override.
         setVoiceNesNoiseLutMode(slot, opts.noiseLutIndex);
+        // S5: `noiseUnipolar` has no standalone setter on purpose (it is
+        // profile character with a per-voice override), so this write is the
+        // per-voice owner: resolve the value AND pin it, otherwise the profile
+        // would re-arm its own default on the very next note (D-3 tier 2).
+        voices[slot].noiseUnipolar = opts.noiseUnipolar;
+        voices[slot].noiseUnipolarOverridden = true;
     }
 
     VoiceNesOptions ApuCore::getVoiceNesOptions(int slot) const {
@@ -749,6 +1145,7 @@ namespace pixelroot32::audio {
         opts.sweepUnitEnabled = v.nesSweepUnit.unitEnabled;
         opts.pulseDutyIndex = v.pulseDutyIndex;
         opts.noiseLutIndex = v.nesNoiseLutIndex;
+        opts.noiseUnipolar = v.noiseUnipolar;
         return opts;
     }
 
@@ -1032,6 +1429,23 @@ namespace pixelroot32::audio {
 
     uint32_t ApuCore::getProfileApplyCountForTesting() const {
         return profileApplyCount_;
+    }
+
+    EnvelopeCurve ApuCore::getVoiceEnvelopeCurveForTesting(int slot) const {
+        if (slot < 0 || slot >= MAX_VOICES) {
+            return EnvelopeCurve::ProfileDefault;
+        }
+        return voices[slot].envelopeCurve;
+    }
+
+    int32_t ApuCore::getVoiceEnvelopeLevelQ15ForTesting(int slot) const {
+        if (slot < 0 || slot >= MAX_VOICES) {
+            return 0;
+        }
+        // The integer core is the only body that ticks this mirror, and every
+        // profile except `Legacy` runs it; on `Legacy` an FPU build leaves it
+        // at its note-on value. That is the same contract as `phaseQ32`.
+        return voices[slot].envelope.currentLevelQ15;
     }
 #endif  // UNIT_TEST — the test-only accessors end here.
 
@@ -1757,6 +2171,14 @@ namespace pixelroot32::audio {
         return voices[slot].nesNoiseLutIndex;
     }
 
+    // S5/E1: resolved unipolar gate of a voice slot.
+    bool ApuCore::isVoiceNoiseUnipolarForTesting(int slot) const {
+        if (slot < 0 || slot >= MAX_VOICES) {
+            return false;
+        }
+        return voices[slot].noiseUnipolar;
+    }
+
     // Hito 4 M10: master HPF test-only accessors.
     float ApuCore::getHpfRForTesting() const { return hpfR_; }
     int32_t ApuCore::getHpfRQ15ForTesting() const { return hpfRQ15_; }
@@ -1765,6 +2187,12 @@ namespace pixelroot32::audio {
 
     // Hito 4 M11.
     SoftClipMode ApuCore::getSoftClipModeForTesting() const { return softClipMode_; }
+
+    // E1/S4: the mixer curve follows the profile, so this accessor is the
+    // observable half of D-3 tier 1 (there is no setter to test against).
+    MixerCurve ApuCore::getMixerCurveForTesting() const {
+        return profileMixerCurve(profile_);
+    }
 #endif
 
     void ApuCore::clearMusicTrackVoiceState() {
@@ -2292,6 +2720,10 @@ namespace pixelroot32::audio {
         if (ch.envelope.releaseSamples > 0) {
             ch.envelope.stage = EnvelopeState::Stage::RELEASE;
             ch.envelope.sampleCounter = 0;
+            // S2: the exponential clock is shared by both stages, so rewind it
+            // when the release starts; otherwise the decay's leftover phase
+            // would pull the first release step up to one step interval early.
+            ch.envelopeCurvePhaseQ15 = 0;
             ch.remainingSamples = ch.envelope.releaseSamples;
         } else {
             ch.enabled = false;
@@ -2381,6 +2813,14 @@ namespace pixelroot32::audio {
         env.attackDeltaQ15 = (env.attackSamples > 0) ? (32768 / (int32_t)env.attackSamples) : 32768;
         env.decayDeltaQ15 = (env.decaySamples > 0) ? ((32768 - env.sustainLevelQ15) / (int32_t)env.decaySamples) : 0;
         env.releaseDeltaQ15 = (env.releaseSamples > 0) ? (env.sustainLevelQ15 / (int32_t)env.releaseSamples) : 0;
+
+        // S2 / D-3 tier 3: the note's own request, unresolved. `ProfileDefault`
+        // means "the profile decides" and is resolved by `applyProfileCharacter`,
+        // which runs after the `nesAccurate` block below; storing the request
+        // (not a resolved value) is what keeps the profile a default instead of
+        // an override.
+        ch->envelopeCurve = event.preset ? event.preset->envelopeCurve
+                                         : EnvelopeCurve::ProfileDefault;
 
         // LFO initialization
         ch->lfo.enabled = false;
@@ -2602,11 +3042,104 @@ namespace pixelroot32::audio {
     // note's own ADSR/LFO/sweep/pitch-envelope values keep winning inside their
     // own domain.
     //
-    // E0 (this phase): `Nes` and `Hybrid` are exact aliases of what the note
-    // path already left, so there is nothing to write — any value assigned here
-    // would have to be the value already in place. E1 changes ONLY this body.
+    // The mix weighting is character too, but it is not voice state: the mix
+    // stage resolves `MixerCurve` from `profile_` once per block (S4), so it
+    // has no per-voice field to write here and cannot be half-applied.
+    //
+    // E0 left this body empty because `Nes` and `Hybrid` were exact aliases.
+    // E1 gives it its real assignments: the envelope curve (S2), the noise
+    // character (S5) and the stepped PULSE duty (S6).
     void ApuCore::applyProfileCharacter(int slot) {
-        (void)slot;
+        Voice& ch = voices[slot];
+
+        // S2 / D-3: the profile supplies the DEFAULT curve only. A note that
+        // named one keeps it — the note owns the field inside its own domain
+        // and the profile is the fallback. This is also why `nesAccurate`
+        // cannot erase the character: `initNesSafe` ran above and does not
+        // touch this field, so resolving it here still wins.
+        if (ch.envelopeCurve == EnvelopeCurve::ProfileDefault) {
+            ch.envelopeCurve = profileDefaultEnvelopeCurve(profile_);
+        }
+
+        // S2: derive the exponential clock from the stage durations. This is the
+        // first point where the curve is resolved, and it runs once per note-on,
+        // never per sample. `Legacy` answers `Linear` and leaves the clock at 0,
+        // so its render arithmetic is untouched.
+        if (ch.envelopeCurve == EnvelopeCurve::Exponential) {
+            // DECAY: the attack always lands on full scale, so the distance to
+            // travel is the excursion above the sustain level.
+            const int32_t decaySpan =
+                (ch.envelope.sustainLevelQ15 < kEnvelopeFullScaleQ15)
+                    ? (kEnvelopeFullScaleQ15 - ch.envelope.sustainLevelQ15)
+                    : 0;
+            ch.decayCurveRateQ15 = exponentialCurveRateQ15(
+                decaySpan, ch.envelope.decaySamples);
+            // RELEASE: the stage targets silence. It normally starts at the
+            // sustain level, but a note shorter than its own decay releases from
+            // wherever the decay had reached — and a sustain of 0 would then
+            // describe a span of 0, i.e. a release that cannot move and snaps.
+            // Full scale is the conservative span for that case: it can only
+            // make the release end at or before its duration, never after.
+            const int32_t releaseSpan = (ch.envelope.sustainLevelQ15 > 0)
+                ? ch.envelope.sustainLevelQ15
+                : kEnvelopeFullScaleQ15;
+            ch.releaseCurveRateQ15 = exponentialCurveRateQ15(
+                releaseSpan, ch.envelope.releaseSamples);
+        } else {
+            ch.decayCurveRateQ15 = 0;
+            ch.releaseCurveRateQ15 = 0;
+        }
+        ch.envelopeCurvePhaseQ15 = 0;
+
+        // S5 / D-3 tiers 1-2: the profile arms the unipolar NOISE gate and the
+        // NES period LUT. Both are resolved here — once per note-on, after the
+        // note and after `initNesSafe` — because the profile owns the DEFAULT
+        // only: a slot whose caller pinned either value keeps it across notes
+        // instead of being re-armed. `Legacy` answers "off, derive the period
+        // from the note", which is exactly what the note path already left
+        // behind, so its render arithmetic is untouched.
+        //
+        // Arming the LUT is a tier-2 owner of the NOISE period, so a note that
+        // asked for an explicit `noisePeriod` (or a frequency-derived clock)
+        // loses to it — the M8 precedence documented on `nesNoiseLutIndex`.
+        // `setVoiceNesNoiseLutMode(slot, 255)` is the documented way out.
+        if (!ch.noiseUnipolarOverridden) {
+            ch.noiseUnipolar = profileDefaultNoiseUnipolar(profile_);
+        }
+        if (!ch.nesNoiseLutOverridden) {
+            const uint8_t lutIndex = profileDefaultNoiseLutIndex(profile_);
+            if (ch.nesNoiseLutIndex != lutIndex) {
+                ch.nesNoiseLutIndex = lutIndex;
+                // The note computed its own period before this point, so the
+                // selector has to be applied now: otherwise the first note
+                // after a profile change would render the previous period.
+                retuneNoisePeriodFromSelector(ch, sampleRate);
+            }
+        }
+
+        // S6 / D-3 tiers 1-3: PULSE duty. `Nes`/`Hybrid` arm the NES step
+        // nearest the note's own `duty`; `Legacy` keeps the continuous
+        // comparison. The writer is PULSE-only by construction — the index is
+        // read by the pulse generator alone, but resolving it for the other
+        // waveforms would still be wrong twice over: it would hand a NOISE or
+        // TRIANGLE voice a mode it can only inherit into a later PULSE note on
+        // the same slot, and it would make "the profile never touches the other
+        // waveforms" untrue to read.
+        if (ch.type == WaveType::PULSE && !ch.pulseDutyOverridden) {
+            // Tier 3, inside the duty domain: a note that ANIMATES its duty
+            // (a `dutySteps` table or a `dutySweep`) cannot be expressed by one
+            // static NES pattern — the renderer ignores `dutyCycleQ32` while an
+            // index is armed — so those notes keep the continuous generator.
+            // That is the note winning in its own domain (D-3), not an
+            // exception to it.
+            const bool animatedDuty = (ch.dutyStepCount > 0) ||
+                                      (ch.dutySweep != 0.0f) ||
+                                      (ch.dutySweepQ32 != 0);
+            ch.pulseDutyIndex = animatedDuty
+                ? 255u
+                : profileDefaultPulseDutyIndex(profile_, ch.dutyCycle);
+        }
+
 #if defined(UNIT_TEST)
         // Structural proof of the ordering above: a test observes exactly one
         // application per note-on, and only after the nesAccurate block ran.
@@ -2740,13 +3273,83 @@ namespace pixelroot32::audio {
         }
     }
 
+    /**
+     * @brief One step of the S-DSP-style exponential envelope decrement (S2/P1).
+     *
+     * `level -= ((level - 1) >> 8) + 1`, the shape the audit's P1 specifies,
+     * applied to the distance between the current level and the stage's end
+     * target. Acting on the excursion rather than on the raw level is what lets
+     * a decay finish AT its sustain level (a release, whose target is 0, is
+     * therefore bit-for-bit the plain recurrence): the stage boundary is then a
+     * −60 dB step instead of the jump back to sustain.
+     *
+     * Above the last 8 bits the recurrence is a first-order decay with a time
+     * constant of 256 samples; the `+1` term is what keeps it moving below that,
+     * where a plain `level -= level >> 8` would park at 1 forever.
+     *
+     * The expression needs no explicit clamp: at offset 0 it evaluates to
+     * `0 - ((-1 >> 8) + 1) == 0`, so the offset cannot go negative — the
+     * "floored at 0" clause of the spec is intrinsic.
+     *
+     * @param levelQ15 Level in Q15; decremented in place.
+     * @param floorQ15 Value the stage ends on (sustain for DECAY, 0 for RELEASE).
+     */
+    static inline void applyExponentialEnvelopeStepQ15(int32_t& levelQ15, int32_t floorQ15) {
+        int32_t offset = levelQ15 - floorQ15;
+        if (offset <= 0) {
+            levelQ15 = floorQ15;
+            return;
+        }
+        offset -= ((offset - 1) >> 8) + 1;
+        if (offset < 0) {
+            offset = 0;
+        }
+        levelQ15 = floorQ15 + offset;
+    }
+
+    /**
+     * @brief Runs the exponential clock for one sample and applies a step when due.
+     *
+     * The clock is a Q15 phase accumulator: it advances by `rateQ15` per sample
+     * and performs one shape step each time it crosses 1.0, so the shape keeps
+     * its exact arithmetic while its RATE follows the stage duration. Chosen
+     * over a stride counter because the fractional part makes the rate exact for
+     * any duration (a stride of `stageSamples / steps` would quantise long
+     * stages by up to one full step) and because `phase + rate < 2 * 32768`
+     * cannot overflow a `uint16_t` while the rate is capped at one step per
+     * sample.
+     *
+     * @param ch Voice whose clock and level are advanced.
+     * @param floorQ15 Value the stage ends on.
+     * @param rateQ15 Shape steps per sample in Q15 (1..32768).
+     */
+    static inline void tickExponentialEnvelopeQ15(AudioChannel& ch, int32_t floorQ15,
+                                                  uint16_t rateQ15) {
+        const uint32_t phase = (uint32_t)ch.envelopeCurvePhaseQ15 + (uint32_t)rateQ15;
+        if (phase < kCurveFullRateQ15) {
+            ch.envelopeCurvePhaseQ15 = (uint16_t)phase;
+            return;
+        }
+        ch.envelopeCurvePhaseQ15 = (uint16_t)(phase - kCurveFullRateQ15);
+        applyExponentialEnvelopeStepQ15(ch.envelope.currentLevelQ15, floorQ15);
+    }
+
     // ------------------------------------------------------------------
     // ADSR Envelope state machine (fixed-point Q15, portable integer core)
     // ------------------------------------------------------------------
     // Compiled unconditionally: the integer core exists in every build (S2),
     // so this tick must never be hidden behind an FPU guard again.
+    //
+    // S2: the curve applies to DECAY and RELEASE only. ATTACK stays linear on
+    // purpose — a linear ramp is predictable and curving it buys nothing — and
+    // `Linear` keeps the frozen `Legacy` arithmetic untouched, branch included.
+    //
+    // The exponential branches on the stage's clock rate: a rate of 0 means the
+    // stage is shorter than the shape's span and deliberately falls back to the
+    // same linear delta (see `exponentialCurveRateQ15`).
     static inline void tickEnvelopeQ15(AudioChannel& ch) {
         auto& env = ch.envelope;
+        const bool exponential = (ch.envelopeCurve == EnvelopeCurve::Exponential);
         switch (env.stage) {
             case EnvelopeState::Stage::ATTACK:
                 env.sampleCounter++;
@@ -2764,7 +3367,12 @@ namespace pixelroot32::audio {
                 break;
             case EnvelopeState::Stage::DECAY:
                 env.sampleCounter++;
-                env.currentLevelQ15 -= env.decayDeltaQ15;
+                if (exponential && ch.decayCurveRateQ15 != 0) {
+                    tickExponentialEnvelopeQ15(ch, env.sustainLevelQ15,
+                                               ch.decayCurveRateQ15);
+                } else {
+                    env.currentLevelQ15 -= env.decayDeltaQ15;
+                }
                 if (env.sampleCounter >= env.decaySamples) {
                     env.currentLevelQ15 = env.sustainLevelQ15;
                     env.sampleCounter = 0;
@@ -2775,7 +3383,11 @@ namespace pixelroot32::audio {
                 break;
             case EnvelopeState::Stage::RELEASE:
                 env.sampleCounter++;
-                env.currentLevelQ15 -= env.releaseDeltaQ15;
+                if (exponential && ch.releaseCurveRateQ15 != 0) {
+                    tickExponentialEnvelopeQ15(ch, 0, ch.releaseCurveRateQ15);
+                } else {
+                    env.currentLevelQ15 -= env.releaseDeltaQ15;
+                }
                 if (env.sampleCounter >= env.releaseSamples || env.currentLevelQ15 <= 0) {
                     env.currentLevelQ15 = 0;
                     env.stage = EnvelopeState::Stage::OFF;
@@ -3147,12 +3759,7 @@ namespace pixelroot32::audio {
     // block (not per sample) so volume ramps still work but the 22kHz
     // inner loop stays integer-only.
     void ApuCore::renderIntegerCore(int16_t* stream, int length) {
-        int32_t volQ15[MAX_VOICES];
         // envQ15 is now tracked continuously per-channel via tickEnvelopeQ15
-        for (int c = 0; c < MAX_VOICES; ++c) {
-            volQ15[c] = (int32_t)(voices[c].volume * 32768.0f);
-        }
-
         // Hito 2 M3: APU cycles per render sample (same as FPU path).
         const double apuCyclesPerSample =
             (sampleRate > 0) ? (nes_apu::kNesApuHzNtsc / (double)sampleRate) : 0.0;
@@ -3184,14 +3791,92 @@ namespace pixelroot32::audio {
             return tri_q15;
         };
         auto generateNoiseSampleQ15 = [](AudioChannel& ch) -> int32_t {
+            if (ch.noiseUnipolar) {
+                // S5/P9: the NES noise channel switches between silence and the
+                // envelope level, never to -level. Only the SOURCE changes: the
+                // level itself is still the volume x envelope multiply that runs
+                // below for every voice, and the AC-level compensation is the
+                // x2 folded into this voice's per-block gain (`mixGainQ15`).
+                return (ch.lfsrState & 1u) ? 32767 : 0;
+            }
             return (ch.lfsrState & 1u) ? 32767 : -32767;
         };
 
         // Process channels by type - hoisted from inner loop
         // This eliminates the switch(ch.type) branch misprediction
+        //
+        // S4: the mixer curve is a property of the mix, so it is resolved from
+        // the profile ONCE per block and never inside the sample loop. The
+        // group a voice feeds depends only on its waveform, and `type` can only
+        // change in `initVoiceFromEvent` — which runs from `processCommands`
+        // and `updateMusicSequencer`, both before this loop — so the group is
+        // resolved per block too.
+        const bool nesWeighted =
+            (profileMixerCurve(profile_) == MixerCurve::NesWeighted);
+
+        // S4/S5: everything the mix does to a voice that is CONSTANT for the
+        // whole block is folded into one Q15 gain here, once per voice, instead
+        // of being applied once per voice per sample:
+        //
+        //   - the NES group weight (`>> kNesMixWeightShift`), which used to be
+        //     applied to the summed groups after the voice loop; and
+        //   - the unipolar x2 compensation, which used to be a `sv << 1` on
+        //     every sample of a gated NOISE voice.
+        //
+        // The mix is the same because both factors are scalars distributed over
+        // a sum: sum_c (w * v_c) == w * sum_c v_c. Only the truncation moves —
+        // from after the sum to before each voice's multiply — so the weighted
+        // sum can differ by < 1 LSB per voice from what the old path produced.
+        // That is below the resolution of the mix, but not always below the
+        // resolution of the OUTPUT: the `Rational` curve indexes its LUT in
+        // 256-LSB steps of `sum`, so a sample sitting on a step boundary can
+        // move by that LUT's own step (~100 LSB down where its slope is
+        // steepest) instead of by 1. Measured against the previous tree:
+        // `Legacy` byte-identical, and `Nes`/`Hybrid` peak and RMS within
+        // 0.002 % with a worst single-sample delta of 101 LSB on the two scenes
+        // that mix a TRIANGLE voice (the pulse weight is Q12 unity, so the
+        // committed goldens, a pulse-only track, are byte-identical).
+        //
+        // No new overflow: `volume` is documented 0..1 and the fold keeps every
+        // intermediate inside int32 over that range — the worst case is a gated
+        // NOISE voice at full volume, 32767 * (2691 / 4096) * 2 = 43046, i.e.
+        // 1.41e9 of the 2.1e9 an int32 holds.
+        //
+        // What it buys is the whole group-bucket machinery: three zeroed
+        // accumulators per SAMPLE, a bucket index per voice and three int64
+        // multiplies per sample become one multiply per voice that the loop was
+        // already doing. Those zeroed buckets were paid by every profile,
+        // `Legacy` included, even though its weights are the identity.
+        //
+        // `volQ15` stays the plain Q15 volume: the sync-back at the end of the
+        // block writes it into `voices[c].volume`, so the volume ramp and the
+        // FPU fallback keep seeing a plain volume. `mixGainQ15` is the folded
+        // one and never leaves this function.
+        int32_t volQ15[MAX_VOICES];
+        int32_t mixGainQ15[MAX_VOICES];
+        for (int c = 0; c < MAX_VOICES; ++c) {
+            volQ15[c] = (int32_t)(voices[c].volume * 32768.0f);
+            int32_t gain = volQ15[c];
+            if (nesWeighted) {
+                gain = (gain * nesMixWeightQ12(nesMixGroupOf(voices[c].type)))
+                     >> kNesMixWeightShift;
+            }
+            if (voices[c].noiseUnipolar && voices[c].type == WaveType::NOISE) {
+                gain <<= kNoiseUnipolarCompensationShift;
+            }
+            mixGainQ15[c] = gain;
+        }
+
         for (int i = 0; i < length; ++i) {
             // Hito 2 M3: tick the NES frame counter before voice mixing.
             tickNesFrameCounter(apuCyclesPerSample);
+            // `Rational` keeps the historical accumulator untouched: one raw
+            // sum, with `MIXER_SCALE` applied once by the output stage.
+            // `NesWeighted` now accumulates into the SAME sum: the published
+            // weights are already inside each voice's `mixGainQ15`, so "weighted
+            // by group" no longer needs a bucket per group nor a second pass —
+            // and `sum` has one meaning for both curves, which is what the
+            // output stage downstream expects.
             int32_t sum = 0;
 
             for (int c = 0; c < MAX_VOICES; ++c) {
@@ -3249,7 +3934,10 @@ namespace pixelroot32::audio {
                     s = 0;
                 }
 
-                // Apply per-channel Q15 volume × envelope: (s * volQ15 * envQ15) >> 30
+                // Apply per-channel Q15 gain × envelope: (s * gainQ15 * envQ15) >> 30
+                // The gain already carries the voice's Q15 volume plus the two
+                // block-constant mix factors (NES group weight, unipolar x2), so
+                // this is the only per-sample scale left.
                 // Hito 2 M7: when the NES envelope is enabled (PULSE / NOISE),
                 // use the envelope's `output` (0..15) scaled to Q15 as the
                 // multiplier. 32768/15 = 2184, so output=15 → 32760 (≈1.0).
@@ -3260,7 +3948,7 @@ namespace pixelroot32::audio {
                 } else {
                     envQ15 = ch.envelope.currentLevelQ15;
                 }
-                int32_t sv = (s * volQ15[c]) >> 15;
+                int32_t sv = (s * mixGainQ15[c]) >> 15;
                 sv = (sv * envQ15) >> 15;
 
                 // Volume LFO (tremolo) — Q15 only, no float conversion.
@@ -3365,6 +4053,9 @@ namespace pixelroot32::audio {
                             && ch.envelope.releaseSamples > 0) {
                             ch.envelope.stage = EnvelopeState::Stage::RELEASE;
                             ch.envelope.sampleCounter = 0;
+                            // S2: rewind the shared exponential clock at the
+                            // stage change (see beginReleaseOnMusicTrack).
+                            ch.envelopeCurvePhaseQ15 = 0;
                             ch.remainingSamples = ch.envelope.releaseSamples;
                         } else {
                             ch.enabled = false;
@@ -3372,6 +4063,14 @@ namespace pixelroot32::audio {
                     }
                 }
             }
+
+            // S4: the voice loop has already accumulated the WEIGHTED mix, so
+            // `sum` reaches the output chain in exactly the same domain and at
+            // exactly the same point as the `Rational` curve: before master
+            // volume, before the shaping curve, before the DC blocker. That is
+            // the "weighted before the HPF" contract — the filter and the
+            // compressor see the weighted signal, not a weighted version of
+            // their own output — and it is why no collapse pass is needed here.
 
             // Apply master volume before the compressor curve so the nonlinear
             // stage sees the attenuated mix — same order as the FPU path
@@ -3494,6 +4193,10 @@ namespace pixelroot32::audio {
         } else {
             voices[slot].pulseDutyIndex = 255;
         }
+        // S6 / D-3 tier 2: an explicit mode pins the slot against the sound
+        // profile's default, so `255` here means "this voice keeps the
+        // continuous generator" for good, not only until the next note-on.
+        voices[slot].pulseDutyOverridden = true;
     }
 
     // Hito 3 M8: NES NOISE period LUT.
@@ -3503,19 +4206,14 @@ namespace pixelroot32::audio {
         // 0..15 -> LUT entry. 16..254 are invalid and fall back to the
         // documented 255 "derive from frequency" sentinel.
         v.nesNoiseLutIndex = (lutIndex < 16u) ? lutIndex : 255u;
+        // S5 / D-3 tier 2: an explicit selector pins the slot against the sound
+        // profile's default, so `255` here means "this voice derives its period
+        // from the note" for good, not only until the next note-on.
+        v.nesNoiseLutOverridden = true;
 
         // Retune now so the change is audible without waiting for a new
         // note, matching how setVoiceNesTimer re-syncs the pulse period.
-        if (v.type != WaveType::NOISE) return;
-        if (v.nesNoiseLutIndex < 16u) {
-            v.noisePeriodSamples =
-                nes_apu::nesNoisePeriodToSamples(v.nesNoiseLutIndex, sampleRate);
-        } else {
-            v.noisePeriodSamples = noise_clock_hz_to_period(v.frequency, sampleRate);
-        }
-        if (v.noiseCountdown > v.noisePeriodSamples) {
-            v.noiseCountdown = v.noisePeriodSamples;
-        }
+        retuneNoisePeriodFromSelector(v, sampleRate);
     }
 
 #if defined(UNIT_TEST)

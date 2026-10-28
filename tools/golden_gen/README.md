@@ -62,7 +62,13 @@ A direct render compares nothing.
 ## Relation to `test_apu_integer_golden`
 
 The fixture this harness writes is the one consumed by
-`test/test_apu_integer_golden.cpp`, compiled twice: with an FPU it selects the
-`Nes` profile (that build's `Legacy` is float) and without an FPU it selects
-`Legacy`. In E0 both are exact aliases of the same body (S3), so the two targets
-assert the same file.
+`test/test_apu_integer_golden.cpp`, compiled twice: with
+`PR32_APU_ENABLE_LEGACY_FLOAT=0` and without an FPU. Both targets select `Legacy`
+and reach the integer core, because in the first build the float body is compiled
+out and in the second it does not exist. That is what makes the two targets assert
+the same file without either of them depending on a profile name.
+
+E1 also added `test_apu_profile_golden`, which pins one fixture per audible profile
+(`apu_nes_...pcm`, `apu_hybrid_...pcm`). Those are generated with the same tool and
+regenerated only when a phase changes that profile's definition, never to make a red
+test green.
