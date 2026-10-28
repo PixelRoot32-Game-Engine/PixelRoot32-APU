@@ -415,7 +415,18 @@ void setup()
 
 void loop()
 {
-    // The measurement runs once, from setup(). Idle so the board does not
-    // watchdog-reset while the capture is being read.
-    delay(1000);
+    // The measurement runs once, from setup(). Then a heartbeat, so a capture
+    // that starts late still proves the board is alive and which firmware is
+    // running: boards reached through USB CDC lose everything printed before the
+    // host enumerates the port.
+    static uint32_t lastBeatMs = 0;
+    static uint32_t beat = 0;
+    if (millis() - lastBeatMs >= 5000u) {
+        lastBeatMs = millis();
+        Serial.printf("# heartbeat %u up=%us fpu=%d block=%d\n", ++beat,
+                      static_cast<unsigned>(millis() / 1000u),
+                      PR32_APU_HAS_FPU, kBlockSamples);
+        Serial.flush();
+    }
+    delay(100);
 }
