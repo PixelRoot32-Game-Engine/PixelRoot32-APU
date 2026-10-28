@@ -752,21 +752,64 @@ namespace pixelroot32::audio {
         return opts;
     }
 
-    // S4: sound profile selector.
+    // S4/S6: sound profile selector.
     void ApuCore::setSoundProfile(SoundProfile profile) {
         // Reject unknown values instead of clamping: a clamped value would
         // silently pick a neighbouring profile, and the caller's intent is
-        // exactly what must not be guessed. T4 adds the core switch and the
-        // envelope-mirror / output-stage synchronisation here.
+        // exactly what must not be guessed.
         switch (profile) {
             case SoundProfile::Legacy:
             case SoundProfile::Nes:
             case SoundProfile::Hybrid:
-                profile_ = profile;
                 break;
             default:
-                break;  // unknown value: leave the current profile alone
+                return;  // unknown value: leave the current profile alone
         }
+        if (profile == profile_) {
+            // Selecting the profile already in force is a no-op. Treating it
+            // as a switch would reset the output stage for nothing.
+            return;
+        }
+
+        // (1) Destination core from the ARGUMENT, never from `profile_`: the
+        // two are different values at this point by construction, and reading
+        // the old one would sync the mirrors in the wrong direction.
+        const bool destinationInteger =
+            (profile != SoundProfile::Legacy) || (PR32_APU_ENABLE_LEGACY_FLOAT == 0);
+        const bool coreChanges = (destinationInteger != profileUsesIntegerCore());
+
+        // (2) Sync the envelope mirror so the block after the switch resumes at
+        // the level the block before it left.
+        //
+        // Only when the core actually changes: the mirror each core does NOT
+        // run stays at its note-on value (the integer core ticks `currentLevelQ15`
+        // only, the float core ticks `currentLevel` only), so copying from the
+        // idle mirror would jump the level — exactly the click this step exists
+        // to prevent. With the core unchanged, the active mirror is already
+        // authoritative and must be left alone.
+        if (coreChanges) {
+            for (int i = 0; i < MAX_VOICES; ++i) {
+                Voice& voice = voices[i];
+                if (destinationInteger) {
+                    voice.envelope.currentLevelQ15 =
+                        (int32_t)(voice.envelope.currentLevel * 32768.0f);
+                } else {
+                    voice.envelope.currentLevel =
+                        (float)voice.envelope.currentLevelQ15 / 32768.0f;
+                }
+            }
+        }
+
+        // (3) Reset the output stage: the HPF recursion of one core holds no
+        // meaning for the other, so both pairs start clean.
+        hpfPrevIn = hpfPrevOut = 0.0f;
+        hpfPrevInQ15 = hpfPrevOutQ15 = 0;
+
+        // (4) Commit. Voices keep playing: no reset(), no `enabled = false`.
+        // Character is NOT re-applied to sounding voices — only notes started
+        // after this point run `applyProfileCharacter` with the new profile
+        // (S5/S6).
+        profile_ = profile;
     }
 
     SoundProfile ApuCore::getSoundProfile() const { return profile_; }
@@ -935,15 +978,17 @@ namespace pixelroot32::audio {
         if (slot < 0 || slot >= MAX_VOICES) {
             return 0.0f;
         }
-#if PR32_APU_HAS_FPU
-        return voices[slot].frequency;
-#else
+        if (!profileUsesIntegerCore()) {
+            return voices[slot].frequency;
+        }
         // The integer core runs the oscillator from `basePhaseIncQ32`; the
         // float `frequency` field is only refreshed by the helpers shared
         // with the float build (note-on, pitch-envelope segments), so a
         // single-segment sweep would leave it at the note-on value and this
         // accessor would report a pitch the core is not playing. Deriving Hz
         // from the increment the core actually uses keeps the readout honest.
+        // The branch is on the profile, not on `PR32_APU_HAS_FPU`: on an FPU
+        // target `Nes`/`Hybrid` render the integer core too (S3, L8.3).
         // NOISE has no phase increment (its pitch is the LFSR period, which
         // `getVoiceNoisePeriodForTesting` reports), so it keeps the float.
         if (voices[slot].type == WaveType::NOISE || sampleRate <= 0) {
@@ -951,21 +996,19 @@ namespace pixelroot32::audio {
         }
         return (float)((double)voices[slot].basePhaseIncQ32
                        * (double)sampleRate / 4294967296.0);
-#endif
     }
 
     float ApuCore::getVoiceDutyCycleForTesting(int slot) const {
         if (slot < 0 || slot >= MAX_VOICES) {
             return 0.0f;
         }
-#if PR32_APU_HAS_FPU
-        return voices[slot].dutyCycle;
-#else
+        if (!profileUsesIntegerCore()) {
+            return voices[slot].dutyCycle;
+        }
         // Same reasoning as getVoiceFrequencyForTesting: the continuous duty
         // sweep advances `dutyCycleQ32` only, so the Q32 mirror is the duty
         // the integer core actually compares against the phase.
         return (float)((double)voices[slot].dutyCycleQ32 / 4294967296.0);
-#endif
     }
 
     float ApuCore::getVoiceDutySweepPerSampleForTesting(int slot) const {
@@ -979,13 +1022,16 @@ namespace pixelroot32::audio {
         if (slot < 0 || slot >= MAX_VOICES) {
             return 0.0f;
         }
-#if PR32_APU_HAS_FPU
-        return voices[slot].phase;
-#else
+        if (!profileUsesIntegerCore()) {
+            return voices[slot].phase;
+        }
         // The integer core never touches the float phase accumulator, so the
         // Q32 mirror is the only place the rendered phase exists.
         return (float)((double)voices[slot].phaseQ32 / 4294967296.0);
-#endif
+    }
+
+    uint32_t ApuCore::getProfileApplyCountForTesting() const {
+        return profileApplyCount_;
     }
 #endif  // UNIT_TEST — the test-only accessors end here.
 
@@ -2540,6 +2586,32 @@ namespace pixelroot32::audio {
         if (event.preset && event.preset->nesAccurate) {
             initNesSafe(*ch, event.type);
         }
+
+        // S5: the profile writes character last of all, after `initNesSafe`,
+        // so `nesAccurate` keeps meaning "start from a canonical clean state"
+        // without erasing the profile's choice. This is the only call site —
+        // one application per note-on.
+        applyProfileCharacter(static_cast<int>(ch - voices));
+    }
+
+    // S5: the ONLY place a profile writes voice character.
+    //
+    // Character is the envelope curve, the mix weighting, the output filters,
+    // the default duty, the noise LUT, unipolar output and pan/echo enablement;
+    // it belongs to the profile and wins over the per-voice opt-ins while the
+    // note's own ADSR/LFO/sweep/pitch-envelope values keep winning inside their
+    // own domain.
+    //
+    // E0 (this phase): `Nes` and `Hybrid` are exact aliases of what the note
+    // path already left, so there is nothing to write — any value assigned here
+    // would have to be the value already in place. E1 changes ONLY this body.
+    void ApuCore::applyProfileCharacter(int slot) {
+        (void)slot;
+#if defined(UNIT_TEST)
+        // Structural proof of the ordering above: a test observes exactly one
+        // application per note-on, and only after the nesAccurate block ran.
+        ++profileApplyCount_;
+#endif
     }
 
     void ApuCore::playSequencerPercussionHit(const AudioEvent& event) {
@@ -2936,11 +3008,57 @@ namespace pixelroot32::audio {
         if (!commandQueue.isEmpty()) processCommands();
         updateMusicSequencer();
 
+        // S3: one core per block, chosen once from the profile. The branch is
+        // deliberately outside the sample loop — a per-sample test would cost
+        // more than the body it selects, and the profile cannot change inside
+        // a block anyway (`setSoundProfile` runs on the audio thread).
+#if PR32_APU_ENABLE_LEGACY_FLOAT
+        if (profileUsesIntegerCore()) {
+            renderIntegerCore(stream, length);
+        } else {
+            renderFloatLegacy(stream, length);
+        }
+#else
+        // No float body in this build, so `Legacy` falls back to the integer
+        // core (S3) and every profile lands on the same destination.
+        renderIntegerCore(stream, length);
+#endif
+
+        if (postMixMono_) {
+            postMixMono_(stream, length, postMixUser_);
+        }
+
+        audioTimeSamples += (uint64_t)length;
+        samplesSinceLog += (uint64_t)length;
+
+        if constexpr (kApuProfilingEnabled) {
+            if (samplesSinceLog >= (uint64_t)sampleRate) {
+                uint8_t idx = profileWriteIdx.fetch_add(1, std::memory_order_relaxed);
+                idx %= PROFILE_RING_SIZE;
+                profileRing[idx].audioTimeSamples = audioTimeSamples;
+                profileRing[idx].peak = currentPeak;
+                profileRing[idx].clipped = (currentPeak >= 32767.0f);
+                if (profileCount < PROFILE_RING_SIZE) {
+                    profileCount++;
+                }
+                currentPeak = 0.0f;
+                samplesSinceLog = 0;
+            }
+        } else if (samplesSinceLog >= (uint64_t)sampleRate) {
+            currentPeak = 0.0f;
+            samplesSinceLog = 0;
+        }
+    }
+
+#if PR32_APU_ENABLE_LEGACY_FLOAT
+    // S1: the frozen `Legacy` float body. Only the mechanical extraction that
+    // gave it a name is allowed to touch it — no sound fix, no optimization.
+    // `generateSamples` owns prologue, dispatch and the post-mix hook.
+    void ApuCore::renderFloatLegacy(int16_t* stream, int length) {
         constexpr float FINAL_SCALE = 32767.0f;
         // HPF is `y[n] = x[n] - x[n-1] + R*y[n-1]`; R now lives in `hpfR_`
         // (Hito 4 M10) so the corner can be configured in Hz.
 
-#if PR32_APU_ENABLE_LEGACY_FLOAT
         // ---- Float path (native, ESP32 classic, ESP32-S3) ---------------
         // Compiled when PR32_APU_ENABLE_LEGACY_FLOAT is set (defaults to
         // PR32_APU_HAS_FPU). This is the frozen `Legacy` render body: no new
@@ -2948,9 +3066,9 @@ namespace pixelroot32::audio {
         // integer/LUT branch below is the portable core and is compiled
         // unconditionally, so an FPU build with the macro at 0 still links.
 
-        // Hito 2 M3: APU cycles per render sample. Computed once per
-        // generateSamples() call. When the frame counter is OFF (default)
-        // the tick is a no-op, so this is just a cheap set-up cost.
+        // Hito 2 M3: APU cycles per render sample. Computed once per render
+        // block. When the frame counter is OFF (default) the tick is a no-op,
+        // so this is just a cheap set-up cost.
         const double apuCyclesPerSample =
             (sampleRate > 0) ? (nes_apu::kNesApuHzNtsc / (double)sampleRate) : 0.0;
 
@@ -3010,22 +3128,25 @@ namespace pixelroot32::audio {
             if (finalSample < -32768.0f) finalSample = -32768.0f;
             stream[i] = apply_master_bitcrush((int16_t)finalSample, masterBitcrushBits_);
         }
-#else
-        // ---- Integer / LUT path (portable core: no-FPU targets, and FPU
-        // targets built with -DPR32_APU_ENABLE_LEGACY_FLOAT=0) --------------
-        // Unconditional body: it is the single core every platform can run
-        // (S2/S3). Uses the Q32 phase mirror + Q15 output per channel so the inner
-        // loop contains zero soft-float operations. The LUT is pre-fitted
-        // to the same compression curve as the FPU path, so both paths
-        // produce numerically equivalent output.
-        //
-        // OPTIMIZATION: Hoisted switch from inner loop. Instead of switch(ch.type) per
-        // sample (causes branch misprediction at 22kHz), we process by wave type
-        // using separate accumulators. This eliminates ~4 branches per sample.
-        //
-        // Volume is still stored in float; we convert to Q15 once per
-        // block (not per sample) so volume ramps still work but the 22kHz
-        // inner loop stays integer-only.
+    }
+#endif
+
+    // ---- Integer / LUT path (portable core: no-FPU targets, and FPU
+    // targets built with -DPR32_APU_ENABLE_LEGACY_FLOAT=0) --------------
+    // Unconditional body: it is the single core every platform can run
+    // (S2/S3). Uses the Q32 phase mirror + Q15 output per channel so the inner
+    // loop contains zero soft-float operations. The LUT is pre-fitted
+    // to the same compression curve as the FPU path, so both paths
+    // produce numerically equivalent output.
+    //
+    // OPTIMIZATION: Hoisted switch from inner loop. Instead of switch(ch.type) per
+    // sample (causes branch misprediction at 22kHz), we process by wave type
+    // using separate accumulators. This eliminates ~4 branches per sample.
+    //
+    // Volume is still stored in float; we convert to Q15 once per
+    // block (not per sample) so volume ramps still work but the 22kHz
+    // inner loop stays integer-only.
+    void ApuCore::renderIntegerCore(int16_t* stream, int length) {
         int32_t volQ15[MAX_VOICES];
         // envQ15 is now tracked continuously per-channel via tickEnvelopeQ15
         for (int c = 0; c < MAX_VOICES; ++c) {
@@ -3355,32 +3476,6 @@ namespace pixelroot32::audio {
         // (and the FPU fallback if ever invoked) sees up-to-date state.
         for (int c = 0; c < MAX_VOICES; ++c) {
             voices[c].volume = (float)volQ15[c] / 32768.0f;
-        }
-#endif
-
-        if (postMixMono_) {
-            postMixMono_(stream, length, postMixUser_);
-        }
-
-        audioTimeSamples += (uint64_t)length;
-        samplesSinceLog += (uint64_t)length;
-
-        if constexpr (kApuProfilingEnabled) {
-            if (samplesSinceLog >= (uint64_t)sampleRate) {
-                uint8_t idx = profileWriteIdx.fetch_add(1, std::memory_order_relaxed);
-                idx %= PROFILE_RING_SIZE;
-                profileRing[idx].audioTimeSamples = audioTimeSamples;
-                profileRing[idx].peak = currentPeak;
-                profileRing[idx].clipped = (currentPeak >= 32767.0f);
-                if (profileCount < PROFILE_RING_SIZE) {
-                    profileCount++;
-                }
-                currentPeak = 0.0f;
-                samplesSinceLog = 0;
-            }
-        } else if (samplesSinceLog >= (uint64_t)sampleRate) {
-            currentPeak = 0.0f;
-            samplesSinceLog = 0;
         }
     }
 

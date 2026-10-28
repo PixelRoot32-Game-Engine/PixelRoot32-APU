@@ -7,6 +7,7 @@
 #include "AudioTypes.h"
 #include "AudioCommandQueue.h"
 #include "AudioMusicTypes.h"
+#include "ApuConfig.h"
 
 #include <atomic>
 #include <cstdint>
@@ -38,6 +39,11 @@ namespace pixelroot32::audio {
       * at the same level (Hito 5 M12). It applies MIXER_SCALE once, after
       * summation rather than per channel, because the table's mapping already
       * contains the 0.4 — see AudioMixerLUT.h.
+      *
+      * Since the profiles arrived (S3) the selector, not the target, decides
+      * which body runs: `Nes`/`Hybrid` use the integer core on every build, and
+      * `Legacy` falls back to it where the float body is not compiled
+      * (`PR32_APU_ENABLE_LEGACY_FLOAT == 0`).
       */
      class ApuCore {
     public:
@@ -900,6 +906,17 @@ namespace pixelroot32::audio {
         // -- Soft-clip test diagnostics (Hito 4 M11) -------------------
         /** @brief Test-only: current master output shaping curve. */
         SoftClipMode getSoftClipModeForTesting() const;
+
+        // -- Sound profile test diagnostics (S4/S5) --------------------
+        /**
+         * @brief Test-only: number of `applyProfileCharacter` applications so far.
+         *
+         * Structural proof of the S5 ordering: one application per note-on,
+         * and after the `nesAccurate` / `initNesSafe` block.
+         *
+         * @return Monotonic count since construction.
+         */
+        uint32_t getProfileApplyCountForTesting() const;
 #endif
 
     private:
@@ -919,6 +936,68 @@ namespace pixelroot32::audio {
         Voice* findVoiceForSfxEvent(WaveType type);
         Voice* findVoiceForPercussionHit();
         float generateSampleForVoice(Voice& voice);
+
+        // -- Render core selection (S3) ------------------------------------
+        /**
+         * @brief Reports whether the active profile renders through the integer core.
+         *
+         * Derived from the profile selector and the build's float-path switch,
+         * never from `PR32_APU_HAS_FPU`: on an FPU target `Nes`/`Hybrid` still
+         * pick the integer body, and with `PR32_APU_ENABLE_LEGACY_FLOAT == 0`
+         * `Legacy` falls back to it as well.
+         *
+         * Evaluated once per rendered block, never per sample.
+         *
+         * @return true if `generateSamples` must use the integer core.
+         */
+        bool profileUsesIntegerCore() const {
+            return (profile_ != SoundProfile::Legacy) || (PR32_APU_ENABLE_LEGACY_FLOAT == 0);
+        }
+
+        /**
+         * @brief Renders one block through the portable integer/Q15 core.
+         *
+         * The single core every target can run (S2/S3), so this definition is
+         * never compiled out. `generateSamples` owns the shared prologue
+         * (command drain, sequencer) and the post-mix hook; this method owns
+         * only the per-sample loop.
+         *
+         * @param stream Output buffer (mono, int16 samples).
+         * @param length Number of samples; the caller guarantees length > 0.
+         */
+        void renderIntegerCore(int16_t* stream, int length);
+
+#if PR32_APU_ENABLE_LEGACY_FLOAT
+        /**
+         * @brief Renders one block through the frozen `Legacy` float core.
+         *
+         * S1: this body is a contract. Only the mechanical extraction that
+         * created it may touch it — no sound fix or optimization lands here.
+         * Compiled only when the float path is enabled for this build.
+         *
+         * @param stream Output buffer (mono, int16 samples).
+         * @param length Number of samples; the caller guarantees length > 0.
+         */
+        void renderFloatLegacy(int16_t* stream, int length);
+#endif
+
+        /**
+         * @brief Applies the active profile's character to one voice.
+         *
+         * S5: the only place a profile writes character — envelope curve, mix
+         * weighting, output filters, default duty, noise LUT, unipolar output
+         * and pan/echo enablement. Called at the very end of
+         * `initVoiceFromEvent`, after the `nesAccurate` / `initNesSafe` block,
+         * so the note's own values are already in place when it runs.
+         *
+         * E0: `Nes`/`Hybrid` are exact aliases and therefore write nothing —
+         * the note path already leaves those values (S3). E1 changes only the
+         * body of this function.
+         *
+         * @param slot Voice index [0, MAX_VOICES); the caller guarantees it is
+         *             a valid voice of the pool.
+         */
+        void applyProfileCharacter(int slot);
 
         // -- Channels and I/O ---------------------------------------------
         Voice voices[MAX_VOICES];
@@ -1058,6 +1137,8 @@ namespace pixelroot32::audio {
         int nesLinearCounterTickCountForTesting_ = 0;
         int nesSweepTickCountForTesting_ = 0;
         int nesIrqSetCountForTesting_ = 0;
+        /** Applications of `applyProfileCharacter` (S5 ordering proof). */
+        uint32_t profileApplyCount_ = 0;
 #endif
     };
 
