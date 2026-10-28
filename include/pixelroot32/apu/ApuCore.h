@@ -34,6 +34,14 @@ namespace pixelroot32::audio {
       *   output:      y * masterVolume * 32767, passed through a single-pole
       *                DC-blocker to remove offset + transient clicks.
       *
+      * `Nes`/`Hybrid` replace the uniform per-channel weighting with
+      * `MixerCurve::NesWeighted` (S4): the voices are summed per group and the
+      * published NES ratios decide how much each group contributes, with the
+      * PULSE group anchored at exactly the level above so the change is
+      * balance, not loudness. The weighted sum then enters the same compressor,
+      * master volume and DC blocker chain. `Legacy` keeps the formula above
+      * unchanged, byte for byte.
+      *
       * On cores without an FPU (ESP32-C3) the integer-optimised path uses
       * `audio_mixer_lut`, which is pre-fitted to the same curve and renders
       * at the same level (Hito 5 M12). It applies MIXER_SCALE once, after
@@ -907,6 +915,20 @@ namespace pixelroot32::audio {
         /** @brief Test-only: current master output shaping curve. */
         SoftClipMode getSoftClipModeForTesting() const;
 
+        // -- Mixer curve test diagnostics (E1/S4) -----------------------
+        /**
+         * @brief Test-only: mixer curve the active profile selects.
+         *
+         * Reports the value the renderer will use, derived from the profile
+         * selector. There is no matching setter on purpose: the curve is
+         * profile character (D-3 tier 1), so `setSoundProfile` is the only way
+         * to change it and this accessor is the way to observe that.
+         *
+         * @return `Rational` under `Legacy`, `NesWeighted` under `Nes` and
+         *         `Hybrid`.
+         */
+        MixerCurve getMixerCurveForTesting() const;
+
         // -- Sound profile test diagnostics (S4/S5) --------------------
         /**
          * @brief Test-only: number of `applyProfileCharacter` applications so far.
@@ -1014,6 +1036,11 @@ namespace pixelroot32::audio {
          * and pan/echo enablement. Called at the very end of
          * `initVoiceFromEvent`, after the `nesAccurate` / `initNesSafe` block,
          * so the note's own values are already in place when it runs.
+         *
+         * The mix weighting is profile character too, but it has no per-voice
+         * field: `renderIntegerCore` resolves the `MixerCurve` from the
+         * profile once per block (S4), so there is nothing for this function
+         * to write for it and nothing that could be half-applied per voice.
          *
          * E0: `Nes`/`Hybrid` are exact aliases and therefore write nothing —
          * the note path already leaves those values (S3). E1 changes only the

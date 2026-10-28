@@ -17,6 +17,7 @@
 
 #include <unity.h>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include "test_config.h"
 #include "golden/apu_mirror_canonical_track.h"
@@ -6213,6 +6214,298 @@ void profile_hybrid_canonical_note_never_falls_silent_before_decay_ends(void) {
 }
 
 // =============================================================================
+// S4: mixer curve and the NES-weighted groups (E1/T2)
+// =============================================================================
+
+// Every probe below shares one instrument and one render shape, so the only
+// input that differs between two renders is the sound profile — the mixer
+// curve's sole owner (D-3 tier 1). A flat envelope keeps the group weights the
+// only thing that can move the level: one-sample attack, no decay, sustain 1.0.
+static InstrumentPreset mixerProbePreset() {
+    InstrumentPreset preset{};
+    preset.baseVolume = 1.0f;
+    preset.duty = 0.5f;
+    preset.defaultOctave = 4;
+    preset.attackTime = 0.0f;
+    preset.decayTime = 0.0f;
+    preset.sustainLevel = 1.0f;
+    preset.releaseTime = 0.005f;
+    return preset;
+}
+
+// Puts the shaping stage out of the way: `None` plus a bypassed DC blocker
+// means the output IS the mix scaled by MIXER_SCALE, which is what lets the
+// weights be read off the PCM. The default HPF would remove the DC of an
+// unbalanced waveform and hide the very number under test.
+static void configureMixerProbe(ApuCore& apu, SoundProfile profile) {
+    apu.init(44100);
+    apu.reset();
+    apu.setSoundProfile(profile);
+    apu.setSoftClipMode(SoftClipMode::None);
+    apu.setHpfCutoffHz(0.0f);
+}
+
+static void queueMixerProbeVoice(ApuCore& apu, WaveType type, float volume,
+                                 float duty, const InstrumentPreset& preset) {
+    AudioCommand cmd{};
+    cmd.type = AudioCommandType::PLAY_EVENT;
+    cmd.event.type = type;
+    cmd.event.frequency = 440.0f;
+    cmd.event.duration = 0.0f;
+    cmd.event.volume = volume;
+    cmd.event.duty = duty;
+    cmd.event.loop = true;
+    cmd.event.preset = &preset;
+    TEST_ASSERT_TRUE(apu.submitCommand(cmd));
+}
+
+static constexpr int kMixerProbeSamples = 2048;
+static int16_t gMixerProbe[kMixerProbeSamples];
+
+// Peak of the settled part of a one-voice render. The envelope reaches full
+// scale on its first sample (attack = 0), and the first 256 samples are still
+// skipped so the reading can never be a transient.
+static int32_t renderMixerProbePeak(SoundProfile profile, WaveType type,
+                                    float volume, float duty) {
+    ApuCore apu;
+    configureMixerProbe(apu, profile);
+    const InstrumentPreset preset = mixerProbePreset();
+    queueMixerProbeVoice(apu, type, volume, duty, preset);
+    apu.generateSamples(gMixerProbe, kMixerProbeSamples);
+    return peakMagnitude(gMixerProbe + 256, kMixerProbeSamples - 256);
+}
+
+// Relative error of a measured peak ratio against the published weight ratio.
+static void assertWeightRatio(double baseWeight, double groupWeight,
+                              int32_t basePeak, int32_t groupPeak,
+                              const char* label) {
+    const double expected = groupWeight / baseWeight;
+    const double actual = (double)groupPeak / (double)basePeak;
+    const double error = (actual - expected) / expected;
+    char message[192];
+    std::snprintf(message, sizeof(message),
+                  "%s: measured ratio %.6f, published %.6f (%.3f %%, limit 1 %%)",
+                  label, actual, expected, error * 100.0);
+    TEST_ASSERT_TRUE_MESSAGE(error <= 0.01 && error >= -0.01, message);
+}
+
+// S4/T2: the three published group weights must survive as RATIOS in the
+// rendered PCM. Each probe is one full-scale voice of one group, so the peak
+// ratio is the weight ratio: 0.00752 : 0.00851 : 0.00494 within ±1 %.
+void mixer_nes_weighted_group_balance_matches_the_published_ratios(void) {
+    const int32_t pulse = renderMixerProbePeak(SoundProfile::Nes, WaveType::PULSE, 1.0f, 0.5f);
+    const int32_t triangle = renderMixerProbePeak(SoundProfile::Nes, WaveType::TRIANGLE, 1.0f, 0.5f);
+    const int32_t noise = renderMixerProbePeak(SoundProfile::Nes, WaveType::NOISE, 1.0f, 0.5f);
+
+    // Guard against three silences: every ratio would be 0/0.
+    TEST_ASSERT_TRUE_MESSAGE(pulse > 1000, "the pulse probe rendered silence");
+    TEST_ASSERT_TRUE_MESSAGE(triangle > 1000, "the triangle probe rendered silence");
+    TEST_ASSERT_TRUE_MESSAGE(noise > 1000, "the noise probe rendered silence");
+
+    assertWeightRatio(0.00752, 0.00851, pulse, triangle, "triangle/pulse");
+    assertWeightRatio(0.00752, 0.00494, pulse, noise, "noise/pulse");
+}
+
+// S4/T2: two full-scale pulses must not change level. `Legacy` applies
+// MIXER_SCALE = 0.4 to each voice, so two of them land on 2 * 0.4 * 32767 =
+// 26213.6; the NES-weighted curve anchors its pulse group at exactly that,
+// which is the normalisation constant this test pins (S4 asks for balance, not
+// level).
+//
+// Same frequency on purpose: the two voices stay phase-aligned, so the mix is
+// exactly 2 x 32767 and the peak reads the level, not a beat.
+static int32_t renderTwoPulsePeak(SoundProfile profile) {
+    ApuCore apu;
+    configureMixerProbe(apu, profile);
+    const InstrumentPreset preset = mixerProbePreset();
+    queueMixerProbeVoice(apu, WaveType::PULSE, 1.0f, 0.5f, preset);
+    queueMixerProbeVoice(apu, WaveType::PULSE, 1.0f, 0.5f, preset);
+    apu.generateSamples(gMixerProbe, kMixerProbeSamples);
+    return peakMagnitude(gMixerProbe + 256, kMixerProbeSamples - 256);
+}
+
+void mixer_nes_weighted_pulses_match_legacy_level(void) {
+    const int32_t legacy = renderTwoPulsePeak(SoundProfile::Legacy);
+    const int32_t nes = renderTwoPulsePeak(SoundProfile::Nes);
+
+    TEST_ASSERT_TRUE_MESSAGE(legacy > 1000, "the Legacy two-pulse probe rendered silence");
+    // Absolute anchor first: 2 * 0.4 * 32767 = 26213.6, +/-1 for the int16 cast.
+    TEST_ASSERT_INT32_WITHIN(2, 26213, legacy);
+    // Then the claim that matters for S4: the profile changed the balance, not
+    // the level, so the same two voices must stay within 2 % of each other.
+    TEST_ASSERT_INT32_WITHIN_MESSAGE((legacy * 2) / 100, legacy, nes,
+        "NesWeighted moved the level of two pulses instead of only their balance");
+}
+
+// A PULSE at duty 0 is a constant -32767 (the phase never falls inside the
+// pulse), so the mix under test is one known number for every sample and the
+// whole output stage can be checked against the model. `out` is the last
+// sample of a settled block.
+static int32_t renderDcPulseLevel(SoundProfile profile, SoftClipMode mode, float volume) {
+    ApuCore apu;
+    apu.init(44100);
+    apu.reset();
+    apu.setSoundProfile(profile);
+    apu.setSoftClipMode(mode);
+    apu.setHpfCutoffHz(0.0f);
+    const InstrumentPreset preset = mixerProbePreset();
+    queueMixerProbeVoice(apu, WaveType::PULSE, volume, 0.0f, preset);
+    apu.generateSamples(gMixerProbe, 128);
+    return gMixerProbe[127];
+}
+
+// S4/T2: the weighting is folded into the mix the output stage receives, not
+// applied to the finished int16 afterwards. With the shaping at `None` and the
+// DC blocker bypassed, the output is exactly MIXER_SCALE * weighted sum, so the
+// stage is checkable to the LSB — and the same voice under `Legacy` must land
+// on the same number, which is the pulse anchor made visible.
+void mixer_nes_weighted_applies_before_the_hpf(void) {
+    // Full scale: the weighted sum is -32767, i.e. 0.4 * -32767 = -13106.8.
+    const int32_t full = renderDcPulseLevel(SoundProfile::Nes, SoftClipMode::None, 1.0f);
+    const int32_t expectedFull = (int32_t)(((int64_t)(-32767) * 13107) >> 15);
+    TEST_ASSERT_INT32_WITHIN_MESSAGE(1, expectedFull, full,
+        "the weighted sum did not reach the output stage unchanged");
+
+    // Half volume: the volume and the envelope are applied per voice, BEFORE
+    // the weighting, so the sum halves to -16384 and the output with it. A
+    // weight applied to the finished sample would not scale this way.
+    const int32_t half = renderDcPulseLevel(SoundProfile::Nes, SoftClipMode::None, 0.5f);
+    const int32_t expectedHalf = (int32_t)(((int64_t)(-16384) * 13107) >> 15);
+    TEST_ASSERT_INT32_WITHIN_MESSAGE(1, expectedHalf, half,
+        "the volume scaling must sit upstream of the weighting");
+
+    // And the pulse anchor: `Legacy` renders the same voice at the same level.
+    const int32_t legacy = renderDcPulseLevel(SoundProfile::Legacy, SoftClipMode::None, 1.0f);
+    TEST_ASSERT_INT32_WITHIN_MESSAGE(1, legacy, full,
+        "the pulse group must anchor at exactly the Legacy level");
+
+    // A non-unity group in absolute terms: the triangle probe peaks at the
+    // 4-bit extreme (-32768), and its weighted sum is that value times the
+    // triangle weight. Reading it back through the same 0.4 scale closes the
+    // loop: the weight is inside the value the output stage receives.
+    const int32_t triangle = renderMixerProbePeak(SoundProfile::Nes, WaveType::TRIANGLE,
+                                                 1.0f, 0.5f);
+    const int32_t triangleSum = (int32_t)(((int64_t)(4635 * 32768)) >> 12);
+    const int32_t expectedTriangle = (int32_t)(((int64_t)triangleSum * 13107) >> 15);
+    TEST_ASSERT_INT32_WITHIN_MESSAGE(1, expectedTriangle, triangle,
+        "the triangle weight did not reach the output stage");
+}
+
+// Loud four-triangle mix, phase-aligned: each voice contributes the triangle
+// weight, so the sum is driven past unity and every curve has to bound it.
+static int32_t renderLoudWeightedMixPeak(SoftClipMode mode) {
+    ApuCore apu;
+    apu.init(44100);
+    apu.reset();
+    apu.setSoundProfile(SoundProfile::Nes);
+    apu.setSoftClipMode(mode);
+    apu.setHpfCutoffHz(0.0f);
+    const InstrumentPreset preset = mixerProbePreset();
+    for (int i = 0; i < 4; ++i) {
+        queueMixerProbeVoice(apu, WaveType::TRIANGLE, 1.0f, 0.5f, preset);
+    }
+    apu.generateSamples(gMixerProbe, kMixerProbeSamples);
+    return peakMagnitude(gMixerProbe + 256, kMixerProbeSamples - 256);
+}
+
+// S4/T2: the weighting is orthogonal to `SoftClipMode` (S4), so every mode has
+// to keep working on the weighted mix — bounded, monotonic where the mode is
+// monotonic, and without a sign inversion or a wrap-around that the mode did
+// not introduce itself.
+void mixer_nes_weighted_stays_bounded_and_monotonic_per_clip_mode(void) {
+    const SoftClipMode modes[4] = {
+        SoftClipMode::None, SoftClipMode::Rational,
+        SoftClipMode::Tanh, SoftClipMode::HardClip
+    };
+    const char* names[4] = {"None", "Rational", "Tanh", "HardClip"};
+
+    // A constant-level voice makes monotonicity and sign a pure comparison:
+    // raising the volume may only raise the magnitude of a negative sample,
+    // never flip its sign and never make it smaller.
+    for (int m = 0; m < 4; ++m) {
+        int32_t previousMagnitude = 0;
+        for (int step = 1; step <= 10; ++step) {
+            const float volume = 0.1f * (float)step;
+            const int32_t out = renderDcPulseLevel(SoundProfile::Nes, modes[m], volume);
+            char message[192];
+            std::snprintf(message, sizeof(message),
+                          "%s: the weighted mix inverted the sign at volume %.1f",
+                          names[m], (double)volume);
+            TEST_ASSERT_TRUE_MESSAGE(out < 0, message);
+            std::snprintf(message, sizeof(message),
+                          "%s: |output| fell from %d to %d while the volume rose to %.1f",
+                          names[m], (int)previousMagnitude, (int)(-out), (double)volume);
+            TEST_ASSERT_GREATER_OR_EQUAL_INT32_MESSAGE(previousMagnitude, -out, message);
+            previousMagnitude = -out;
+        }
+    }
+
+    // Bounded on an overdriven mix, and no shaped mode may pass more level than
+    // the unshaped one: a wrap in the weighted sum would break that ordering.
+    const int32_t none = renderLoudWeightedMixPeak(SoftClipMode::None);
+    TEST_ASSERT_TRUE_MESSAGE(none > 1000, "the loud weighted mix rendered silence");
+    const int32_t shaped[3] = {
+        renderLoudWeightedMixPeak(SoftClipMode::Rational),
+        renderLoudWeightedMixPeak(SoftClipMode::Tanh),
+        renderLoudWeightedMixPeak(SoftClipMode::HardClip)
+    };
+    for (int m = 0; m < 3; ++m) {
+        char message[192];
+        std::snprintf(message, sizeof(message),
+                      "%s passed more level than the unshaped weighted mix (%d > %d)",
+                      names[m + 1], (int)shaped[m], (int)none);
+        TEST_ASSERT_GREATER_OR_EQUAL_INT32_MESSAGE(shaped[m], none, message);
+        // |int16| reaches 32768 on the negative rail, so that is the bound.
+        TEST_ASSERT_TRUE_MESSAGE(shaped[m] >= 0 && shaped[m] <= 32768,
+                                 "the weighted mix left the int16 range");
+    }
+}
+
+// D-3 tier 1: the mixer curve belongs to the profile. There is no per-voice
+// setter and no command for it on purpose — mixing is a property of the whole
+// mix, so a voice-level owner would let one note change another one's level.
+void mixer_curve_is_owned_by_the_profile(void) {
+    ApuCore apu;
+    // Before anything selects a profile: the frozen Legacy curve.
+    TEST_ASSERT_EQUAL_INT((int)MixerCurve::Rational, (int)apu.getMixerCurveForTesting());
+
+    apu.setSoundProfile(SoundProfile::Nes);
+    TEST_ASSERT_EQUAL_INT((int)MixerCurve::NesWeighted, (int)apu.getMixerCurveForTesting());
+    apu.setSoundProfile(SoundProfile::Hybrid);
+    TEST_ASSERT_EQUAL_INT((int)MixerCurve::NesWeighted, (int)apu.getMixerCurveForTesting());
+    apu.setSoundProfile(SoundProfile::Legacy);
+    TEST_ASSERT_EQUAL_INT((int)MixerCurve::Rational, (int)apu.getMixerCurveForTesting());
+
+    // A stream restart must not discard the caller's choice, the same contract
+    // the profile itself has (S4).
+    apu.setSoundProfile(SoundProfile::Hybrid);
+    apu.init(22050);
+    TEST_ASSERT_EQUAL_INT((int)MixerCurve::NesWeighted, (int)apu.getMixerCurveForTesting());
+}
+
+// PRESERVE (T2): the voice-loop change must not move the `Legacy` mix. Its
+// historical anchors are MIXER_SCALE * 32767 = 13106.8 for one voice and twice
+// that for two, and the committed PCM fixtures pin the same bytes end to end.
+void mixer_legacy_keeps_its_historical_level(void) {
+    const int32_t one = renderMixerProbePeak(SoundProfile::Legacy, WaveType::PULSE, 1.0f, 0.5f);
+    TEST_ASSERT_INT32_WITHIN_MESSAGE(1, 13107, one,
+        "one full-scale pulse must still leave the mixer at 0.4 * 32767");
+
+    const int32_t two = renderTwoPulsePeak(SoundProfile::Legacy);
+    TEST_ASSERT_INT32_WITHIN_MESSAGE(2, 26213, two,
+        "two full-scale pulses must still leave the mixer at 2 * 0.4 * 32767");
+
+    // The same render through the weighted curve matches on a pulse-only
+    // programme, which is what keeps the committed integer golden (rendered
+    // through `Nes` on an FPU build) green without regenerating it. One LSB of
+    // slack: an FPU build reaches `Legacy` through the float body, whose
+    // `(int16_t)` cast truncates toward zero where the integer core floors.
+    TEST_ASSERT_INT32_WITHIN_MESSAGE(1, one, renderMixerProbePeak(SoundProfile::Nes,
+                                                                 WaveType::PULSE, 1.0f, 0.5f),
+        "the pulse anchor must be exactly the Legacy weight");
+}
+
+// =============================================================================
 // Unity test runner
 // =============================================================================
 
@@ -6461,6 +6754,14 @@ int main(int argc, char** argv) {
     RUN_TEST(envelope_exponential_release_reaches_minus_60_db_at_the_stage_end);
     RUN_TEST(envelope_exponential_short_stage_keeps_the_linear_ramp);
     RUN_TEST(profile_hybrid_canonical_note_never_falls_silent_before_decay_ends);
+
+    // S4: mixer curve and the NES-weighted groups (E1/T2)
+    RUN_TEST(mixer_curve_is_owned_by_the_profile);
+    RUN_TEST(mixer_nes_weighted_group_balance_matches_the_published_ratios);
+    RUN_TEST(mixer_nes_weighted_pulses_match_legacy_level);
+    RUN_TEST(mixer_nes_weighted_applies_before_the_hpf);
+    RUN_TEST(mixer_nes_weighted_stays_bounded_and_monotonic_per_clip_mode);
+    RUN_TEST(mixer_legacy_keeps_its_historical_level);
 
     // Integration tests
     RUN_TEST(test_apu_core_integration_full_pipeline);

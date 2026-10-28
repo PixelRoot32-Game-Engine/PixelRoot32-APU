@@ -164,6 +164,43 @@ namespace pixelroot32::audio {
     };
 
     /**
+     * @enum MixerCurve
+     * @brief Balance the summed voices carry into the output stage.
+     *
+     * Orthogonal to `SoftClipMode`: the curve decides how much each voice
+     * GROUP contributes to the mix, the clip mode decides what happens to the
+     * resulting sum afterwards. The weighting runs before the clip curve and
+     * before the DC blocker, so the compressor's nonlinearity acts on the
+     * rebalanced signal rather than on a mix it saw first.
+     *
+     * Owned by the sound profile (D-3 tier 1), never by a voice: the mix is a
+     * property of the whole output, so there is deliberately no per-voice
+     * setter and no `AudioCommandType` for it. A voice-level owner would let
+     * one note change another one's level.
+     *
+     * Declared next to `SoftClipMode` because the two are the two halves of
+     * the same output stage and `AudioChannel` must not grow a field for
+     * either of them.
+     */
+    enum class MixerCurve : uint8_t {
+        /**
+         * The historical `Legacy` weighting: every voice counts the same, and
+         * `MIXER_SCALE` is applied once to their sum. Named after the
+         * `Rational` output curve it has always been paired with, and kept
+         * bit-for-bit on both render cores.
+         */
+        Rational = 0,
+        /**
+         * NES linear-approximation mixer (S4): pulses, triangle and noise are
+         * weighted by the published DAC coefficients
+         * (`0.00752 * (p1 + p2)`, `0.00851 * tri`, `0.00494 * noise`,
+         * `0.00335 * dmc`) instead of counting the same. Rebalances the mix;
+         * the overall level is normalised back to the `Rational` one.
+         */
+        NesWeighted = 1
+    };
+
+    /**
      * @struct SfxBreakpoint
      * @brief Timed automation point for SFX duty steps or pitch envelope.
      *
