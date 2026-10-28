@@ -167,7 +167,7 @@ The suite (`ctest`) includes `test_apu_mirror` with a **golden PCM** (`test/gold
 
 ### 9.1 Targets and case counts
 
-Measured 2026-10-28 on the sound-profile branch (`cmake -S . -B build -G "MinGW Makefiles" -DPR32_APU_BUILD_TESTS=ON`, `cmake --build build`, `cd build && ctest --output-on-failure` → `100% tests passed out of 11`). The case counts are Unity's summary line, each binary run from `test/`:
+Measured 2026-10-28 on the sound-profile branch (`cmake -S . -B build -G "MinGW Makefiles" -DPR32_APU_BUILD_TESTS=ON`, `cmake --build build`, `cd build && ctest --output-on-failure` → `100% tests passed out of 13`). The case counts are Unity's summary line, each binary run from `test/`:
 
 | Target | Cases | What it covers |
 |---|---|---|
@@ -176,13 +176,15 @@ Measured 2026-10-28 on the sound-profile branch (`cmake -S . -B build -G "MinGW 
 | `test_audio_command_queue` | 10 | SPSC queue, capacity and the `AudioCommand` ABI pins |
 | `test_audio_music_types` | 35 | Music types, `InstrumentPreset` layout, shipped presets |
 | `test_apu_mirror` | 37 | Tool Suite parity, byte-for-byte against the float golden |
+| `test_apu_output_filter` | 11 | E2 output chain: measured response, full-scale stability, `setHpfCutoffHz` precedence, `Legacy` one-pole |
+| `test_apu_output_filter_integer` | 11 | The same suite where `Legacy` has no float body (`PR32_APU_ENABLE_LEGACY_FLOAT=0`) |
 | `test_q15_smoke` | 15 | Integer/Q15 path smoke coverage |
 | `test_apu_integer_golden` | 1 | The integer core against the `Legacy` integer golden (FPU build with the float body off) |
 | `test_apu_integer_golden_no_fpu` | 1 | The same golden from a build with no FPU at all |
 | `test_apu_profile_golden` | 2 | `Nes` and `Hybrid` against their own goldens (FPU build with the float body off) |
 | `test_apu_profile_golden_no_fpu` | 2 | The same two goldens from a build with no FPU at all |
 | `test_library_link` | 4 | Public symbols exist in the shipped artifact (links, no `UNIT_TEST`) |
-| **Total** | **522** | 0 failures, 0 ignored, exit code 0 in all eleven |
+| **Total** | **549** | 0 failures, 0 ignored, exit code 0 in all thirteen |
 
 The five continuous-duty cases added by the full-scale fix (`test_pulse_duty_full_scale_*`, `test_pulse_duty_zero_never_goes_positive`, `test_pulse_duty_interior_value_unchanged`) live in `test/test_apu_core.cpp`, so both core targets run them; that is the 205 → 210 step on the two rows above.
 
@@ -223,15 +225,15 @@ Two consequences worth knowing: at 8 voices the integer core is **cheaper** than
 ### 9.4 `sizeof` (measured)
 
 ```
-sizeof(ApuCore)          = 13264 B   host ABI, production build (queue 64)
-sizeof(ApuCore)          = 13288 B   host ABI, UNIT_TEST build
+sizeof(ApuCore)          = 13344 B   host ABI, production build (queue 64)
+sizeof(ApuCore)          = 13368 B   host ABI, UNIT_TEST build
 sizeof(AudioCommand)     =   144 B
 sizeof(AudioChannel)     =   336 B
 sizeof(InstrumentPreset) =    72 B
 queue budget             = 64 x 144 B = 9216 B
 ```
 
-The host figures were re-measured on 2026-10-28; E1's per-voice character state took `AudioChannel` from 328 to 336 B, which is the +64 B on `ApuCore` over the pre-E1 13 200 / 13 224 B. `AudioCommand` stayed at 144 B (see §5). The two host figures are pinned by `static_assert(sizeof(ApuCore) <= 13312, ...)` in `test_apu_core`; the test compiles with `UNIT_TEST=1`, so it asserts 13 288 B and the production figure is recorded next to the pin. The 32-bit target figure recorded before E1 was **9 800 B** (`gCoreStorage`, 0x2648, in the firmware maps of `tools/apu_bench_firmware` for `esp32dev`, `esp32-c3-devkitm-1` and `esp32-s3-devkitc-1`, identical on the three because the ABI is the same width); E1's channel growth changes it by the same 8 B per channel, so it is **not restated as current here** — the E1 firmware bench run prints it and it is recorded with §9.5's numbers.
+The host figures were re-measured on 2026-10-28 after E2. E1's per-voice character state took `AudioChannel` from 328 to 336 B (+64 B on `ApuCore` over the pre-E1 13 200 / 13 224 B), and E2/S1 added the `Nes`/`Hybrid` output filter chain state: **+80 B** on both builds (two high-pass poles, five Butterworth coefficients in Q15 `int32_t` because the LPF's `b1` does not fit `int16`, eight recursion registers, the resolved corners and three flags), landing at 13 344 / 13 368 B. `AudioCommand` stayed at 144 B (see §5). The two host figures are pinned by `static_assert(sizeof(ApuCore) <= 13376, ...)` in `test_apu_core`: the test compiles with `UNIT_TEST=1`, so it asserts the 13 368 B test-build size rounded up to the next multiple of 16, and the production figure is recorded in the message next to it. The 32-bit target figure recorded before E1 was **9 800 B** (`gCoreStorage`, 0x2648, in the firmware maps of `tools/apu_bench_firmware` for `esp32dev`, `esp32-c3-devkitm-1` and `esp32-s3-devkitc-1`, identical on the three because the ABI is the same width); E1's channel growth changes it by the same 8 B per channel and E2 adds the same 80 B, so it is **not restated as current here** — the firmware bench run prints it and it is recorded with §9.5's numbers.
 
 ### 9.5 CPU and underrun baseline, firmware
 

@@ -251,6 +251,16 @@ namespace pixelroot32::audio {
          * restores the legacy default, the same way it restores the master
          * volume and bitcrush depth.
          *
+         * S8 (caller precedence): this setter is an explicit statement about
+         * the output corner, so it OUTRANKS the sound profile. Once it has
+         * been called, `Nes` and `Hybrid` do NOT install their output filter
+         * chain; the historical single-pole HPF runs at the caller's corner
+         * instead. `reset()` clears that override, so the profile owns the
+         * stage again on the following block. This mirrors the
+         * `pulseDutyOverridden` / `noiseUnipolarOverridden` /
+         * `nesNoiseLutOverridden` tier-2 convention of E1. Calling it with
+         * <= 0 still counts as an explicit choice (an overridden bypass).
+         *
          * Not safe to call concurrently with rendering; treat it like the
          * other direct configuration setters.
          *
@@ -341,6 +351,22 @@ namespace pixelroot32::audio {
          * selector, one render body for the whole mix. Unknown values are
          * ignored rather than clamped, so a corrupt command cannot silently
          * change the sound to a neighbouring profile.
+         *
+         * The profile also OWNS the output stage (`Nes` and `Hybrid`, S1):
+         * one shared chain applied to the summed mix, never per voice, in
+         * this order — HPF 1st order at 90 Hz, HPF 1st order at 440 Hz, LPF
+         * 2nd order Butterworth (Q = 1/sqrt(2)) at `min(14000 Hz,
+         * 0.45 * fs)`. Coefficients are derived on a configuration or rate
+         * change, never per sample. `Legacy` keeps the historical single-pole
+         * HPF and is byte-identical on every build.
+         *
+         * The LPF is deliberately NOT engaged below `0.45 * fs >= 6000 Hz`
+         * (i.e. `fs >= 13334 Hz`): at 8 000 Hz `0.45 * fs` is 3 600 Hz, which
+         * would cut most of the passband and gut the sound instead of
+         * approximating the NES's 14 kHz roof. Below that floor the chain is
+         * the two high-passes only, which is a documented property of the
+         * profile, not a fallback. An explicit `setHpfCutoffHz()` call wins
+         * over all of this (S8).
          *
          * Thread safety: like `setVoiceNesOptions`, this mutates configuration
          * the renderer reads and is NOT safe to call concurrently with
@@ -1002,6 +1028,71 @@ namespace pixelroot32::audio {
          * @return Envelope level in Q15 (0..32768), or 0 if invalid.
          */
         int32_t getVoiceEnvelopeLevelQ15ForTesting(int slot) const;
+
+        // -- Output filter chain test diagnostics (E2/S1-S3, S8) -----------
+        /**
+         * @brief Test-only: true when the profile chain is installed.
+         *
+         * Reports the resolved state the render loop reads: `Nes`/`Hybrid`
+         * with no caller `setHpfCutoffHz` override.
+         * @return true when the render loop runs the three-stage chain.
+         */
+        bool isOutputFilterChainActiveForTesting() const;
+
+        /**
+         * @brief Test-only: true when the LPF is part of the installed chain.
+         *
+         * False when the chain itself is inactive, and false below the
+         * `0.45 * fs >= 6000 Hz` floor, where the chain is the two
+         * high-passes only.
+         * @return true when the Butterworth stage runs.
+         */
+        bool isOutputFilterLpfActiveForTesting() const;
+
+        /** @brief Test-only: Q15 pole of the 90 Hz high-pass. */
+        int32_t getOutputFilterHpf1RQ15ForTesting() const;
+        /** @brief Test-only: Q15 pole of the 440 Hz high-pass. */
+        int32_t getOutputFilterHpf2RQ15ForTesting() const;
+        /** @brief Test-only: Q15 `b0` of the Butterworth LPF. */
+        int32_t getOutputFilterLpfB0Q15ForTesting() const;
+        /** @brief Test-only: Q15 `b1` of the Butterworth LPF. */
+        int32_t getOutputFilterLpfB1Q15ForTesting() const;
+        /** @brief Test-only: Q15 `b2` of the Butterworth LPF. */
+        int32_t getOutputFilterLpfB2Q15ForTesting() const;
+        /** @brief Test-only: Q15 `a1` of the Butterworth LPF. */
+        int32_t getOutputFilterLpfA1Q15ForTesting() const;
+        /** @brief Test-only: Q15 `a2` of the Butterworth LPF. */
+        int32_t getOutputFilterLpfA2Q15ForTesting() const;
+        /** @brief Test-only: resolved 90 Hz corner. */
+        float getOutputFilterHpf1CutoffHzForTesting() const;
+        /** @brief Test-only: resolved 440 Hz corner. */
+        float getOutputFilterHpf2CutoffHzForTesting() const;
+        /** @brief Test-only: resolved LPF corner; 0 when the LPF is off. */
+        float getOutputFilterLpfCutoffHzForTesting() const;
+
+        /**
+         * @brief Test-only: largest |state| across both output stages.
+         *
+         * Covers the chain's four recursions and the historical one-pole, so a
+         * stability run can assert the recursion stays inside the int16 bound
+         * instead of inferring it from the output.
+         * @return Maximum absolute state value.
+         */
+        int32_t getOutputFilterStateMaxAbsForTesting() const;
+
+        /** @brief Test-only: clears both output stages' recursion state. */
+        void resetOutputFilterStateForTesting();
+
+        /**
+         * @brief Test-only: runs `applyOutputStage` over an injected buffer.
+         *
+         * Same function `renderIntegerCore` calls per sample, including the
+         * final int16 clamp and the master bitcrush, so a test observes the
+         * production stage and not a copy of its math.
+         * @param buffer Mono int16 samples, rewritten in place.
+         * @param length Number of samples.
+         */
+        void processOutputStageForTesting(int16_t* buffer, int length);
 #endif
 
     private:
@@ -1128,6 +1219,53 @@ namespace pixelroot32::audio {
         bool hpfEnabled_ = true;
         float hpfR_ = kHpfLegacyR;
         int32_t hpfRQ15_ = kHpfLegacyRQ15;
+        /**
+         * S8: true once the caller has called `setHpfCutoffHz`. A set corner
+         * outranks the profile's output chain; `reset()` clears it.
+         */
+        bool hpfCutoffOverridden_ = false;
+
+        // -- Output filter chain, `Nes` / `Hybrid` (E2/S1) ------------------
+        //
+        // One shared stage on the summed mix: HPF 90 Hz -> HPF 440 Hz ->
+        // Butterworth LPF. The one-pole above is the `Legacy` stage and keeps
+        // running unchanged when the chain is inactive; the render loop picks
+        // one or the other per sample through `applyOutputStage`.
+        //
+        // All coefficients are Q15 in `int32_t`: the LPF's `b1` can exceed 1
+        // (up to ~2 near 0.45 * fs), so it does not fit the 16-bit range the
+        // one-pole uses. Products are accumulated in `int64_t` because five
+        // Q15 terms at full scale overflow `int32_t`.
+        static constexpr float kOutputHpf1Hz = 90.0f;
+        static constexpr float kOutputHpf2Hz = 440.0f;
+        static constexpr float kOutputLpfMaxHz = 14000.0f;
+        /** 0.45 * fs floor below which the LPF would gut the passband. */
+        static constexpr double kOutputLpfMin45FsHz = 6000.0;
+
+        /** True when the profile owns the stage and no caller override exists. */
+        bool outputFilterActive_ = false;
+        /** False below the 6 kHz floor; the chain is then the two HPFs only. */
+        bool outputLpfActive_ = false;
+        int32_t outHpf1RQ15_ = 0;
+        int32_t outHpf2RQ15_ = 0;
+        int32_t outLpfB0Q15_ = 0;
+        int32_t outLpfB1Q15_ = 0;
+        int32_t outLpfB2Q15_ = 0;
+        int32_t outLpfA1Q15_ = 0;
+        int32_t outLpfA2Q15_ = 0;
+        // Recursion state, all clamped to the int16 range by the stage itself.
+        int32_t outHpf1PrevInQ15_ = 0;
+        int32_t outHpf1PrevOutQ15_ = 0;
+        int32_t outHpf2PrevInQ15_ = 0;
+        int32_t outHpf2PrevOutQ15_ = 0;
+        int32_t outLpfX1Q15_ = 0;
+        int32_t outLpfX2Q15_ = 0;
+        int32_t outLpfY1Q15_ = 0;
+        int32_t outLpfY2Q15_ = 0;
+        // Resolved corners in Hz; `outLpfCutoffHz_` is 0 when the LPF is off.
+        float outHpf1CutoffHz_ = kOutputHpf1Hz;
+        float outHpf2CutoffHz_ = kOutputHpf2Hz;
+        float outLpfCutoffHz_ = 0.0f;
 
         // -- Soft-clip configuration (Hito 4 M11) --------------------------
         /**
@@ -1152,6 +1290,58 @@ namespace pixelroot32::audio {
          * rate change) and by `setHpfCutoffHz`. Never called per sample.
          */
         void recomputeHpfCoefficients();
+
+        /**
+         * @brief Derive the `Nes` / `Hybrid` output chain from profile and rate.
+         *
+         * Called by `init` (a configured corner is in Hz, so it follows the
+         * rate), by `setSoundProfile` (the profile decides whether the chain
+         * is installed) and by `setHpfCutoffHz` (the caller override flips it
+         * off). Never called per sample or per block: the sample loop only
+         * reads `outputFilterActive_` and the pre-computed Q15 coefficients.
+         *
+         * The LPF is computed with the RBJ low-pass at Q = 1/sqrt(2) and its
+         * corner is `min(14000 Hz, 0.45 * fs)`, engaged only when
+         * `0.45 * fs >= 6000 Hz`. The transcendentals are confined here, on a
+         * configuration change, so no `exp`/`sin`/`cos` reaches the render
+         * path even on a soft-float target.
+         */
+        void recomputeOutputFilterCoefficients();
+
+        /**
+         * @brief Clears the recursion state of the output chain.
+         *
+         * A new rate, a new profile or a reset must not leave a stale
+         * coefficient/state pair ringing; called from all three paths.
+         */
+        void resetOutputFilterState();
+
+        /**
+         * @brief The complete integer output stage for one Q15 sample.
+         *
+         * The single entry point `renderIntegerCore` uses: the profile chain
+         * when `outputFilterActive_`, otherwise the historical single-pole
+         * HPF, which is the frozen `Legacy` arithmetic. Extracted verbatim so
+         * the same code the renderer runs can be driven over a test buffer.
+         *
+         * @param inputQ15 Post-shaping mix sample in Q15.
+         * @return Stage output, clamped to the int16 range.
+         */
+        int32_t applyOutputStage(int32_t inputQ15);
+
+        /**
+         * @brief HPF 90 Hz -> HPF 440 Hz -> LPF, one Q15 sample.
+         *
+         * Each stage saturates its own state to [-32768, 32767], so a corrupt
+         * coefficient can never wrap the recursion, and every divide by 32768
+         * truncates toward zero (not an arithmetic shift) for the reason
+         * documented on the historical one-pole: a shift freezes the DC decay
+         * on a permanent offset instead of reaching zero.
+         *
+         * @param inputQ15 Chain input in Q15.
+         * @return Chain output, saturated to the int16 range.
+         */
+        int32_t processOutputFilterChain(int32_t inputQ15);
 
         // -- Profiling ring buffer (thread-safe offload) --------------------
         ProfileEntry profileRing[PROFILE_RING_SIZE];

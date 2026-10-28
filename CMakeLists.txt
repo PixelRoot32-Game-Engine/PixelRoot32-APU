@@ -63,6 +63,22 @@ if(PR32_APU_BUILD_TESTS)
     # mirror; the fixture lives in test/golden/fixtures/)
     pr32_apu_add_test(test_apu_mirror)
 
+    # E2/S1-S3, S8: the `Nes`/`Hybrid` output filter chain — measured response
+    # against the theoretical cascade, full-scale stability, the caller's
+    # `setHpfCutoffHz` override, and the historical one-pole of `Legacy`.
+    # Built twice: the default (float `Legacy`) and the build where `Legacy`
+    # renders through the integer core, which is the path the one-pole pin
+    # exists for.
+    pr32_apu_add_test(test_apu_output_filter)
+    add_executable(test_apu_output_filter_integer test/test_apu_output_filter.cpp src/ApuCore.cpp)
+    target_compile_definitions(test_apu_output_filter_integer PRIVATE
+        UNIT_TEST=1 PR32_APU_ENABLE_LEGACY_FLOAT=0)
+    target_include_directories(test_apu_output_filter_integer PRIVATE
+        include test test/support)
+    target_link_libraries(test_apu_output_filter_integer PRIVATE pr32_apu_unity)
+    add_test(NAME test_apu_output_filter_integer COMMAND test_apu_output_filter_integer
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test)
+
     # Q15 / integer path exercised natively — the coverage gap identified in
     # the extraction analysis (no firmware build compiled this path).
     add_executable(test_q15_smoke test/test_q15_smoke.cpp src/ApuCore.cpp)

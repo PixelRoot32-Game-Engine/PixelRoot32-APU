@@ -1082,6 +1082,11 @@ namespace pixelroot32::audio {
         // Hito 4 M10: a configured corner is expressed in Hz, so it has to
         // follow the new rate. No-op while the legacy coefficient is in use.
         recomputeHpfCoefficients();
+        // E2/S1: the profile chain's corners are in Hz too, so a rate change
+        // re-derives them. The recursion state is cleared because a pole
+        // computed for the old rate has no meaning for the new one.
+        resetOutputFilterState();
+        recomputeOutputFilterCoefficients();
         // Voices are reset by the constructor and by `reset()`; the sound
         // profile is configuration and deliberately survives a stream restart.
     }
@@ -1116,6 +1121,206 @@ namespace pixelroot32::audio {
         hpfRQ15_ = (int32_t)(clamped * 32768.0 + 0.5);
         if (hpfRQ15_ > 32767) hpfRQ15_ = 32767;
         if (hpfRQ15_ < 0) hpfRQ15_ = 0;
+    }
+
+    // E2/S1: the output stage owned by the `Nes` / `Hybrid` profiles.
+    void ApuCore::recomputeOutputFilterCoefficients() {
+        // The profile owns the stage (D-3 tier 1), but an explicit
+        // `setHpfCutoffHz` is a tier-2 caller override and wins (S8). Resolve
+        // that here, once per configuration change, so the sample loop only
+        // tests a bool.
+        const bool profileWantsChain = (profile_ == SoundProfile::Nes) ||
+                                       (profile_ == SoundProfile::Hybrid);
+        outputFilterActive_ = profileWantsChain && !hpfCutoffOverridden_ &&
+                              sampleRate > 0;
+
+        // LPF policy (audit P3 risk iii): at 8 000 Hz `0.45 * fs` is 3 600 Hz,
+        // which would cut most of the passband and "switch off" the sound
+        // instead of approximating the NES's 14 kHz roof. Below the 6 kHz
+        // floor the LPF is skipped by definition; the chain is then the two
+        // high-passes only.
+        const double nyquist45 = 0.45 * (double)sampleRate;
+        outputLpfActive_ = outputFilterActive_ && (sampleRate > 0) &&
+                           (nyquist45 >= kOutputLpfMin45FsHz);
+
+        outHpf1CutoffHz_ = kOutputHpf1Hz;
+        outHpf2CutoffHz_ = kOutputHpf2Hz;
+        outLpfCutoffHz_ = outputLpfActive_
+            ? (float)std::min((double)kOutputLpfMaxHz, nyquist45)
+            : 0.0f;
+
+        // First-order high-pass pole, the same definition as the historical
+        // one-pole: R = exp(-2*pi*fc/fs), clamped strictly inside (0, 1) so a
+        // bad corner can never make the recursion unstable. The transcendental
+        // lives here, on configuration only, so it never reaches a sample loop
+        // even on a soft-float target.
+        auto highPassPoleQ15 = [this](double fcHz) -> int32_t {
+            const double r =
+                std::exp(-6.283185307179586 * fcHz / (double)sampleRate);
+            double clamped = r;
+            if (!(clamped > 0.0)) clamped = 0.0;  // also catches NaN
+            if (clamped > 0.99999) clamped = 0.99999;
+            return (int32_t)(clamped * 32768.0 + 0.5);
+        };
+        outHpf1RQ15_ = highPassPoleQ15((double)kOutputHpf1Hz);
+        outHpf2RQ15_ = highPassPoleQ15((double)kOutputHpf2Hz);
+
+        outLpfB0Q15_ = 0;
+        outLpfB1Q15_ = 0;
+        outLpfB2Q15_ = 0;
+        outLpfA1Q15_ = 0;
+        outLpfA2Q15_ = 0;
+        if (!outputLpfActive_ || sampleRate <= 0) {
+            return;
+        }
+
+        // RBJ low-pass at Q = 1/sqrt(2) (Butterworth): monotonic, -3 dB at the
+        // corner, no peaking. The corner is `min(14 kHz, 0.45 * fs)`, i.e. it
+        // tracks the rate until it hits the NES roof.
+        const double fc = std::min((double)kOutputLpfMaxHz, nyquist45);
+        const double w0 = 6.283185307179586 * fc / (double)sampleRate;
+        const double cw = std::cos(w0);
+        const double alpha = std::sin(w0) / 1.4142135623730951;  // 2Q with Q=1/sqrt(2)
+        const double a0 = 1.0 + alpha;
+        const double b0 = (1.0 - cw) * 0.5 / a0;
+        const double b1 = (1.0 - cw) / a0;
+        const double b2 = b0;
+        const double a1 = -2.0 * cw / a0;
+        const double a2 = (1.0 - alpha) / a0;
+
+        // Q15 in int32_t, not int16: `b1` can reach ~2 near 0.45 * fs (that is
+        // ~52 000 in Q15) and must keep its resolution, which is exactly why
+        // the products below are accumulated in int64.
+        auto toQ15 = [](double v) -> int32_t {
+            const double scaled = std::round(v * 32768.0);
+            if (scaled > 2147483647.0) return 2147483647;
+            if (scaled < -2147483648.0) return -2147483647 - 1;
+            return (int32_t)scaled;
+        };
+        outLpfB0Q15_ = toQ15(b0);
+        outLpfB1Q15_ = toQ15(b1);
+        outLpfB2Q15_ = toQ15(b2);
+        outLpfA1Q15_ = toQ15(a1);
+        outLpfA2Q15_ = toQ15(a2);
+
+        // Stability guard. |a2| >= 1 places a pole on or outside the unit
+        // circle; a saturated recurrence would then ring forever. Over the
+        // supported 8 000-48 000 Hz range |a2| stays <= 0.65, so this never
+        // fires in practice; if a future rate ever needed it, dropping the LPF
+        // is the documented degradation (a missing slope, never a blow-up).
+        if (outLpfA2Q15_ >= 32768 || outLpfA2Q15_ <= -32768) {
+            outLpfB0Q15_ = 0;
+            outLpfB1Q15_ = 0;
+            outLpfB2Q15_ = 0;
+            outLpfA1Q15_ = 0;
+            outLpfA2Q15_ = 0;
+            outputLpfActive_ = false;
+            outLpfCutoffHz_ = 0.0f;
+        }
+    }
+
+    void ApuCore::resetOutputFilterState() {
+        outHpf1PrevInQ15_ = 0;
+        outHpf1PrevOutQ15_ = 0;
+        outHpf2PrevInQ15_ = 0;
+        outHpf2PrevOutQ15_ = 0;
+        outLpfX1Q15_ = 0;
+        outLpfX2Q15_ = 0;
+        outLpfY1Q15_ = 0;
+        outLpfY2Q15_ = 0;
+    }
+
+    int32_t ApuCore::processOutputFilterChain(int32_t inputQ15) {
+        // HPF 90 Hz, then HPF 440 Hz: the same difference equation as the
+        // historical one-pole, `y[n] = x[n] - x[n-1] + R*y[n-1]`. The Q30
+        // feedback is divided by 32768 rather than shifted: the shift
+        // truncates toward minus infinity, which freezes the decay on a
+        // permanent DC offset for every negative y (see the historical
+        // comment this replaces). Division truncates toward zero and
+        // guarantees |y| drops by at least one LSB per silent sample.
+        int32_t hpf1 = inputQ15 - outHpf1PrevInQ15_ +
+                       (int32_t)(((int64_t)outHpf1RQ15_ *
+                                  (int64_t)outHpf1PrevOutQ15_) / 32768);
+        if (hpf1 > 32767) hpf1 = 32767;
+        if (hpf1 < -32768) hpf1 = -32768;
+        outHpf1PrevInQ15_ = inputQ15;
+        outHpf1PrevOutQ15_ = hpf1;
+
+        int32_t hpf2 = hpf1 - outHpf2PrevInQ15_ +
+                       (int32_t)(((int64_t)outHpf2RQ15_ *
+                                  (int64_t)outHpf2PrevOutQ15_) / 32768);
+        if (hpf2 > 32767) hpf2 = 32767;
+        if (hpf2 < -32768) hpf2 = -32768;
+        outHpf2PrevInQ15_ = hpf1;
+        outHpf2PrevOutQ15_ = hpf2;
+
+        if (!outputLpfActive_) {
+            return hpf2;
+        }
+
+        // Butterworth biquad:
+        //   y = b0*x + b1*x1 + b2*x2 - a1*y1 - a2*y2, all Q15, then /32768.
+        // int64 is required: five Q15 terms at full scale overflow int32
+        // (`b1` alone reaches ~52 000). The state is saturated so a corrupt
+        // coefficient can never wrap the recursion.
+        const int64_t acc = (int64_t)outLpfB0Q15_ * (int64_t)hpf2 +
+                            (int64_t)outLpfB1Q15_ * (int64_t)outLpfX1Q15_ +
+                            (int64_t)outLpfB2Q15_ * (int64_t)outLpfX2Q15_ -
+                            (int64_t)outLpfA1Q15_ * (int64_t)outLpfY1Q15_ -
+                            (int64_t)outLpfA2Q15_ * (int64_t)outLpfY2Q15_;
+        int32_t y = (int32_t)(acc / 32768);
+        if (y > 32767) y = 32767;
+        if (y < -32768) y = -32768;
+
+        outLpfX2Q15_ = outLpfX1Q15_;
+        outLpfX1Q15_ = hpf2;
+        outLpfY2Q15_ = outLpfY1Q15_;
+        outLpfY1Q15_ = y;
+        return y;
+    }
+
+    int32_t ApuCore::applyOutputStage(int32_t inputQ15) {
+        // E2/S1: `Nes`/`Hybrid` replace the historical one-pole with their
+        // output chain on the SUMMED mix. The active flag was resolved on the
+        // configuration change, so this branch is the whole per-sample cost of
+        // selecting the stage.
+        if (outputFilterActive_) {
+            return processOutputFilterChain(inputQ15);
+        }
+
+        // Historical single-pole HPF — the frozen `Legacy` arithmetic. It also
+        // carries `Legacy` on builds with no float core, where the integer
+        // body is the only one compiled, so every line below must stay
+        // byte-identical to what it replaced.
+        int32_t hpfOutQ15;
+        if (hpfEnabled_) {
+            // Compute R * y[n-1] in Q30, then shift to Q15.
+            // The shift truncates TOWARD ZERO, not arithmetically: an
+            // arithmetic >>15 has a fixed point for every negative y with
+            // |y| < 32768/(1-R) (~200 at the default R), so a voice that
+            // went silent froze the blocker on a permanent -199 DC offset
+            // instead of decaying. Truncation toward zero mirrors the
+            // float path's int conversion and guarantees |y| drops by at
+            // least one LSB per silent sample, whatever the coefficient.
+            int64_t feedback = (int64_t)hpfRQ15_ * (int64_t)hpfPrevOutQ15;
+            int32_t feedbackQ15 = (int32_t)(feedback / 32768);
+
+            // HPF difference equation
+            hpfOutQ15 = inputQ15 - hpfPrevInQ15 + feedbackQ15;
+
+            // Saturating clamp to prevent overflow artifacts
+            if (hpfOutQ15 > 32767) hpfOutQ15 = 32767;
+            if (hpfOutQ15 < -32768) hpfOutQ15 = -32768;
+
+            // Update state for next sample
+            hpfPrevInQ15 = inputQ15;
+            hpfPrevOutQ15 = hpfOutQ15;
+        } else {
+            hpfOutQ15 = inputQ15;
+            hpfPrevInQ15 = inputQ15;
+            hpfPrevOutQ15 = 0;
+        }
+        return hpfOutQ15;
     }
 
     // Hito 4 M14: bundled per-voice NES options.
@@ -1207,15 +1412,24 @@ namespace pixelroot32::audio {
         }
 
         // (3) Reset the output stage: the HPF recursion of one core holds no
-        // meaning for the other, so both pairs start clean.
+        // meaning for the other, so both pairs start clean. E2/S1 adds the
+        // profile chain's four recursions to that reset: a stale state paired
+        // with the incoming profile's coefficients would ring.
         hpfPrevIn = hpfPrevOut = 0.0f;
         hpfPrevInQ15 = hpfPrevOutQ15 = 0;
+        resetOutputFilterState();
 
         // (4) Commit. Voices keep playing: no reset(), no `enabled = false`.
         // Character is NOT re-applied to sounding voices — only notes started
         // after this point run `applyProfileCharacter` with the new profile
         // (S5/S6).
         profile_ = profile;
+
+        // (5) The output chain belongs to the profile (S1), so its activation
+        // follows the commit. Coefficients are already resolved for this rate;
+        // only the active flag and the corners can change here. The caller's
+        // `setHpfCutoffHz` override, if any, still wins (S8).
+        recomputeOutputFilterCoefficients();
     }
 
     SoundProfile ApuCore::getSoundProfile() const { return profile_; }
@@ -1235,6 +1449,10 @@ namespace pixelroot32::audio {
     }
 
     void ApuCore::setHpfCutoffHz(float cutoffHz) {
+        // S8: any explicit corner is the caller's decision about the output
+        // stage, so it outranks the profile chain from here on — the profile
+        // does not install its chain over it. `reset()` clears the override.
+        hpfCutoffOverridden_ = true;
         if (!(cutoffHz > 0.0f)) {   // <= 0 or NaN: bypass
             hpfCutoffHz_ = 0.0f;
             hpfEnabled_ = false;
@@ -1243,6 +1461,7 @@ namespace pixelroot32::audio {
             hpfEnabled_ = true;
         }
         recomputeHpfCoefficients();
+        recomputeOutputFilterCoefficients();
     }
 
     void ApuCore::reset() {
@@ -1260,6 +1479,12 @@ namespace pixelroot32::audio {
         hpfCutoffHz_ = -1.0f;
         hpfEnabled_ = true;
         recomputeHpfCoefficients();
+        // E2/S1: `reset()` clears the caller's corner override (S8), so the
+        // profile owns the stage again; the recursion starts clean. The
+        // profile selector itself is configuration and survives (S4).
+        hpfCutoffOverridden_ = false;
+        resetOutputFilterState();
+        recomputeOutputFilterCoefficients();
         softClipMode_ = SoftClipMode::Rational;  // Hito 4 M11
         currentPeak = 0.0f;
         samplesSinceLog = 0;
@@ -2201,6 +2426,97 @@ namespace pixelroot32::audio {
     // observable half of D-3 tier 1 (there is no setter to test against).
     MixerCurve ApuCore::getMixerCurveForTesting() const {
         return profileMixerCurve(profile_);
+    }
+
+    // E2/S1: the output chain is profile character with no public setter, so
+    // these accessors are the observable half of the API.
+    bool ApuCore::isOutputFilterChainActiveForTesting() const {
+        return outputFilterActive_;
+    }
+
+    bool ApuCore::isOutputFilterLpfActiveForTesting() const {
+        return outputLpfActive_;
+    }
+
+    int32_t ApuCore::getOutputFilterHpf1RQ15ForTesting() const {
+        return outHpf1RQ15_;
+    }
+
+    int32_t ApuCore::getOutputFilterHpf2RQ15ForTesting() const {
+        return outHpf2RQ15_;
+    }
+
+    int32_t ApuCore::getOutputFilterLpfB0Q15ForTesting() const {
+        return outLpfB0Q15_;
+    }
+
+    int32_t ApuCore::getOutputFilterLpfB1Q15ForTesting() const {
+        return outLpfB1Q15_;
+    }
+
+    int32_t ApuCore::getOutputFilterLpfB2Q15ForTesting() const {
+        return outLpfB2Q15_;
+    }
+
+    int32_t ApuCore::getOutputFilterLpfA1Q15ForTesting() const {
+        return outLpfA1Q15_;
+    }
+
+    int32_t ApuCore::getOutputFilterLpfA2Q15ForTesting() const {
+        return outLpfA2Q15_;
+    }
+
+    float ApuCore::getOutputFilterHpf1CutoffHzForTesting() const {
+        return outHpf1CutoffHz_;
+    }
+
+    float ApuCore::getOutputFilterHpf2CutoffHzForTesting() const {
+        return outHpf2CutoffHz_;
+    }
+
+    float ApuCore::getOutputFilterLpfCutoffHzForTesting() const {
+        return outLpfCutoffHz_;
+    }
+
+    int32_t ApuCore::getOutputFilterStateMaxAbsForTesting() const {
+        const int32_t values[] = {
+            hpfPrevInQ15,      hpfPrevOutQ15,
+            outHpf1PrevInQ15_, outHpf1PrevOutQ15_,
+            outHpf2PrevInQ15_, outHpf2PrevOutQ15_,
+            outLpfX1Q15_,      outLpfX2Q15_,
+            outLpfY1Q15_,      outLpfY2Q15_,
+        };
+        int32_t worst = 0;
+        for (int32_t v : values) {
+            const int32_t magnitude = (v < 0) ? -v : v;
+            if (magnitude > worst) {
+                worst = magnitude;
+            }
+        }
+        return worst;
+    }
+
+    void ApuCore::resetOutputFilterStateForTesting() {
+        // The historical one-pole is part of the stage too, so a test that
+        // compares whole buffers starts it from zero as well.
+        hpfPrevIn = 0.0f;
+        hpfPrevOut = 0.0f;
+        hpfPrevInQ15 = 0;
+        hpfPrevOutQ15 = 0;
+        resetOutputFilterState();
+    }
+
+    void ApuCore::processOutputStageForTesting(int16_t* buffer, int length) {
+        if (buffer == nullptr || length <= 0) {
+            return;
+        }
+        for (int i = 0; i < length; ++i) {
+            int32_t sample = applyOutputStage(static_cast<int32_t>(buffer[i]));
+            if (sample > 32767) sample = 32767;
+            if (sample < -32768) sample = -32768;
+            buffer[i] = apply_master_bitcrush(static_cast<int16_t>(sample),
+                                              masterBitcrushBits_);
+        }
     }
 #endif
 
@@ -4130,39 +4446,15 @@ namespace pixelroot32::audio {
                 }
             }
 
-            // Q15 HPF: y[n] = x[n] - x[n-1] + (R * y[n-1])
-            // Uses Q15 fixed-point to avoid soft-float on RISC-V cores.
-            // Hito 4 M10: `hpfRQ15_` mirrors the float coefficient, derived
-            // from the configured corner. Default 32604 = 0.995 * 32768,
-            // the historical value (~35.2 Hz at 44100, ~17.6 Hz at 22050).
-            int32_t hpfOutQ15;
-            if (hpfEnabled_) {
-                // Compute R * y[n-1] in Q30, then shift to Q15.
-                // The shift truncates TOWARD ZERO, not arithmetically: an
-                // arithmetic >>15 has a fixed point for every negative y with
-                // |y| < 32768/(1-R) (~200 at the default R), so a voice that
-                // went silent froze the blocker on a permanent -199 DC offset
-                // instead of decaying. Truncation toward zero mirrors the
-                // float path's int conversion and guarantees |y| drops by at
-                // least one LSB per silent sample, whatever the coefficient.
-                int64_t feedback = (int64_t)hpfRQ15_ * (int64_t)hpfPrevOutQ15;
-                int32_t feedbackQ15 = (int32_t)(feedback / 32768);
-
-                // HPF difference equation
-                hpfOutQ15 = inputQ15 - hpfPrevInQ15 + feedbackQ15;
-
-                // Saturating clamp to prevent overflow artifacts
-                if (hpfOutQ15 > 32767) hpfOutQ15 = 32767;
-                if (hpfOutQ15 < -32768) hpfOutQ15 = -32768;
-
-                // Update state for next sample
-                hpfPrevInQ15 = inputQ15;
-                hpfPrevOutQ15 = hpfOutQ15;
-            } else {
-                hpfOutQ15 = inputQ15;
-                hpfPrevInQ15 = inputQ15;
-                hpfPrevOutQ15 = 0;
-            }
+            // E2/S1: the output stage is profile character. `Nes`/`Hybrid`
+            // run the shared three-stage chain (HPF 90 -> HPF 440 -> LPF) on
+            // the summed mix; `Legacy` keeps the historical single-pole HPF
+            // byte for byte, on every build. Which one runs was resolved on
+            // the configuration change, so this is a flag test here — no
+            // coefficient is computed per sample. `applyOutputStage` owns the
+            // arithmetic, including the truncate-toward-zero reasoning the
+            // one-pole depends on.
+            int32_t hpfOutQ15 = applyOutputStage(inputQ15);
 
             // Hito 5 M12: the fixed -6 dB headroom pad (`>>1`, Q15 -> Q14) is
             // gone; this path now lands at the same level as the float one.

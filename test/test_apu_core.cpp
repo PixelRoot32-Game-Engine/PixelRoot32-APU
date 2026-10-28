@@ -28,11 +28,18 @@
 
 using namespace pixelroot32::audio;
 
-// S8: with the 64-slot queue the production ABI measures 13 200 B; this file
-// compiles with UNIT_TEST=1, so what is pinned here is the 13 224 B test-build
-// size (the 4 B test counter). The cap covers both.
-static_assert(sizeof(ApuCore) <= 13312,
-              "ApuCore must stay within the 13 KB budget (host ABI, queue 64)");
+// S8: the production ABI measures 13 344 B after E2; this file compiles with
+// UNIT_TEST=1, so what is pinned here is the 13 368 B test-build size (the
+// test counters). 13 368 rounds up to 13 376, the pin below.
+//
+// E2/S1 added the `Nes`/`Hybrid` output filter chain state (+80 B): two
+// high-pass poles, five Butterworth coefficients in Q15 int32 (the LPF's b1
+// does not fit int16) and eight recursion registers. It does not fit the old
+// 48 B of slack, so the pin moves with the exact byte counts in the message
+// instead of any unrelated state being trimmed.
+static_assert(sizeof(ApuCore) <= 13376,
+              "ApuCore must stay within the 13 376 B pin (UNIT_TEST build: "
+              "13 368 B, production: 13 344 B; E2 output-filter state +80 B)");
 
 // Required Unity setup/teardown
 void setUp(void) {
