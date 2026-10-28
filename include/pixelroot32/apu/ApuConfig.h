@@ -37,8 +37,8 @@
  *   AUDIO_SEQUENCER_MAX_NOTES   Max sequencer notes per frame [1, 1024]
  *                               (default 32, see ApuCore.h).
  *
- *   AUDIO_COMMAND_QUEUE_CAPACITY  Command queue capacity [128, 1024]
- *                               (default 128, see AudioCommandQueue.h).
+ *   AUDIO_COMMAND_QUEUE_CAPACITY  Command queue capacity [32, 64]
+ *                               (default 64, see AudioCommandQueue.h).
  *
  *   PIXELROOT32_DEBUG_MODE      Enables the diagnostic log call sites
  *                               (routed through the log hook below).

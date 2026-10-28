@@ -19,6 +19,15 @@ namespace pixelroot32::audio {
      * Supports one producer (game/logic thread) and a single consumer (the audio thread).
      * Concurrent multi-producer use is not supported by this algorithm.
      * 
+     * Memory: one slot holds a whole AudioCommand (sizeof(AudioCommand) bytes,
+     * 144 B on the host ABI). The ring keeps one slot free to distinguish full
+     * from empty, so a CAPACITY of 64 accepts 63 commands. The accepted range is
+     * 32-64, and its ceiling is set by RAM, not by throughput: the real command
+     * rate is tens per second, so the former 128 doubled the dominant cost of
+     * ApuCore without adding headroom anyone used. Raising the ceiling means
+     * raising the 9 KB budget below in the same commit, after measuring the new
+     * slot size: a capacity the budget cannot pay for is not a capacity.
+     * 
      * Drop policy: When the queue is full, the newest command is silently dropped and
      * the droppedCommands counter is incremented. Callers can monitor this via
      * getDroppedCommands() for diagnostics.
@@ -29,17 +38,25 @@ namespace pixelroot32::audio {
      */
     class AudioCommandQueue {
     public:
-        // Configurable capacity: 128-1024. Default 128 for memory efficiency.
-        // Can be increased for high-throughput use cases at compile time.
+        // Configurable capacity: 32-64. Default 64 (see the class comment).
+        // The ceiling is the RAM budget below, not a throughput choice.
         #ifndef AUDIO_COMMAND_QUEUE_CAPACITY
         /** @brief Default queue capacity in commands. */
-        static constexpr size_t CAPACITY = 128;
+        static constexpr size_t CAPACITY = 64;
         #else
-        static_assert(AUDIO_COMMAND_QUEUE_CAPACITY >= 128 && AUDIO_COMMAND_QUEUE_CAPACITY <= 1024,
-            "AUDIO_COMMAND_QUEUE_CAPACITY must be between 128 and 1024");
+        static_assert(AUDIO_COMMAND_QUEUE_CAPACITY >= 32 && AUDIO_COMMAND_QUEUE_CAPACITY <= 64,
+            "AUDIO_COMMAND_QUEUE_CAPACITY must be between 32 and 64");
         /** @brief User-configured queue capacity in commands. */
         static constexpr size_t CAPACITY = AUDIO_COMMAND_QUEUE_CAPACITY;
         #endif
+
+        // S7/S8 RAM budget: 64 slots x 144 B = 9 216 B is the whole allowance.
+        // Today the range above already implies this, but the assert stays as the
+        // guard that catches a growing AudioCommand: that is how the budget would
+        // be blown without anyone touching the capacity. Affirmed here rather than
+        // in a test so every consumer build, not just the suite, refuses it.
+        static_assert(CAPACITY * sizeof(AudioCommand) <= 9216,
+                      "command queue must stay within the 9 KB RAM budget");
 
         /** @brief Default constructor. Initializes head, tail, and dropped counters to zero. */
         AudioCommandQueue() : head(0), tail(0), droppedCommands(0) {}

@@ -26,6 +26,12 @@
 
 using namespace pixelroot32::audio;
 
+// S8: with the 64-slot queue the production ABI measures 13 200 B; this file
+// compiles with UNIT_TEST=1, so what is pinned here is the 13 224 B test-build
+// size (the 4 B test counter). The cap covers both.
+static_assert(sizeof(ApuCore) <= 13312,
+              "ApuCore must stay within the 13 KB budget (host ABI, queue 64)");
+
 // Required Unity setup/teardown
 void setUp(void) {
     test_setup();
@@ -153,8 +159,8 @@ void test_apu_core_submit_command_queue_full(void) {
     cmd.event.duration = 0.1f;
     cmd.event.volume = 0.8f;
 
-    // Try to submit more commands than queue capacity
-    // Queue capacity is 128, so this should eventually fail
+    // Try to submit more commands than queue capacity: 200 submissions always
+    // overflow the ring regardless of the configured depth.
     int successCount = 0;
     for (int i = 0; i < 200; i++) {
         if (apu.submitCommand(cmd)) {
