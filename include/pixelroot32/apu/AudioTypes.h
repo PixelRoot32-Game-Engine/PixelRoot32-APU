@@ -807,6 +807,16 @@ namespace pixelroot32::audio {
         uint8_t noiseLutIndex = 255;
     };
 
+    /**
+     * @enum SoundProfile
+     * @brief Named character sets applied to every voice.
+     *
+     * `Legacy` is the frozen compatibility contract: it reproduces the 2.0.0
+     * sound. `Nes` and `Hybrid` are aliases of `Legacy` until their character
+     * set lands, so selecting them must not change a single sample yet.
+     */
+    enum class SoundProfile : uint8_t { Legacy = 0, Nes = 1, Hybrid = 2 };
+
     enum class AudioCommandType : uint8_t {
         PLAY_EVENT,
         STOP_CHANNEL,
@@ -833,6 +843,11 @@ namespace pixelroot32::audio {
          * audio command queue. Reads `channelIndex` and `nesOptions`.
          */
         SET_NES_OPTIONS,
+        /**
+         * S4: apply a `SoundProfile` from the audio command queue. Reads
+         * `soundProfile`. See `ApuCore::setSoundProfile`.
+         */
+        SET_SOUND_PROFILE,
     };
 
     // Forward declaration for MusicTrack
@@ -857,6 +872,16 @@ namespace pixelroot32::audio {
         static constexpr size_t MAX_SUB_TRACKS = 3;
         /** Used when type == SET_MASTER_BITCRUSH (clamped 0–15; 0 = off). */
         uint8_t masterBitcrushBits = 0;
+        /**
+         * Used when type == SET_SOUND_PROFILE: profile to apply.
+         *
+         * Declared here rather than beside `nesLengthHalt` because this is the
+         * only free slot: the byte lands in the alignment padding before
+         * `seekOffsetTicks`, so `sizeof(AudioCommand)` stays at 144. Taking the
+         * byte next to `nesLengthHalt` instead would push `nesOptions` past its
+         * 8-byte boundary and grow every queue slot to 152.
+         */
+        uint8_t soundProfile = 0;
         /** Used when type == MUSIC_SEEK: elapsed ticks from music play start. */
         uint64_t seekOffsetTicks = 0;
         /** Used when type == TRIGGER_NES_LENGTH: LUT index (clamped 0–31). */
@@ -874,6 +899,7 @@ namespace pixelroot32::audio {
         AudioCommand()
             : type(AudioCommandType::STOP_CHANNEL),
               masterBitcrushBits(0),
+              soundProfile(0),
               seekOffsetTicks(0),
               nesLengthIndex(0),
               nesLengthHalt(false),

@@ -23,14 +23,22 @@
  *                               either path (e.g. -DPR32_APU_HAS_FPU=0 to
  *                               exercise the Q15 path in native tests).
  *
+ *   PR32_APU_ENABLE_LEGACY_FLOAT 1 = compile the frozen float render path
+ *                               (the `Legacy` profile on FPU targets), 0 =
+ *                               compile only the integer/Q15 core. Defaults
+ *                               to PR32_APU_HAS_FPU, so a build that does not
+ *                               set it keeps today's behaviour; on an FPU
+ *                               target `-DPR32_APU_ENABLE_LEGACY_FLOAT=0`
+ *                               yields an integer-only binary.
+ *
  *   PR32_APU_ENABLE_PROFILING   1 = capture peak/clip snapshots into the
  *                               ApuCore profiling ring (default 0).
  *
  *   AUDIO_SEQUENCER_MAX_NOTES   Max sequencer notes per frame [1, 1024]
  *                               (default 32, see ApuCore.h).
  *
- *   AUDIO_COMMAND_QUEUE_CAPACITY  Command queue capacity [128, 1024]
- *                               (default 128, see AudioCommandQueue.h).
+ *   AUDIO_COMMAND_QUEUE_CAPACITY  Command queue capacity [32, 64]
+ *                               (default 64, see AudioCommandQueue.h).
  *
  *   PIXELROOT32_DEBUG_MODE      Enables the diagnostic log call sites
  *                               (routed through the log hook below).
@@ -54,6 +62,14 @@
     #else
         #define PR32_APU_HAS_FPU 1
     #endif
+#endif
+
+// ---------------------------------------------------------------------------
+// Legacy float render path
+// ---------------------------------------------------------------------------
+#ifndef PR32_APU_ENABLE_LEGACY_FLOAT
+    /** @brief Compiles the frozen float render path (Legacy on FPU targets). */
+    #define PR32_APU_ENABLE_LEGACY_FLOAT PR32_APU_HAS_FPU
 #endif
 
 // ---------------------------------------------------------------------------

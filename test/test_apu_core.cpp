@@ -26,6 +26,12 @@
 
 using namespace pixelroot32::audio;
 
+// S8: with the 64-slot queue the production ABI measures 13 200 B; this file
+// compiles with UNIT_TEST=1, so what is pinned here is the 13 224 B test-build
+// size (the 4 B test counter). The cap covers both.
+static_assert(sizeof(ApuCore) <= 13312,
+              "ApuCore must stay within the 13 KB budget (host ABI, queue 64)");
+
 // Required Unity setup/teardown
 void setUp(void) {
     test_setup();
@@ -153,8 +159,8 @@ void test_apu_core_submit_command_queue_full(void) {
     cmd.event.duration = 0.1f;
     cmd.event.volume = 0.8f;
 
-    // Try to submit more commands than queue capacity
-    // Queue capacity is 128, so this should eventually fail
+    // Try to submit more commands than queue capacity: 200 submissions always
+    // overflow the ring regardless of the configured depth.
     int successCount = 0;
     for (int i = 0; i < 200; i++) {
         if (apu.submitCommand(cmd)) {
@@ -5505,6 +5511,306 @@ void test_nes_options_reflect_nes_safe_boundary(void) {
 }
 
 // =============================================================================
+// S4: sound profiles
+// =============================================================================
+//
+// The profile is global configuration: one selector per core, applied to every
+// voice. These cases pin the API surface (default, round trip, rejection of
+// unknown values, queued path, survival of `init`) but deliberately say nothing
+// about which render body the profile picks — that dispatch is T4.
+
+void test_sound_profile_defaults_to_legacy(void) {
+    ApuCore apu;
+    TEST_ASSERT_EQUAL_INT((int)SoundProfile::Legacy,
+                          (int)apu.getSoundProfile());
+}
+
+void test_sound_profile_round_trips(void) {
+    ApuCore apu;
+    apu.init(44100);
+    apu.reset();
+
+    apu.setSoundProfile(SoundProfile::Nes);
+    TEST_ASSERT_EQUAL_INT((int)SoundProfile::Nes, (int)apu.getSoundProfile());
+    apu.setSoundProfile(SoundProfile::Hybrid);
+    TEST_ASSERT_EQUAL_INT((int)SoundProfile::Hybrid, (int)apu.getSoundProfile());
+    apu.setSoundProfile(SoundProfile::Legacy);
+    TEST_ASSERT_EQUAL_INT((int)SoundProfile::Legacy, (int)apu.getSoundProfile());
+}
+
+// Garbage must be ignored, not clamped: 7 is not "nearest profile" and must
+// leave whatever was configured untouched.
+void test_sound_profile_ignores_unknown_value(void) {
+    ApuCore apu;
+    apu.init(44100);
+    apu.reset();
+
+    apu.setSoundProfile(SoundProfile::Nes);
+    apu.setSoundProfile(static_cast<SoundProfile>(7));
+
+    TEST_ASSERT_EQUAL_INT((int)SoundProfile::Nes, (int)apu.getSoundProfile());
+}
+
+// Game-thread callers reach the setter through the queue, exactly like
+// SET_NES_OPTIONS; the command must land on the same state.
+void test_sound_profile_command_applies_on_render(void) {
+    ApuCore apu;
+    apu.init(44100);
+    apu.reset();
+
+    AudioCommand cmd{};
+    cmd.type = AudioCommandType::SET_SOUND_PROFILE;
+    cmd.soundProfile = static_cast<uint8_t>(SoundProfile::Nes);
+    TEST_ASSERT_TRUE(apu.submitCommand(cmd));
+
+    int16_t buffer[64] = {0};
+    apu.generateSamples(buffer, 64);
+
+    TEST_ASSERT_EQUAL_INT((int)SoundProfile::Nes, (int)apu.getSoundProfile());
+}
+
+// The profile is configuration, not state: init() restarts the stream but must
+// keep what the caller selected.
+void test_sound_profile_survives_init(void) {
+    ApuCore apu;
+    apu.setSoundProfile(SoundProfile::Hybrid);
+    apu.init(48000);
+
+    TEST_ASSERT_EQUAL_INT((int)SoundProfile::Hybrid, (int)apu.getSoundProfile());
+}
+
+// =============================================================================
+// S3 / S5 / S6: core dispatch, profile character and the hot switch
+// =============================================================================
+//
+// Both suite binaries run this file, so every case below has to hold whichever
+// core the build contains: `test_apu_core` has the float body, while
+// `test_apu_core_integer` is built with PR32_APU_HAS_FPU=0. `Nes` and `Hybrid`
+// select the integer core in both builds (S3) and, in E0, are exact aliases of
+// `Legacy`'s sound, so no case here may expect them to differ audibly.
+
+// Queues one looping SINE note. Split from the render calls so the caller can
+// put a `setSoundProfile` call between two blocks: a profile change cannot land
+// mid-buffer, only at a render-call boundary.
+static void queueSustainedSine(ApuCore& apu, float volume) {
+    AudioCommand cmd{};
+    cmd.type = AudioCommandType::PLAY_EVENT;
+    cmd.event.type = WaveType::SINE;
+    cmd.event.frequency = 440.0f;
+    cmd.event.duration = 0.0f;
+    cmd.event.volume = volume;
+    cmd.event.duty = 0.5f;
+    cmd.event.loop = true;
+    TEST_ASSERT_TRUE(apu.submitCommand(cmd));
+}
+
+static int32_t peakMagnitude(const int16_t* pcm, int length) {
+    int32_t peak = 0;
+    for (int i = 0; i < length; ++i) {
+        const int32_t mag = (pcm[i] < 0) ? -(int32_t)pcm[i] : (int32_t)pcm[i];
+        if (mag > peak) peak = mag;
+    }
+    return peak;
+}
+
+// Largest |x[n] - x[n-1]| in [from, to). Adjacent-sample steps are what a click
+// looks like in PCM; a level jump shows up here and nowhere else.
+static int32_t maxAdjacentStep(const int16_t* pcm, int from, int to) {
+    int32_t worst = 0;
+    for (int i = (from > 0 ? from : 1); i < to; ++i) {
+        const int32_t step = (int32_t)pcm[i] - (int32_t)pcm[i - 1];
+        const int32_t mag = (step < 0) ? -step : step;
+        if (mag > worst) worst = mag;
+    }
+    return worst;
+}
+
+// S5: `applyProfileCharacter` runs at the very end of `initVoiceFromEvent`,
+// after the `nesAccurate` / `initNesSafe` block. The counter is the structural
+// proof: exactly one application per note-on, and the canonical safe state the
+// block installed is still what the voice reports afterwards.
+void profile_apply_runs_after_nes_accurate_init(void) {
+    ApuCore apu;
+    apu.init(44100);
+    apu.reset();
+
+    TEST_ASSERT_EQUAL_UINT32(0, apu.getProfileApplyCountForTesting());
+
+    InstrumentPreset preset = INSTR_PULSE_LEAD;
+    preset.nesAccurate = true;
+
+    int16_t buffer[256] = {0};
+    const int slot = playPresetNote(apu, buffer, WaveType::PULSE, preset);
+    TEST_ASSERT_EQUAL_UINT32(1, apu.getProfileApplyCountForTesting());
+    // Ordering: the profile did not undo the safe state the note left behind.
+    assertNesSafeCommon(apu, slot);
+
+    // Silence the voice without starting a note: the counter must not move.
+    AudioCommand stop{};
+    stop.type = AudioCommandType::STOP_CHANNEL;
+    stop.channelIndex = (uint8_t)slot;
+    TEST_ASSERT_TRUE(apu.submitCommand(stop));
+    apu.generateSamples(buffer, 64);
+    TEST_ASSERT_EQUAL_UINT32(1, apu.getProfileApplyCountForTesting());
+
+    // A second note-on applies character once more — exactly once, not once
+    // per voice touched or per render call.
+    const int slot2 = playPresetNote(apu, buffer, WaveType::PULSE, preset);
+    TEST_ASSERT_EQUAL_UINT32(2, apu.getProfileApplyCountForTesting());
+    assertNesSafeCommon(apu, slot2);
+}
+
+// S3: in E0 `Nes` and `Hybrid` are aliases — same core, same bytes. This is
+// also the E0 promise of S15.3, pinned where the dispatch lives.
+void profile_nes_and_hybrid_render_identical_bytes(void) {
+    constexpr int kSamples = 4096;
+    static int16_t nes[kSamples];
+    static int16_t hybrid[kSamples];
+
+    auto render = [](SoundProfile profile, int16_t* out) {
+        ApuCore apu;
+        apu.init(44100);
+        apu.reset();
+        apu.setSoundProfile(profile);
+
+        AudioCommand cmd{};
+        cmd.type = AudioCommandType::PLAY_EVENT;
+        cmd.event.type = WaveType::PULSE;
+        cmd.event.frequency = 440.0f;
+        cmd.event.duration = 1.0f;
+        cmd.event.volume = 0.8f;
+        cmd.event.duty = 0.25f;
+        cmd.event.loop = true;
+        TEST_ASSERT_TRUE(apu.submitCommand(cmd));
+        apu.generateSamples(out, kSamples);
+    };
+
+    render(SoundProfile::Nes, nes);
+    render(SoundProfile::Hybrid, hybrid);
+
+    // Guard against comparing two silent buffers: two equal silences prove
+    // nothing about the core, only that nothing rendered.
+    TEST_ASSERT_TRUE(peakMagnitude(nes, kSamples) > 1000);
+    TEST_ASSERT_EQUAL_INT(0, std::memcmp(nes, hybrid, sizeof(nes)));
+}
+
+// S6: the measurable no-click criterion. 0.5 s at 44100 Hz, profile switched
+// at the midpoint, which is a call boundary (one block per render call).
+//
+// The note runs at full volume on purpose: at lower levels a lost envelope
+// mirror only drops the output part-way and the seam stays under the
+// threshold, so the case would pass for the wrong reason.
+void profile_hot_switch_does_not_click(void) {
+    constexpr int kHalf = 11025;          // 0.25 s each; 0.5 s total
+    static int16_t pcm[2 * kHalf];
+
+    ApuCore apu;
+    apu.init(44100);
+    apu.reset();
+    queueSustainedSine(apu, 1.0f);
+
+    apu.generateSamples(pcm, kHalf);          // Legacy core
+    apu.setSoundProfile(SoundProfile::Nes);   // switch, voices keep playing
+    apu.generateSamples(pcm + kHalf, kHalf);  // integer core
+
+    // No rails anywhere in the render.
+    int rails = 0;
+    for (int i = 0; i < 2 * kHalf; ++i) {
+        if (pcm[i] == 32767 || pcm[i] == -32767) ++rails;
+    }
+    TEST_ASSERT_EQUAL_INT(0, rails);
+
+    // The seam itself: the eight differences that straddle the switch.
+    const int32_t seam = maxAdjacentStep(pcm, kHalf, kHalf + 8);
+    TEST_ASSERT_TRUE(seam < (32767 / 4));
+
+    // The note must still be sounding after the switch, otherwise "no click"
+    // could be satisfied by an output that simply went silent.
+    TEST_ASSERT_TRUE(peakMagnitude(pcm + kHalf, kHalf) > 1000);
+}
+
+// L8.3: the test accessors must report the mirrors of the core that is
+// actually rendering, not the ones `PR32_APU_HAS_FPU` implies. With `Nes` the
+// integer core renders, so `basePhaseIncQ32` / `phaseQ32` are authoritative
+// and the float `frequency` / `phase` mirrors stay at their note-on values.
+void profile_accessors_follow_the_active_core(void) {
+    ApuCore apu;
+    apu.init(44100);
+    apu.reset();
+    apu.setSoundProfile(SoundProfile::Nes);
+
+    AudioCommand cmd{};
+    cmd.type = AudioCommandType::PLAY_EVENT;
+    cmd.event.type = WaveType::PULSE;
+    cmd.event.frequency = 440.0f;
+    cmd.event.duration = 1.0f;
+    cmd.event.volume = 0.5f;
+    cmd.event.duty = 0.5f;
+    cmd.event.sweepEndHz = 880.0f;
+    cmd.event.sweepDurationSec = 0.1f;  // 4410 samples
+    cmd.event.loop = false;
+    cmd.event.sweepCurve = SweepCurve::Linear;
+    TEST_ASSERT_TRUE(apu.submitCommand(cmd));
+
+    int16_t buffer[256] = {0};
+    // ~52% of the sweep: the single-segment sweep writes `basePhaseIncQ32`
+    // only, so a readout taken from the float mirror would still say 440 Hz.
+    for (int n = 0; n < 9; ++n) {
+        apu.generateSamples(buffer, 256);
+    }
+
+    const int slot = find_first_enabled_sfx_slot(apu);
+    TEST_ASSERT_TRUE(slot >= 0);
+
+    // Linear midpoint of 440 -> 880 Hz is 660 Hz.
+    const float hz = apu.getVoiceFrequencyForTesting(slot);
+    TEST_ASSERT_FLOAT_WITHIN(40.0f, 660.0f, hz);
+
+    // Phase: the integer core advances only `phaseQ32`, so a float-mirror
+    // readout would be stuck at the note-on value of 0.
+    const float phase = apu.getVoicePhaseForTesting(slot);
+    TEST_ASSERT_TRUE(phase > 0.0f);
+    TEST_ASSERT_TRUE(phase < 1.0f);
+
+    // Duty: both mirrors agree here (no duty sweep), so this pins that the
+    // accessor still reports the sounding duty rather than a stale field.
+    TEST_ASSERT_FLOAT_WITHIN(0.01f, 0.5f, apu.getVoiceDutyCycleForTesting(slot));
+}
+
+// S6 idempotence: selecting the profile already in force must leave every bit
+// of render state alone. The strongest form of that claim is byte equality
+// against a reference run that never repeats the call — a reset of the output
+// stage or of an envelope mirror would show up as a difference.
+void profile_setter_is_idempotent_for_state(void) {
+    constexpr int kBlock = 11025;
+    static int16_t reference[2 * kBlock];
+    static int16_t repeated[2 * kBlock];
+
+    auto render = [](int16_t* out, bool repeatSetter) {
+        ApuCore apu;
+        apu.init(44100);
+        apu.reset();
+        apu.setSoundProfile(SoundProfile::Nes);
+
+        queueSustainedSine(apu, 1.0f);
+
+        apu.generateSamples(out, kBlock);
+        if (repeatSetter) {
+            apu.setSoundProfile(SoundProfile::Nes);  // already in force
+        }
+        apu.generateSamples(out + kBlock, kBlock);
+    };
+
+    render(reference, false);
+    render(repeated, true);
+
+    TEST_ASSERT_EQUAL_INT(0, std::memcmp(reference, repeated, sizeof(reference)));
+    // And the seam is continuous in absolute terms, so the equality above is
+    // not simply two identically-broken renders.
+    TEST_ASSERT_TRUE(maxAdjacentStep(repeated, kBlock, kBlock + 8) < (32767 / 4));
+}
+
+// =============================================================================
 // Unity test runner
 // =============================================================================
 
@@ -5731,6 +6037,20 @@ int main(int argc, char** argv) {
     RUN_TEST(test_nes_options_command_ignores_bad_slot);
     RUN_TEST(test_nes_options_noise_lut_retunes_immediately);
     RUN_TEST(test_nes_options_reflect_nes_safe_boundary);
+
+    // S4: sound profiles
+    RUN_TEST(test_sound_profile_defaults_to_legacy);
+    RUN_TEST(test_sound_profile_round_trips);
+    RUN_TEST(test_sound_profile_ignores_unknown_value);
+    RUN_TEST(test_sound_profile_command_applies_on_render);
+    RUN_TEST(test_sound_profile_survives_init);
+
+    // S3 / S5 / S6: core dispatch, profile character and the hot switch
+    RUN_TEST(profile_nes_and_hybrid_render_identical_bytes);
+    RUN_TEST(profile_apply_runs_after_nes_accurate_init);
+    RUN_TEST(profile_hot_switch_does_not_click);
+    RUN_TEST(profile_accessors_follow_the_active_core);
+    RUN_TEST(profile_setter_is_idempotent_for_state);
 
     // Integration tests
     RUN_TEST(test_apu_core_integration_full_pipeline);
