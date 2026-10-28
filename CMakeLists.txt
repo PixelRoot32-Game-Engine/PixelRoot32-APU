@@ -72,6 +72,15 @@ if(PR32_APU_BUILD_TESTS)
     add_test(NAME test_q15_smoke COMMAND test_q15_smoke
              WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test)
 
+    # The float suite compiled against the integer core: proves the two render
+    # paths agree on behaviour, not just on level.
+    add_executable(test_apu_core_integer test/test_apu_core.cpp src/ApuCore.cpp)
+    target_compile_definitions(test_apu_core_integer PRIVATE UNIT_TEST=1 PR32_APU_HAS_FPU=0)
+    target_include_directories(test_apu_core_integer PRIVATE include test test/support)
+    target_link_libraries(test_apu_core_integer PRIVATE pr32_apu_unity)
+    add_test(NAME test_apu_core_integer COMMAND test_apu_core_integer
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test)
+
     # Consumer link surface. Every suite above recompiles src/ApuCore.cpp with
     # UNIT_TEST=1, so a definition left inside a `#if defined(UNIT_TEST)` block
     # still resolves for them — and the shipped library silently loses the

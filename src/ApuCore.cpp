@@ -914,14 +914,37 @@ namespace pixelroot32::audio {
         if (slot < 0 || slot >= MAX_VOICES) {
             return 0.0f;
         }
+#if PR32_APU_HAS_FPU
         return voices[slot].frequency;
+#else
+        // The integer core runs the oscillator from `basePhaseIncQ32`; the
+        // float `frequency` field is only refreshed by the helpers shared
+        // with the float build (note-on, pitch-envelope segments), so a
+        // single-segment sweep would leave it at the note-on value and this
+        // accessor would report a pitch the core is not playing. Deriving Hz
+        // from the increment the core actually uses keeps the readout honest.
+        // NOISE has no phase increment (its pitch is the LFSR period, which
+        // `getVoiceNoisePeriodForTesting` reports), so it keeps the float.
+        if (voices[slot].type == WaveType::NOISE || sampleRate <= 0) {
+            return voices[slot].frequency;
+        }
+        return (float)((double)voices[slot].basePhaseIncQ32
+                       * (double)sampleRate / 4294967296.0);
+#endif
     }
 
     float ApuCore::getVoiceDutyCycleForTesting(int slot) const {
         if (slot < 0 || slot >= MAX_VOICES) {
             return 0.0f;
         }
+#if PR32_APU_HAS_FPU
         return voices[slot].dutyCycle;
+#else
+        // Same reasoning as getVoiceFrequencyForTesting: the continuous duty
+        // sweep advances `dutyCycleQ32` only, so the Q32 mirror is the duty
+        // the integer core actually compares against the phase.
+        return (float)((double)voices[slot].dutyCycleQ32 / 4294967296.0);
+#endif
     }
 
     float ApuCore::getVoiceDutySweepPerSampleForTesting(int slot) const {
@@ -935,7 +958,13 @@ namespace pixelroot32::audio {
         if (slot < 0 || slot >= MAX_VOICES) {
             return 0.0f;
         }
+#if PR32_APU_HAS_FPU
         return voices[slot].phase;
+#else
+        // The integer core never touches the float phase accumulator, so the
+        // Q32 mirror is the only place the rendered phase exists.
+        return (float)((double)voices[slot].phaseQ32 / 4294967296.0);
+#endif
     }
 #endif  // UNIT_TEST — the test-only accessors end here.
 
@@ -3247,9 +3276,16 @@ namespace pixelroot32::audio {
             // the historical value (~35.2 Hz at 44100, ~17.6 Hz at 22050).
             int32_t hpfOutQ15;
             if (hpfEnabled_) {
-                // Compute R * y[n-1] in Q30, then shift to Q15
+                // Compute R * y[n-1] in Q30, then shift to Q15.
+                // The shift truncates TOWARD ZERO, not arithmetically: an
+                // arithmetic >>15 has a fixed point for every negative y with
+                // |y| < 32768/(1-R) (~200 at the default R), so a voice that
+                // went silent froze the blocker on a permanent -199 DC offset
+                // instead of decaying. Truncation toward zero mirrors the
+                // float path's int conversion and guarantees |y| drops by at
+                // least one LSB per silent sample, whatever the coefficient.
                 int64_t feedback = (int64_t)hpfRQ15_ * (int64_t)hpfPrevOutQ15;
-                int32_t feedbackQ15 = (int32_t)(feedback >> 15);
+                int32_t feedbackQ15 = (int32_t)(feedback / 32768);
 
                 // HPF difference equation
                 hpfOutQ15 = inputQ15 - hpfPrevInQ15 + feedbackQ15;
