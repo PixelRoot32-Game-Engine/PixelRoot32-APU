@@ -132,11 +132,11 @@ struct CellResult {
 
 /// @brief Storage for the core of the cell being measured.
 ///
-/// Static, not a local: `sizeof(ApuCore)` is 13 200 B on the 32-bit ABI and the
-/// Arduino loop task that runs `setup()` has 8 KB of stack, so a local would
-/// overflow it. Unsigned char storage plus placement new keeps the host tool's
-/// guarantee -- every cell starts from a freshly constructed core -- without
-/// 8 x 13 200 B of statics.
+/// Static, not a local: `sizeof(ApuCore)` is 9 800 B on the 32-bit ABI (13 200 B
+/// on the 64-bit host ABI) and the Arduino loop task that runs `setup()` has 8 KB
+/// of stack, so a local would overflow it. Unsigned char storage plus placement
+/// new keeps the host tool's guarantee -- every cell starts from a freshly
+/// constructed core -- without 8 x 9 800 B of statics.
 alignas(ApuCore) unsigned char gCoreStorage[sizeof(ApuCore)];
 
 /// @brief Render buffer for the cell being measured.
