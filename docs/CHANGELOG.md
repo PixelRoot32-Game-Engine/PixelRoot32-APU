@@ -136,9 +136,9 @@ first.
     end, because the canonical track is PULSE-only and would not have seen it:
     a 220 → 900 Hz glide crosses two band edges inside a single note.
   - **Measured cost, classic ESP32, p99 per 512-sample block at 22 050 Hz.**
-    `Legacy` flat (−0.1 %), `Nes` 8 voices **+4.96 %**, `Hybrid` 8 voices
-    **+6.82 %** — the profile that carries both changes misses the +6 % budget by
-    0.8 points at 26 % of the block. Flash **+8 624 B** of the 8 704 B allowance.
+    `Legacy` flat (−0.1 %), `Nes` 8 voices **+5.10 %**, `Hybrid` 8 voices
+    **+6.98 %** — the profile that carries both changes misses the +6 % budget by
+    one point at 26 % of the block, and the level trim is what pushed it there. Flash **+8 692 B** of the 8 704 B allowance: 12 B of margin, which is a warning rather than an achievement.
     The C3 was not measurable: its native USB port delivers no application
     output with either core USB mode, and a five-line probe sketch is equally
     silent, so this is a tooling limit and not this change. `docs/ABI.md` §9.7

@@ -306,23 +306,24 @@ E2 gives `Nes` and `Hybrid` the NES output stage and gives `Hybrid` a band-limit
 |---|---|---|---|---|
 | `Legacy` 8 voices | 6 668 | 6 662 | −0.1 % | must be flat |
 | `Legacy` 1 voice | 1 555 | 1 562 | +0.5 % | must be flat |
-| `Nes` 8 voices | 5 687 | 5 969 | **+4.96 %** | <= +6 % → **passes** |
-| `Nes` 1 voice | 1 471 | 1 683 | +14.4 % | no criterion |
-| `Hybrid` 8 voices | 5 686 | 6 074 | **+6.82 %** | <= +6 % → **fails** |
-| `Hybrid` 1 voice | 1 471 | 1 683 | +14.4 % | no criterion |
+| `Nes` 8 voices | 5 687 | 5 977 | **+5.10 %** | <= +6 % → **passes** |
+| `Nes` 1 voice | 1 471 | 1 692 | +15.0 % | no criterion |
+| `Hybrid` 8 voices | 5 686 | 6 083 | **+6.98 %** | <= +6 % → **fails** |
+| `Hybrid` 1 voice | 1 471 | 1 692 | +15.0 % | no criterion |
 
 `Legacy` is flat, which is the independent confirmation of its byte-identical fixtures: the frozen path did not change. The eight-voice figures are the ones that matter for a game; the single-voice penalty is the output chain's fixed per-sample cost, which a single voice does not amortise, and it is 7.2 % of the block in absolute terms.
 
 **The level trim costs one multiply and the clamp the loop already performs.** The Q15 profile gain (`kProfileTrimNesQ15` = 47786 for +3.28 dB, `kProfileTrimHybridQ15` = 53854 for +4.31 dB) is resolved with the chain's activation — on `init`, `setSoundProfile` and `setHpfCutoffHz`, never per sample and never per block — and applied on the chain-active branch only, as `int32_t trim * sample` rescaled by the same truncating shift as the rest of the stage and saturated by the clamp the loop already performs (`32767 × 53854 = 1 764 634 018`, inside `int32_t`). It costs no RAM: the four-byte member fitted existing padding, so `sizeof(ApuCore)` stays at §9.4's **13 344 B** (13 368 B with `UNIT_TEST`). `Legacy` never enters the chain branch, so its per-sample work is unchanged and both of its fixtures stayed byte-identical (§9.2). **No CPU number is claimed for the trim**: it must be re-measured on the board like every row above, and §9.3's host baseline predates the change. Its audible consequence is in §9.2 — matched RMS with the chain's 13–14 dB crest factor raises `Nes`/`Hybrid` peaks to about two thirds of full scale on a dense mix. Measured flash on `esp32dev`: **301 237 B**, **+68 B** over the pre-trim 301 169 B and 12 B under the 301 249 B ceiling.
 
-`Hybrid` is the only profile that pays for both changes, and it misses the budget by 0.82 points: 6 074 us against a 6 027 us target. The series that got it there is worth recording, because each step was measured rather than estimated:
+`Hybrid` is the only profile that pays for both changes, and it misses the budget by 0.98 points: 6 083 us against a 6 027 us target. The series that got it there is worth recording, because each step was measured rather than estimated:
 
 | Stage | `Nes` 8v | `Hybrid` 8v |
 |---|---|---|
 | first implementation | +5.82 % | +11.11 % |
 | float coefficient derivation, int32 products | +5.40 % | +11.11 % |
 | mipmap hoist, force-inline, crossfade window narrowed to the top 1/8 of a band | +5.94 % | +7.83 % |
-| output stage force-inlined and snapshotted out of `this` | **+4.96 %** | **+6.82 %** |
+| output stage force-inlined and snapshotted out of `this` | +4.96 % | +6.82 % |
+| per-profile level trim (one multiply per sample) | **+5.10 %** | **+6.98 %** |
 
 Two optimisations were attempted and rejected on measurement, and both would have looked fine on paper:
 
@@ -338,8 +339,9 @@ Flash, same firmware, `firmware.bin`/`Flash:` on `esp32dev`:
 | pre-E2 baseline | 292 545 B | — |
 | first implementation | 303 681 B | +11 136 B |
 | float derivation, int32 products | 300 713 B | +8 168 B |
-| after the two remaining passes | 301 169 B | **+8 624 B** (budget 8 704 B) |
+| after the two remaining passes | 301 169 B | +8 624 B (budget 8 704 B) |
+| per-profile level trim | **301 237 B** | **+8 692 B** (budget 8 704 B) |
 
-The budget is met **with 80 B to spare**, and the audit's ~150 B estimate for the filter stage was wrong by more than an order of magnitude — the table data is 4 096 B of that and the mipmap code ~192 B, so the filter and its coefficient derivation are ~4.3 KB.
+The budget is met **with 12 B to spare**, which is a warning rather than an achievement, and the audit's ~150 B estimate for the filter stage was wrong by more than an order of magnitude — the table data is 4 096 B of that and the mipmap code ~192 B, so the filter and its coefficient derivation are ~4.3 KB.
 
 **The C3 rows are pending, and not because of E2.** After a verified flash and a hard reset, the application prints nothing on that board's native USB port (`303A:1001`), with `ARDUINO_USB_MODE=1` and with `=0`. A five-line probe sketch that only calls `Serial.printf` in `loop()` is equally silent, so the channel is the defect, not this library. The C3 has no second console on this unit. This is the same class of failure already recorded for `esp32-s3-devkitc-1` in §9.5, and it means the E2 cost is measured on one board only — a Tier A target, which is the one the audit's S12 rule is tightest on, was not confirmed.
