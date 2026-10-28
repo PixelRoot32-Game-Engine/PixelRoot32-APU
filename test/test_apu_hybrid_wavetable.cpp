@@ -1,6 +1,7 @@
 /**
  * @file test_apu_hybrid_wavetable.cpp
- * @brief E2/T3 (S4, S6, S9): the `Hybrid` SAW reads the band-limited mipmap.
+ * @brief E2/T3 (S4, S5, S6, S9): the `Hybrid` SAW reads the band-limited
+ * mipmap.
  *
  * `test_apu_wavetable_spectral.cpp` proves the committed tables and states the
  * read the renderer has to honour; this suite proves the renderer honours it.
@@ -14,6 +15,18 @@
  *     automation track the table selection.
  *   - adjacent levels are CROSSFADED by the position inside the octave, so a
  *     glissando crossing a boundary has no seam (S6).
+ *   - S5 end to end: the SAME note rendered through `ApuCore` under `Hybrid`
+ *     folds at least 10 dB less energy below the fundamental than under `Nes`.
+ *     The spectral suite measures the tables in isolation and the cases below
+ *     compare profiles sample for sample; neither of those adds up to the
+ *     profile-level number S5 states, so it is measured on the PCM here.
+ *     Measured worst case: 18.5 dB at 104.97 Hz / 22 050 Hz (Nes -41.29 dB,
+ *     Hybrid -59.81 dB). At 22 050 Hz the baseline climbs from -46.7 dB at
+ *     56 Hz to -2.8 dB at 8 kHz as the ramp's aliases start landing below the
+ *     fundamental, while `Hybrid` reads between -59.8 dB and -94.8 dB
+ *     everywhere. The 64.60 Hz row reproduces the spectral suite's ramp figure
+ *     (-46.01 dB) exactly, which is the cross-check that this is the same
+ *     baseline measured through a different path.
  *
  * The render is read through the public pipeline with the output stage
  * deliberately bypassed: the profile owns it (S1), but `setHpfCutoffHz(0)`
@@ -32,6 +45,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <complex>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -214,6 +228,184 @@ int32_t maxAdjacentLevelDifference()
         }
     }
     return worst;
+}
+
+// =============================================================================
+// S5 end to end - fold-down of what `ApuCore` actually emits
+// =============================================================================
+//
+// Same metric as `test_apu_wavetable_spectral.cpp`, deliberately: the fold-down
+// is the energy in bins 1 .. fundamentalBin-1 relative to the fundamental, over
+// a record that holds an EXACT integer number of periods, so no window and no
+// guard band are needed. What changes is where the samples come from: the PCM
+// the renderer produces, not a table read composed in the test.
+
+constexpr double kPi = 3.14159265358979323846;
+constexpr int kRecordLength = 8192;
+// The note is queued on the first render call and sample 0 still has the
+// envelope at zero (the S4 wiring case pins that), so the measured record
+// starts after the note-on transient. Any whole-sample offset keeps the record
+// coherent: `phaseIncQ32 * kRecordLength` is an exact number of cycles, so
+// every window of `kRecordLength` samples is one full period.
+constexpr int kRecordSkip = 64;
+constexpr double kMinImprovementDb = 10.0;
+constexpr double kFoldFloorDb = -60.0;
+constexpr double kSilentDb = -300.0;
+constexpr double kSweepLowHz = 55.0;
+constexpr double kSweepHighHz = 8000.0;
+// Eleven targets: the S5 floor, 64.60 Hz (the frequency the table-level sweep
+// in `test_apu_wavetable_spectral.cpp` found hardest for the interpolated read:
+// -59.70 dB, 13.69 dB better than the ramp), then ~1.63x steps to 8 kHz.
+// The step is NOT an octave on purpose: the fold-down depends only on
+// `q = f / fs` and the Q32 increment, so a shared octave list would print the
+// 44 100 Hz row at `2f` identical to the 22 050 Hz row at `f`.
+constexpr double kRenderTargetsHz[] = {kSweepLowHz, 64.60, 105.3, 171.6,
+                                       279.7,       455.9, 743.1, 1211.4,
+                                       1974.6,      3218.6, kSweepHighHz};
+constexpr int kRenderPoints =
+    static_cast<int>(sizeof(kRenderTargetsHz) / sizeof(kRenderTargetsHz[0]));
+constexpr int kRenderRates[] = {22050, 44100};
+// A record that rendered silence would pass the "already below the floor"
+// clause vacuously; the smallest peak a real SAW note leaves is ~5 500 LSB
+// (level 7 at 8 kHz is a sine sampled ~2.8 times per period).
+constexpr double kMinPlausiblePeakLsb = 4000.0;
+
+/// @brief One measured point: a rate, the note that was rendered, and the bin
+/// its fundamental sits on.
+struct RenderPoint {
+    int sampleRate = 0;
+    double frequencyHz = 0.0;
+    int fundamentalBin = 0;
+};
+
+/// @brief In-place iterative radix-2 FFT; `data.size()` must be a power of two.
+void fft(std::vector<std::complex<double>>& data)
+{
+    const std::size_t n = data.size();
+    for (std::size_t i = 1, j = 0; i < n; ++i) {
+        std::size_t bit = n >> 1;
+        for (; j & bit; bit >>= 1) j ^= bit;
+        j |= bit;
+        if (i < j) std::swap(data[i], data[j]);
+    }
+    for (std::size_t size = 2; size <= n; size <<= 1) {
+        const double angle = -2.0 * kPi / static_cast<double>(size);
+        const std::complex<double> step(std::cos(angle), std::sin(angle));
+        for (std::size_t start = 0; start < n; start += size) {
+            std::complex<double> twiddle(1.0, 0.0);
+            for (std::size_t k = start; k < start + size / 2; ++k) {
+                const std::complex<double> even = data[k];
+                const std::complex<double> odd = data[k + size / 2] * twiddle;
+                data[k] = even + odd;
+                data[k + size / 2] = even - odd;
+                twiddle *= step;
+            }
+        }
+    }
+}
+
+/// @brief Power per bin of a real record, full spectrum (mirror included).
+std::vector<double> spectrumPower(const std::vector<double>& signal)
+{
+    std::vector<std::complex<double>> bins(signal.size());
+    for (std::size_t i = 0; i < signal.size(); ++i) bins[i] = signal[i];
+    fft(bins);
+    std::vector<double> power(bins.size());
+    for (std::size_t i = 0; i < bins.size(); ++i) power[i] = std::norm(bins[i]);
+    return power;
+}
+
+/// @brief Fold-down in dB relative to the fundamental, exactly as the spectral
+/// suite defines it (energy below the fundamental cannot exist in a
+/// band-limited oscillator).
+double foldDownDb(const std::vector<double>& power, int fundamentalBin)
+{
+    double fundamental = 0.0;
+    for (int k = fundamentalBin - 1; k <= fundamentalBin + 1; ++k) {
+        fundamental = std::max(fundamental, power[static_cast<std::size_t>(k)]);
+    }
+    double below = 0.0;
+    for (int k = 1; k < fundamentalBin; ++k) {
+        below += power[static_cast<std::size_t>(k)];
+    }
+    if (below <= 0.0 || fundamental <= 0.0) return kSilentDb;
+    return 10.0 * std::log10(below / fundamental);
+}
+
+/// @brief The nearest DFT-grid point the `float` note frequency reproduces
+/// exactly.
+///
+/// The renderer derives its Q32 increment from a `float`
+/// (`frequency_hz_to_phase_inc_q32`), and a `float` cannot hold every grid
+/// frequency: near 8 kHz the step between representable values moves the
+/// truncated increment by ~95 LSB, which over 8 192 samples is more than a bin
+/// of phase drift -- the fundamental then leaks into the bins the metric counts
+/// as folded energy. Measured, not assumed: with this check disabled the
+/// 4 293 Hz / 22 050 Hz row reads -78.5 dB instead of -90.3 dB for `Hybrid`,
+/// because that frequency's bin is one the `float` increment cannot land on.
+/// So the snap picks the nearest bin whose increment is exactly `bin << 19`,
+/// which makes the record hold a whole number of periods by construction.
+///
+/// Power-of-two bins are skipped: there the note's period is an exact
+/// submultiple of the record (`8192 / bin` samples), so the ramp's aliases also
+/// land on multiples of `bin` and both profiles read `-300 dB` because nothing
+/// folds below the fundamental at all. The measurement is not wrong there, it
+/// is empty, and an empty row is not evidence for S5.
+bool nearestCoherentPoint(double targetHz, int rate, RenderPoint& out)
+{
+    const int lowestBin = std::max(
+        2, static_cast<int>(std::ceil(kSweepLowHz * kRecordLength /
+                                      static_cast<double>(rate))));
+    const int centre = static_cast<int>(
+        std::lround(targetHz * kRecordLength / static_cast<double>(rate)));
+    for (int offset = 0; offset <= 64; ++offset) {
+        for (int direction = 0; direction < 2; ++direction) {
+            if (offset == 0 && direction == 1) continue;
+            const int bin = centre + ((direction == 0) ? offset : -offset);
+            if (bin < lowestBin || bin > kRecordLength / 2 - 1) continue;
+            if ((bin & (bin - 1)) == 0) continue;  // see above
+            const double exact = bin * static_cast<double>(rate) /
+                                 static_cast<double>(kRecordLength);
+            const float asFloat = static_cast<float>(exact);
+            if (phaseIncFor(static_cast<double>(asFloat), rate) !=
+                (static_cast<uint32_t>(bin) << 19)) {
+                continue;
+            }
+            out.sampleRate = rate;
+            out.frequencyHz = static_cast<double>(asFloat);
+            out.fundamentalBin = bin;
+            return true;
+        }
+    }
+    return false;
+}
+
+/// @brief One rendered note and its fold-down.
+struct RenderFold {
+    double foldDownDb = kSilentDb;
+    double peakLsb = 0.0;
+};
+
+/// @brief Renders the flat SAW note under `profile` and measures its record.
+RenderFold measureRender(SoundProfile profile, const RenderPoint& point)
+{
+    const InstrumentPreset preset = flatPreset();
+    const AudioCommand cmd = noteCommand(WaveType::SAW,
+                                         static_cast<float>(point.frequencyHz), true,
+                                         0.0f, 0.0f, SweepCurve::Linear, preset);
+    const std::vector<int16_t> pcm = render(profile, cmd,
+                                            kRecordSkip + kRecordLength,
+                                            point.sampleRate);
+
+    std::vector<double> record(static_cast<std::size_t>(kRecordLength));
+    RenderFold result;
+    for (int i = 0; i < kRecordLength; ++i) {
+        const double value = static_cast<double>(pcm[static_cast<std::size_t>(kRecordSkip + i)]);
+        record[static_cast<std::size_t>(i)] = value;
+        result.peakLsb = std::max(result.peakLsb, std::fabs(value));
+    }
+    result.foldDownDb = foldDownDb(spectrumPower(record), point.fundamentalBin);
+    return result;
 }
 
 } // namespace
@@ -544,6 +736,93 @@ void test_hybrid_sine_is_not_band_limited(void)
     }
 }
 
+// =============================================================================
+// S5 end to end - the improvement the profile delivers, on rendered PCM
+// =============================================================================
+
+void test_hybrid_saw_alias_improvement_through_the_renderer()
+{
+    double worstImprovementDb = 1e9;
+    RenderPoint worstPoint;
+    double worstNesDb = 0.0;
+    double worstHybridDb = 0.0;
+    bool worstFloorClause = false;
+    bool worstImprovementClause = false;
+    int measured = 0;
+    char message[320];
+
+    std::printf("\n  S5 end to end: SAW through ApuCore, output stage bypassed "
+                "(setHpfCutoffHz(0), SoftClipMode::None)\n");
+    std::printf("  dB below the fundamental, relative to it; lower is better\n");
+    std::printf("  rate    freq      Nes      Hybrid   improvement\n");
+
+    for (int rate : kRenderRates) {
+        for (int index = 0; index < kRenderPoints; ++index) {
+            const double target = kRenderTargetsHz[index];
+            RenderPoint point;
+            std::snprintf(message, sizeof(message),
+                          "no coherent grid point near %.2f Hz at %d Hz", target, rate);
+            TEST_ASSERT_TRUE_MESSAGE(nearestCoherentPoint(target, rate, point), message);
+
+            const RenderFold nes = measureRender(SoundProfile::Nes, point);
+            const RenderFold hybrid = measureRender(SoundProfile::Hybrid, point);
+            const double improvement = nes.foldDownDb - hybrid.foldDownDb;
+            ++measured;
+
+            std::printf("  %5d  %7.2f   %7.2f   %7.2f   %6.2f dB\n", point.sampleRate,
+                        point.frequencyHz, nes.foldDownDb, hybrid.foldDownDb,
+                        improvement);
+
+            // A record that rendered silence would satisfy the floor clause
+            // for free, so the note has to be there before the number counts.
+            std::snprintf(message, sizeof(message),
+                          "record at %.2f Hz / %d Hz peaked at %.0f LSB: the note did not render",
+                          point.frequencyHz, point.sampleRate,
+                          std::min(nes.peakLsb, hybrid.peakLsb));
+            TEST_ASSERT_TRUE_MESSAGE(
+                std::min(nes.peakLsb, hybrid.peakLsb) >= kMinPlausiblePeakLsb, message);
+
+            // S5: at least 10 dB better, or the mipmapped figure is already at
+            // or below the floor the S4 case pins (-60 dB), where "better" has
+            // nothing left to buy.
+            const bool floorClause = hybrid.foldDownDb <= kFoldFloorDb;
+            const bool improvementClause = improvement >= kMinImprovementDb;
+            std::snprintf(message, sizeof(message),
+                          "%.2f Hz / %d Hz: Hybrid %.2f dB vs Nes %.2f dB -> %.2f dB "
+                          "(need %.1f dB better, or Hybrid at or below %.0f dB)",
+                          point.frequencyHz, point.sampleRate, hybrid.foldDownDb,
+                          nes.foldDownDb, improvement, kMinImprovementDb,
+                          kFoldFloorDb);
+            TEST_ASSERT_TRUE_MESSAGE(floorClause || improvementClause, message);
+
+            if (improvement < worstImprovementDb) {
+                worstImprovementDb = improvement;
+                worstPoint = point;
+                worstNesDb = nes.foldDownDb;
+                worstHybridDb = hybrid.foldDownDb;
+                worstFloorClause = floorClause;
+                worstImprovementClause = improvementClause;
+            }
+        }
+    }
+
+    std::printf("  worst of %d points: %.2f dB better at %.2f Hz / %d Hz "
+                "(Nes %.2f dB, Hybrid %.2f dB; cleared by %s)\n",
+                measured, worstImprovementDb, worstPoint.frequencyHz,
+                worstPoint.sampleRate, worstNesDb, worstHybridDb,
+                worstImprovementClause ? "the 10 dB clause"
+                                       : "the absolute floor clause");
+    TEST_ASSERT_TRUE(measured >= 16);
+    std::snprintf(message, sizeof(message),
+                  "worst S5 point %.2f Hz / %d Hz: Hybrid %.2f dB vs Nes %.2f dB is "
+                  "only %.2f dB better (floor clause %s, 10 dB clause %s)",
+                  worstPoint.frequencyHz, worstPoint.sampleRate, worstHybridDb,
+                  worstNesDb, worstImprovementDb,
+                  worstFloorClause ? "met" : "missed",
+                  worstImprovementClause ? "met" : "missed");
+    TEST_ASSERT_TRUE_MESSAGE(worstImprovementClause || worstFloorClause, message);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -552,5 +831,6 @@ int main(void)
     RUN_TEST(test_hybrid_saw_glissando_crosses_levels_without_a_step);
     RUN_TEST(test_hybrid_saw_fast_sweep_stays_bounded);
     RUN_TEST(test_hybrid_sine_is_not_band_limited);
+    RUN_TEST(test_hybrid_saw_alias_improvement_through_the_renderer);
     return UNITY_END();
 }
