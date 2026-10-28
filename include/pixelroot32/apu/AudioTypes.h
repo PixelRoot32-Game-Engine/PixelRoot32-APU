@@ -508,6 +508,10 @@ namespace pixelroot32::audio {
         // phaseQ32 wraps naturally at 2^32, encoding one period.
         uint32_t phaseQ32 = 0;
         uint32_t phaseIncQ32 = 0;
+        // Q32 mirror of `dutyCycle`, compared against `phaseQ32` by the integer
+        // generator. Saturates at 0xFFFFFFFF for duty == 1.0: the natural
+        // product (2^32) does not fit in `uint32_t`, and the wrapped value 0
+        // turned "always high" into "never high".
         uint32_t dutyCycleQ32 = 0x80000000u; // 50% default
         uint32_t basePhaseIncQ32 = 0;
 

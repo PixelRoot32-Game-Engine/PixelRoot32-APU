@@ -637,7 +637,16 @@ namespace pixelroot32::audio {
             duty = 1.0f;
         }
         ch.dutyCycle = duty;
-        ch.dutyCycleQ32 = (uint32_t)((double)duty * 4294967296.0);
+        // `duty * 2^32` is exactly 2^32 at full scale, which does not fit in
+        // `uint32_t`: the truncating conversion wrapped it to 0, so the integer
+        // generator's `phaseQ32 < dutyCycleQ32` was never true and a 100 %
+        // pulse rendered flat instead of a constant high level. Saturate at the
+        // boundary and keep the original product for every other value, so the
+        // rest of the integer PCM cannot move. Rescaling the product to
+        // 4294967295.0 would fix this one input and shift every voice by 1 LSB.
+        ch.dutyCycleQ32 = (duty >= 1.0f)
+            ? 0xFFFFFFFFu
+            : (uint32_t)((double)duty * 4294967296.0);
     }
 
     /** Apply t<=0 duty steps at init; schedule next boundary in samples (no float/sample). */

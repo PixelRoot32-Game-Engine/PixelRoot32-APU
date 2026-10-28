@@ -2211,6 +2211,185 @@ void test_pulse_duty_continuous_unchanged(void)
 }
 
 // =============================================================================
+// Continuous PULSE duty at full scale (fix/apu-duty-full-scale)
+//
+// `set_pulse_duty` mirrors the float duty into the Q32 field the integer
+// generator compares against the phase. At duty == 1.0 the product is 2^32,
+// which does not fit in `uint32_t`, so the conversion used to yield 0 and
+// `phaseQ32 < dutyCycleQ32` was never true: a 100 % pulse rendered a flat line
+// instead of a constant high level. The float body compares against the float
+// `dutyCycle` (1.0) and was always right, so this is the two bodies
+// disagreeing about the same input, not a change of musical intent.
+// =============================================================================
+
+// The profile that reaches the integer core in this build: `Nes` on an FPU
+// target, where `Legacy` is the frozen float body; without an FPU every
+// profile already renders the integer core (same rule as
+// test_apu_integer_golden).
+static SoundProfile integerCoreProfileForBuild() {
+#if PR32_APU_HAS_FPU
+    return SoundProfile::Nes;
+#else
+    return SoundProfile::Legacy;
+#endif
+}
+
+// Starts one sustained PULSE note at `duty` on `profile`'s core and returns the
+// slot it landed on.
+//
+// 110.25 Hz is exactly 400 samples per period at 44 100 Hz, so a 400-sample
+// window stays inside one period while outlasting the 2 ms (88-sample) attack:
+// the level is read at full scale instead of through the ramp.
+//
+// The discrete 8-step duty and the two post-mix stages that would reshape a
+// constant level are forced off *after* the note-on, so the measurement is
+// about `dutyCycleQ32` itself and cannot be masked by a profile's character
+// hook or by a DC blocker eating the level.
+static int startContinuousDutyPulse(ApuCore& apu, SoundProfile profile,
+                                    float duty) {
+    apu.init(44100);
+    apu.setSoundProfile(profile);
+    apu.reset();
+
+    AudioCommand cmd{};
+    cmd.type = AudioCommandType::PLAY_EVENT;
+    cmd.event.type = WaveType::PULSE;
+    cmd.event.frequency = 110.25f;
+    cmd.event.duration = 1.0f;
+    cmd.event.volume = 1.0f;
+    cmd.event.duty = duty;
+    TEST_ASSERT_TRUE(apu.submitCommand(cmd));
+
+    int16_t warmup[1] = {0};
+    apu.generateSamples(warmup, 1);          // applies the note-on
+    const int slot = find_first_enabled_sfx_slot(apu);
+    TEST_ASSERT_TRUE(slot >= 0);
+
+    apu.setVoicePulseDutyMode(slot, 255);    // continuous, never an 8-step pattern
+    apu.setHpfCutoffHz(0.0f);                // a DC blocker would decay a constant level
+    apu.setSoftClipMode(SoftClipMode::None); // keep the level linear: the sign is what we read
+    return slot;
+}
+
+// The mirror itself. `getVoiceDutyCycleForTesting` reports the Q32 field on the
+// integer core, so a mirror that wrapped to 0 reads back as 0.0 instead of the
+// 1.0 the request asked for.
+void test_pulse_duty_full_scale_sets_q32_mirror(void) {
+    ApuCore apu;
+    const int slot = startContinuousDutyPulse(
+        apu, integerCoreProfileForBuild(), 1.0f);
+
+    TEST_ASSERT_EQUAL_FLOAT_MESSAGE(
+        1.0f, apu.getVoiceDutyCycleForTesting(slot),
+        "duty == 1.0 must saturate the Q32 mirror, not wrap it to 0");
+}
+
+// The symptom. A 100 % pulse is "all high", which is what the float body
+// renders; a flat line at 0 would satisfy "no negative sample" while still
+// being wrong, so the count of high samples is asserted too.
+void test_pulse_duty_full_scale_never_goes_negative(void) {
+    constexpr int kPeriod = 400;   // 110.25 Hz at 44 100 Hz
+    constexpr int kAttack = 88;    // default 2 ms attack ramp
+
+    ApuCore apu;
+    startContinuousDutyPulse(apu, integerCoreProfileForBuild(), 1.0f);
+
+    int16_t pcm[kPeriod] = {};
+    apu.generateSamples(pcm, kPeriod);
+
+    int high = 0;
+    for (int i = 0; i < kPeriod; ++i) {
+        TEST_ASSERT_GREATER_OR_EQUAL_INT_MESSAGE(
+            0, pcm[i],
+            "100 % duty must never go negative in the integer core");
+        if (pcm[i] > 0) {
+            ++high;
+        }
+    }
+    TEST_ASSERT_GREATER_THAN_INT_MESSAGE(
+        kPeriod - kAttack, high,
+        "100 % duty must be a constant high level, not a flat line");
+}
+
+// The other end of the range still means what it meant: 0 % is "all low".
+void test_pulse_duty_zero_never_goes_positive(void) {
+    constexpr int kPeriod = 400;
+
+    ApuCore apu;
+    startContinuousDutyPulse(apu, integerCoreProfileForBuild(), 0.0f);
+
+    int16_t pcm[kPeriod] = {};
+    apu.generateSamples(pcm, kPeriod);
+
+    int low = 0;
+    for (int i = 0; i < kPeriod; ++i) {
+        TEST_ASSERT_LESS_OR_EQUAL_INT_MESSAGE(
+            0, pcm[i],
+            "0 % duty must never go positive in the integer core");
+        if (pcm[i] < 0) {
+            ++low;
+        }
+    }
+    TEST_ASSERT_GREATER_THAN_INT_MESSAGE(
+        300, low,
+        "0 % duty must be a constant low level, not a flat line");
+}
+
+// The two bodies must agree on the same preset. Byte equality is not
+// available (the bodies differ), so the polarity of every sample is: with
+// duty == 1.0 both must stay on the same side of zero for a whole period.
+void test_pulse_duty_full_scale_matches_float_polarity(void) {
+    constexpr int kPeriod = 400;
+
+    ApuCore integer;
+    startContinuousDutyPulse(integer, integerCoreProfileForBuild(), 1.0f);
+    int16_t integerPcm[kPeriod] = {};
+    integer.generateSamples(integerPcm, kPeriod);
+
+    // `Legacy` is the float body on an FPU target; on a no-FPU target it is
+    // the integer core again, so the comparison stays valid (just narrower).
+    ApuCore floating;
+    startContinuousDutyPulse(floating, SoundProfile::Legacy, 1.0f);
+    int16_t floatPcm[kPeriod] = {};
+    floating.generateSamples(floatPcm, kPeriod);
+
+    for (int i = 0; i < kPeriod; ++i) {
+        const int integerSign = (integerPcm[i] > 0) - (integerPcm[i] < 0);
+        const int floatSign = (floatPcm[i] > 0) - (floatPcm[i] < 0);
+        TEST_ASSERT_EQUAL_INT_MESSAGE(
+            floatSign, integerSign,
+            "float and integer bodies must agree on every sample's polarity "
+            "at duty == 1.0");
+    }
+}
+
+// PRESERVE: an interior duty keeps the mapping it had, so the fix cannot have
+// rescaled the mirror under the other voices. 25 % of a 400-sample period is
+// exactly 100 high samples and the readout still reports the requested duty.
+void test_pulse_duty_interior_value_unchanged(void) {
+    constexpr int kPeriod = 400;
+
+    ApuCore apu;
+    const int slot = startContinuousDutyPulse(
+        apu, integerCoreProfileForBuild(), 0.25f);
+    TEST_ASSERT_EQUAL_FLOAT_MESSAGE(
+        0.25f, apu.getVoiceDutyCycleForTesting(slot),
+        "an interior duty must keep its Q32 mapping");
+
+    int16_t pcm[kPeriod] = {};
+    apu.generateSamples(pcm, kPeriod);
+
+    int high = 0;
+    for (int i = 0; i < kPeriod; ++i) {
+        if (pcm[i] > 0) {
+            ++high;
+        }
+    }
+    TEST_ASSERT_EQUAL_INT_MESSAGE(
+        100, high, "25 % duty must keep its one-quarter high split");
+}
+
+// =============================================================================
 // Hito 1 M16: TRIANGLE octave doubling (opt-in)
 // =============================================================================
 
@@ -7361,6 +7540,12 @@ int main(int argc, char** argv) {
     // Hito 1: NES PULSE duty (M2) + TRIANGLE octave doubling (M16)
     RUN_TEST(test_pulse_duty_nes_4modes);
     RUN_TEST(test_pulse_duty_continuous_unchanged);
+    // Continuous duty at full scale (fix/apu-duty-full-scale)
+    RUN_TEST(test_pulse_duty_full_scale_sets_q32_mirror);
+    RUN_TEST(test_pulse_duty_full_scale_never_goes_negative);
+    RUN_TEST(test_pulse_duty_zero_never_goes_positive);
+    RUN_TEST(test_pulse_duty_full_scale_matches_float_polarity);
+    RUN_TEST(test_pulse_duty_interior_value_unchanged);
     RUN_TEST(test_triangle_octave_up_default_off);
     RUN_TEST(test_triangle_octave_up_doubles_freq);
     RUN_TEST(test_triangle_octave_up_ignored_for_other_types);
