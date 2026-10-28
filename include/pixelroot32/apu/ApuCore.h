@@ -7,6 +7,7 @@
 #include "AudioTypes.h"
 #include "AudioCommandQueue.h"
 #include "AudioMusicTypes.h"
+#include "ApuConfig.h"
 
 #include <atomic>
 #include <cstdint>
@@ -33,11 +34,24 @@ namespace pixelroot32::audio {
       *   output:      y * masterVolume * 32767, passed through a single-pole
       *                DC-blocker to remove offset + transient clicks.
       *
+      * `Nes`/`Hybrid` replace the uniform per-channel weighting with
+      * `MixerCurve::NesWeighted` (S4): the voices are summed per group and the
+      * published NES ratios decide how much each group contributes, with the
+      * PULSE group anchored at exactly the level above so the change is
+      * balance, not loudness. The weighted sum then enters the same compressor,
+      * master volume and DC blocker chain. `Legacy` keeps the formula above
+      * unchanged, byte for byte.
+      *
       * On cores without an FPU (ESP32-C3) the integer-optimised path uses
       * `audio_mixer_lut`, which is pre-fitted to the same curve and renders
       * at the same level (Hito 5 M12). It applies MIXER_SCALE once, after
       * summation rather than per channel, because the table's mapping already
       * contains the 0.4 — see AudioMixerLUT.h.
+      *
+      * Since the profiles arrived (S3) the selector, not the target, decides
+      * which body runs: `Nes`/`Hybrid` use the integer core on every build, and
+      * `Legacy` falls back to it where the float body is not compiled
+      * (`PR32_APU_ENABLE_LEGACY_FLOAT == 0`).
       */
      class ApuCore {
     public:
@@ -170,6 +184,18 @@ namespace pixelroot32::audio {
          * The default `pulseDutyIndex == 255` keeps the legacy continuous
          * `dutyCycle` behaviour, so existing consumers are unaffected.
          *
+         * S6: since E1 the sound profile also owns this mode as its DEFAULT —
+         * `Nes` and `Hybrid` arm the step nearest the note's own `duty`, and
+         * `Legacy` arms continuous. A call here is a tier-2 override (D-3): it
+         * pins the mode for the slot, so the profile does NOT re-arm its own
+         * choice on the next note and the note's `duty` no longer selects the
+         * step. Passing 255 therefore means "this slot stays continuous" even
+         * under a NES-derived profile. The pin is per-slot state: it survives
+         * new notes and is cleared only by `Voice::reset()`.
+         *
+         * Like the other selectors, this is not safe to call concurrently with
+         * rendering.
+         *
          * @param slot Voice index [0, MAX_VOICES); out-of-range ignored.
          * @param nesDutyIndex 0..3 for NES discrete duty, 4..254 treated as
          *                     continuous (defensive), 255 for continuous.
@@ -225,6 +251,18 @@ namespace pixelroot32::audio {
          * restores the legacy default, the same way it restores the master
          * volume and bitcrush depth.
          *
+         * S8 (caller precedence): this setter is an explicit statement about
+         * the output corner, so it OUTRANKS the sound profile. Once it has
+         * been called, `Nes` and `Hybrid` do NOT install their output filter
+         * chain; the historical single-pole HPF runs at the caller's corner
+         * instead — level included, because the profile's fixed gain trim is
+         * part of the chain and is suppressed with it. `reset()` clears that
+         * override, so the profile owns the stage again on the following
+         * block. This mirrors the
+         * `pulseDutyOverridden` / `noiseUnipolarOverridden` /
+         * `nesNoiseLutOverridden` tier-2 convention of E1. Calling it with
+         * <= 0 still counts as an explicit choice (an overridden bypass).
+         *
          * Not safe to call concurrently with rendering; treat it like the
          * other direct configuration setters.
          *
@@ -272,6 +310,18 @@ namespace pixelroot32::audio {
          * selector indices land on the documented sentinels, and selecting
          * a noise LUT entry retunes a live NOISE voice immediately.
          *
+         * S5: two of the bundled fields — `noiseUnipolar` and `noiseLutIndex` —
+         * are also the per-slot override of a sound-profile default (D-3 tier
+         * 2), so applying this struct pins them: a profile will not re-arm its
+         * own value on the next note. `noiseUnipolar` has no standalone setter,
+         * which makes this method and `AudioCommandType::SET_NES_OPTIONS` its
+         * only per-voice entry points.
+         *
+         * S6 adds `pulseDutyIndex` to that set: it is delegated to
+         * `setVoicePulseDutyMode`, which pins the duty mode against the
+         * profile's default, so applying a default-constructed struct returns a
+         * NES-profile PULSE voice to the continuous generator.
+         *
          * Not safe to call concurrently with rendering. Use
          * `AudioCommandType::SET_NES_OPTIONS` from the game thread — it
          * carries the same struct through the queue and applies it via this
@@ -295,6 +345,88 @@ namespace pixelroot32::audio {
          *             default-constructed value.
          */
         VoiceNesOptions getVoiceNesOptions(int slot) const;
+
+        /**
+         * @brief Select the character set applied to every voice.
+         *
+         * S4. The profile is global configuration, not per-voice state: one
+         * selector, one render body for the whole mix. Unknown values are
+         * ignored rather than clamped, so a corrupt command cannot silently
+         * change the sound to a neighbouring profile.
+         *
+         * The profile also OWNS the output stage (`Nes` and `Hybrid`, S1):
+         * one shared chain applied to the summed mix, never per voice, in
+         * this order — HPF 1st order at 90 Hz, HPF 1st order at 440 Hz, LPF
+         * 2nd order Butterworth (Q = 1/sqrt(2)) at `min(14000 Hz,
+         * 0.45 * fs)`. Coefficients are derived on a configuration or rate
+         * change, never per sample. `Legacy` keeps the historical single-pole
+         * HPF and is byte-identical on every build.
+         *
+         * The LPF is deliberately NOT engaged below `0.45 * fs >= 6000 Hz`
+         * (i.e. `fs >= 13334 Hz`): at 8 000 Hz `0.45 * fs` is 3 600 Hz, which
+         * would cut most of the passband and gut the sound instead of
+         * approximating the NES's 14 kHz roof. Below that floor the chain is
+         * the two high-passes only, which is a documented property of the
+         * profile, not a fallback. An explicit `setHpfCutoffHz()` call wins
+         * over all of this (S8).
+         *
+         * The stage also carries the profile's LEVEL TRIM, so a profile switch
+         * is a change of character and not of loudness. The trim is matched on
+         * crest-weighted loudness — `0.75 * RMS_dBFS + 0.25 * peak_dBFS`
+         * against `Legacy`, a documented heuristic rather than a standard —
+         * because matching RMS alone was tried first and sounded louder than
+         * `Legacy` on hardware: the chain's crest factor is 13–14 dB against
+         * `Legacy`'s 4.6 dB, so equal RMS lifts every transient by 3–4 dB. On
+         * the canonical track the two profiles are therefore lifted only
+         * **1.10 dB** (`Nes`) and **1.90 dB** (`Hybrid`) after the chain and
+         * before the master bitcrush, which leaves them about 2.2 / 2.4 dB
+         * BELOW `Legacy` in RMS — deliberately, since a crest-weighted match
+         * must never end up louder in RMS than the anchor. `Legacy` is the
+         * frozen anchor and stays at unity — it never runs the chain, so it
+         * never runs the multiply either. Both the amount and the activation
+         * are resolved once per configuration change. The trim is tied to the
+         * chain, so an explicit `setHpfCutoffHz()` suppresses it too: that
+         * caller asked for the historical one-pole, level included. Headroom
+         * is the price of the chain's transients: with these trims the
+         * canonical peaks are ~37 % of full scale (`Nes`) and ~41 %
+         * (`Hybrid`), against `Legacy`'s 18 %, and a dense mix reaches ~52 %
+         * and ~51 % — under the rail, but with less room than `Legacy`'s ~36 %,
+         * so a consumer mixing by peak should still check its master level.
+         *
+         * SAW is the one waveform whose TIMBRE the profile changes (S4): only
+         * `Hybrid` reads a band-limited table, a mipmap of eight 256-point Q15
+         * octaves selected from the voice's own `f / fs`, crossfaded between
+         * adjacent levels so a glissando has no seam (S6). `Legacy` and `Nes`
+         * both keep the ideal ramp and its aliasing; `Nes` does so on purpose
+         * (P4) — its PULSE character deliberately reproduces the NES's own
+         * artefacts, and the untuned SAW is simply left alone rather than
+         * given a half-NES treatment. SINE is unchanged on every profile:
+         * it is a single harmonic, so band-limiting it would spend flash to
+         * remove an artefact it does not have (L5).
+         *
+         * Thread safety: like `setVoiceNesOptions`, this mutates configuration
+         * the renderer reads and is NOT safe to call concurrently with
+         * rendering — write it from the audio thread. From the game thread use
+         * `AudioCommandType::SET_SOUND_PROFILE`, which `processCommands`
+         * dispatches here, so both entry points produce identical state.
+         *
+         * `init()` deliberately leaves it alone: a stream restart must not
+         * discard the caller's choice.
+         *
+         * @param profile Profile to apply. `Legacy`, `Nes` or `Hybrid`;
+         *                anything else is ignored.
+         */
+        void setSoundProfile(SoundProfile profile);
+
+        /**
+         * @brief Read back the active sound profile.
+         *
+         * S4. A plain read of the stored selector, so it is safe to call from
+         * any thread. Returns `SoundProfile::Legacy` until one is selected.
+         *
+         * @return Profile currently in force.
+         */
+        SoundProfile getSoundProfile() const;
 
         // -- NES frame counter (Hito 2 M3) -----------------------------
         /**
@@ -633,6 +765,26 @@ namespace pixelroot32::audio {
          * @param slot Voice index [0, MAX_VOICES); out-of-range returns 0.
          */
         float getVoiceDutySweepPerSampleForTesting(int slot) const;
+        /**
+         * @brief Test-only: current Q32 phase increment of a voice slot.
+         * @note Available only when UNIT_TEST is defined. Not for game code.
+         * @param slot Voice index [0, MAX_VOICES); out-of-range returns 0.
+         * @return The increment the integer core renders the slot with, or 0.
+         */
+        uint32_t getVoicePhaseIncQ32ForTesting(int slot) const;
+        /**
+         * @brief Test-only: SAW mipmap level the `Hybrid` read selects.
+         *
+         * Exposes the production selector (`level = floor(log2(q)) + 9`,
+         * clamped to [0, 7], `q = phaseIncQ32 / 2^32`) so a test can assert it
+         * against the band layout of `AudioOscMipLUT.h` without reimplementing
+         * the renderer. Pure: it reads no voice state.
+         *
+         * @note Available only when UNIT_TEST is defined. Not for game code.
+         * @param phaseIncQ32 Phase increment in Q32 cycles per sample.
+         * @return Mipmap level in [0, SAW_MIP_LEVEL_COUNT - 1].
+         */
+        static int sawMipmapLevelForTesting(uint32_t phaseIncQ32);
 
         // -- NES frame counter test diagnostics (Hito 2 M3) ------------
         /**
@@ -855,6 +1007,20 @@ namespace pixelroot32::audio {
          */
         uint8_t getVoiceNesNoiseLutIndexForTesting(int slot) const;
 
+        // -- Unipolar NOISE test diagnostics (E1/S5) -------------------
+        /**
+         * @brief Test-only: resolved unipolar gate of a voice slot.
+         *
+         * Reports the per-voice mirror the integer core renders with, i.e. the
+         * value after `applyProfileCharacter` resolved the profile default and
+         * after any voice-level override. Never "undecided": the mirror is a
+         * plain flag, not a tri-state.
+         *
+         * @param slot Voice index [0, MAX_VOICES); out-of-range returns false.
+         * @return true when a NOISE voice gates between 0 and the level.
+         */
+        bool isVoiceNoiseUnipolarForTesting(int slot) const;
+
         // -- Master HPF test diagnostics (Hito 4 M10) ------------------
         /** @brief Test-only: current HPF feedback coefficient R. */
         float getHpfRForTesting() const;
@@ -868,6 +1034,135 @@ namespace pixelroot32::audio {
         // -- Soft-clip test diagnostics (Hito 4 M11) -------------------
         /** @brief Test-only: current master output shaping curve. */
         SoftClipMode getSoftClipModeForTesting() const;
+
+        // -- Mixer curve test diagnostics (E1/S4) -----------------------
+        /**
+         * @brief Test-only: mixer curve the active profile selects.
+         *
+         * Reports the value the renderer will use, derived from the profile
+         * selector. There is no matching setter on purpose: the curve is
+         * profile character (D-3 tier 1), so `setSoundProfile` is the only way
+         * to change it and this accessor is the way to observe that.
+         *
+         * @return `Rational` under `Legacy`, `NesWeighted` under `Nes` and
+         *         `Hybrid`.
+         */
+        MixerCurve getMixerCurveForTesting() const;
+
+        // -- Sound profile test diagnostics (S4/S5) --------------------
+        /**
+         * @brief Test-only: number of `applyProfileCharacter` applications so far.
+         *
+         * Structural proof of the S5 ordering: one application per note-on,
+         * and after the `nesAccurate` / `initNesSafe` block.
+         *
+         * @return Monotonic count since construction.
+         */
+        uint32_t getProfileApplyCountForTesting() const;
+
+        /**
+         * @brief Test-only: the Q15 level trim the active profile applies.
+         *
+         * The trim is profile character with no setter, so this is the only way
+         * to observe it. It exists so a test that derives a relation from the
+         * trim ratio reads the value the renderer used instead of keeping a
+         * second copy of the constant: a hand-copied constant goes stale the
+         * first time the trim is retuned, and that has already happened once.
+         *
+         * @return `kProfileTrimUnityQ15` under `Legacy`, the profile's gain
+         *         otherwise; unity when `setHpfCutoffHz` suppressed the chain.
+         */
+        int32_t getProfileTrimQ15ForTesting() const;
+
+        // -- Envelope curve test diagnostics (E1/S2) -------------------
+        /**
+         * @brief Test-only: resolved ADSR curve of a voice slot.
+         *
+         * Reports the per-voice mirror after `initVoiceFromEvent` has run, i.e.
+         * the value the renderer will use: never `ProfileDefault`.
+         *
+         * @param slot Voice index [0, MAX_VOICES); out-of-range returns
+         *             `EnvelopeCurve::ProfileDefault`.
+         * @return Resolved curve of the slot.
+         */
+        EnvelopeCurve getVoiceEnvelopeCurveForTesting(int slot) const;
+
+        /**
+         * @brief Test-only: current Q15 ADSR level of a voice slot.
+         *
+         * Exposes the mirror the integer core actually renders with, so the
+         * envelope curve can be compared against its analytic model sample by
+         * sample instead of being inferred from PCM.
+         *
+         * @param slot Voice index [0, MAX_VOICES); out-of-range returns 0.
+         * @return Envelope level in Q15 (0..32768), or 0 if invalid.
+         */
+        int32_t getVoiceEnvelopeLevelQ15ForTesting(int slot) const;
+
+        // -- Output filter chain test diagnostics (E2/S1-S3, S8) -----------
+        /**
+         * @brief Test-only: true when the profile chain is installed.
+         *
+         * Reports the resolved state the render loop reads: `Nes`/`Hybrid`
+         * with no caller `setHpfCutoffHz` override.
+         * @return true when the render loop runs the three-stage chain.
+         */
+        bool isOutputFilterChainActiveForTesting() const;
+
+        /**
+         * @brief Test-only: true when the LPF is part of the installed chain.
+         *
+         * False when the chain itself is inactive, and false below the
+         * `0.45 * fs >= 6000 Hz` floor, where the chain is the two
+         * high-passes only.
+         * @return true when the Butterworth stage runs.
+         */
+        bool isOutputFilterLpfActiveForTesting() const;
+
+        /** @brief Test-only: Q15 pole of the 90 Hz high-pass. */
+        int32_t getOutputFilterHpf1RQ15ForTesting() const;
+        /** @brief Test-only: Q15 pole of the 440 Hz high-pass. */
+        int32_t getOutputFilterHpf2RQ15ForTesting() const;
+        /** @brief Test-only: Q15 `b0` of the Butterworth LPF. */
+        int32_t getOutputFilterLpfB0Q15ForTesting() const;
+        /** @brief Test-only: Q15 `b1` of the Butterworth LPF. */
+        int32_t getOutputFilterLpfB1Q15ForTesting() const;
+        /** @brief Test-only: Q15 `b2` of the Butterworth LPF. */
+        int32_t getOutputFilterLpfB2Q15ForTesting() const;
+        /** @brief Test-only: Q15 `a1` of the Butterworth LPF. */
+        int32_t getOutputFilterLpfA1Q15ForTesting() const;
+        /** @brief Test-only: Q15 `a2` of the Butterworth LPF. */
+        int32_t getOutputFilterLpfA2Q15ForTesting() const;
+        /** @brief Test-only: resolved 90 Hz corner. */
+        float getOutputFilterHpf1CutoffHzForTesting() const;
+        /** @brief Test-only: resolved 440 Hz corner. */
+        float getOutputFilterHpf2CutoffHzForTesting() const;
+        /** @brief Test-only: resolved LPF corner; 0 when the LPF is off. */
+        float getOutputFilterLpfCutoffHzForTesting() const;
+
+        /**
+         * @brief Test-only: largest |state| across both output stages.
+         *
+         * Covers the chain's four recursions and the historical one-pole, so a
+         * stability run can assert the recursion stays inside the int16 bound
+         * instead of inferring it from the output.
+         * @return Maximum absolute state value.
+         */
+        int32_t getOutputFilterStateMaxAbsForTesting() const;
+
+        /** @brief Test-only: clears both output stages' recursion state. */
+        void resetOutputFilterStateForTesting();
+
+        /**
+         * @brief Test-only: runs `applyOutputStage` over an injected buffer.
+         *
+         * Same function `renderIntegerCore` calls per sample, including the
+         * final int16 clamp and the master bitcrush, so a test observes the
+         * production stage and not a copy of its math.
+         * @param buffer Mono int16 samples, rewritten in place.
+         * @param length Number of samples.
+         */
+        void processOutputStageForTesting(int16_t* buffer, int length);
 #endif
 
     private:
@@ -887,6 +1182,74 @@ namespace pixelroot32::audio {
         Voice* findVoiceForSfxEvent(WaveType type);
         Voice* findVoiceForPercussionHit();
         float generateSampleForVoice(Voice& voice);
+
+        // -- Render core selection (S3) ------------------------------------
+        /**
+         * @brief Reports whether the active profile renders through the integer core.
+         *
+         * Derived from the profile selector and the build's float-path switch,
+         * never from `PR32_APU_HAS_FPU`: on an FPU target `Nes`/`Hybrid` still
+         * pick the integer body, and with `PR32_APU_ENABLE_LEGACY_FLOAT == 0`
+         * `Legacy` falls back to it as well.
+         *
+         * Evaluated once per rendered block, never per sample.
+         *
+         * @return true if `generateSamples` must use the integer core.
+         */
+        bool profileUsesIntegerCore() const {
+            return (profile_ != SoundProfile::Legacy) || (PR32_APU_ENABLE_LEGACY_FLOAT == 0);
+        }
+
+        /**
+         * @brief Renders one block through the portable integer/Q15 core.
+         *
+         * The single core every target can run (S2/S3), so this definition is
+         * never compiled out. `generateSamples` owns the shared prologue
+         * (command drain, sequencer) and the post-mix hook; this method owns
+         * only the per-sample loop.
+         *
+         * @param stream Output buffer (mono, int16 samples).
+         * @param length Number of samples; the caller guarantees length > 0.
+         */
+        void renderIntegerCore(int16_t* stream, int length);
+
+#if PR32_APU_ENABLE_LEGACY_FLOAT
+        /**
+         * @brief Renders one block through the frozen `Legacy` float core.
+         *
+         * S1: this body is a contract. Only the mechanical extraction that
+         * created it may touch it — no sound fix or optimization lands here.
+         * Compiled only when the float path is enabled for this build.
+         *
+         * @param stream Output buffer (mono, int16 samples).
+         * @param length Number of samples; the caller guarantees length > 0.
+         */
+        void renderFloatLegacy(int16_t* stream, int length);
+#endif
+
+        /**
+         * @brief Applies the active profile's character to one voice.
+         *
+         * S5: the only place a profile writes character — envelope curve, mix
+         * weighting, output filters, default duty, noise LUT, unipolar output
+         * and pan/echo enablement. Called at the very end of
+         * `initVoiceFromEvent`, after the `nesAccurate` / `initNesSafe` block,
+         * so the note's own values are already in place when it runs.
+         *
+         * The mix weighting is profile character too, but it has no per-voice
+         * field: `renderIntegerCore` resolves the `MixerCurve` from the
+         * profile once per block (S4), so there is nothing for this function
+         * to write for it and nothing that could be half-applied per voice.
+         *
+         * E0: `Nes`/`Hybrid` are exact aliases and therefore write nothing —
+         * the note path already leaves those values (S3). E1 fills the body:
+         * the envelope curve (S2), the noise character (S5) and the stepped
+         * PULSE duty (S6), each as a DEFAULT the note or the voice may pin.
+         *
+         * @param slot Voice index [0, MAX_VOICES); the caller guarantees it is
+         *             a valid voice of the pool.
+         */
+        void applyProfileCharacter(int slot);
 
         // -- Channels and I/O ---------------------------------------------
         Voice voices[MAX_VOICES];
@@ -926,6 +1289,149 @@ namespace pixelroot32::audio {
         bool hpfEnabled_ = true;
         float hpfR_ = kHpfLegacyR;
         int32_t hpfRQ15_ = kHpfLegacyRQ15;
+        /**
+         * S8: true once the caller has called `setHpfCutoffHz`. A set corner
+         * outranks the profile's output chain; `reset()` clears it.
+         */
+        bool hpfCutoffOverridden_ = false;
+
+        // -- Output filter chain, `Nes` / `Hybrid` (E2/S1) ------------------
+        //
+        // One shared stage on the summed mix: HPF 90 Hz -> HPF 440 Hz ->
+        // Butterworth LPF. The one-pole above is the `Legacy` stage and keeps
+        // running unchanged when the chain is inactive; the render loop picks
+        // one or the other per sample through `applyOutputStage`.
+        //
+        // The two first-order high-passes are DELIBERATELY kept as two
+        // sections instead of being merged into one second-order section with
+        // `b = [1, -2, 1]`. The merge is exact in real arithmetic, but the
+        // chain input is already quantised to int16: the second difference of
+        // a 20 Hz tone at half scale is ~0.5 LSB, below the ~2 LSB of
+        // quantisation noise it differentiates, so the merged form loses the
+        // bottom of the band (measured -45 dB instead of -0.35 dB at 20 Hz).
+        // The cascade's intermediate state is what keeps that resolution, and
+        // the cost is recovered below by replacing the 64-bit divisions with
+        // truncating shifts and the 64-bit products with int32 ones.
+        //
+        // All coefficients are Q15 in `int32_t`: the LPF's `b1` can exceed 1
+        // (up to ~2 near 0.45 * fs), so it does not fit the 16-bit range the
+        // one-pole uses. Products are int32_t because |coefficient| < 2^16 and
+        // |state| < 2^15; only the SUM of the LPF's five products needs
+        // `int64_t`.
+        static constexpr float kOutputHpf1Hz = 90.0f;
+        static constexpr float kOutputHpf2Hz = 440.0f;
+        static constexpr float kOutputLpfMaxHz = 14000.0f;
+        /** 0.45 * fs floor below which the LPF would gut the passband. */
+        static constexpr float kOutputLpfMin45FsHz = 6000.0f;
+
+        /**
+         * Bounds that make the fixed-point arithmetic provably safe.
+         *
+         * `kOutputCoeffQ15Max` is below 2^16 and every coefficient is clamped
+         * to it, and `kOutputStateQ15Max` is 2^15 and every recursion state is
+         * saturated to the int16 rail before it is stored. A product is
+         * therefore below 2^31 and fits `int32_t`; a five-term sum does not,
+         * which is why the LPF accumulator is `int64_t`.
+         */
+        static constexpr int32_t kOutputCoeffQ15Max = 65535;
+        static constexpr int32_t kOutputStateQ15Max = 32768;
+        static_assert(kOutputCoeffQ15Max < 65536,
+                      "output chain coefficient must stay below 2^16");
+        static_assert(kOutputStateQ15Max <= 32768,
+                      "output chain state must stay inside the int16 rail");
+        static_assert(
+            static_cast<int64_t>(kOutputCoeffQ15Max) * kOutputStateQ15Max <=
+                2147483647LL,
+            "one coefficient*state product must fit int32_t");
+        static_assert(
+            5 * static_cast<int64_t>(kOutputCoeffQ15Max) * kOutputStateQ15Max <=
+                9223372036854775807LL,
+            "the five-term accumulator must fit int64_t");
+
+        /**
+         * Fixed per-profile output trim, Q15, applied after the chain and
+         * before the master bitcrush.
+         *
+         * ANCHOR: crest-weighted loudness, `W = 0.75 * RMS_dBFS +
+         * 0.25 * peak_dBFS`, matched to `Legacy`. This is a documented
+         * heuristic, not a standard, and it is stated here so it can be argued
+         * with. It exists because pure RMS was tried first and the EAR
+         * rejected it: `Legacy`'s crest factor on the canonical track is
+         * 4.6 dB against the chain's 13.3 / 14.3 dB, so equal RMS lifts every
+         * transient by 3-4 dB and the two profiles sounded louder and clearer
+         * than `Legacy` on hardware (listening check, 2026-10-28). Pure peak
+         * would overcorrect below the un-trimmed level; 0.75 / 0.25 lands
+         * between the two and is what ships.
+         *
+         * Measured on the canonical fixtures (22 050 samples at 44 100 Hz)
+         * BEFORE any trim, with the INTEGER `Legacy` route as the anchor
+         * because the trim lives in that core:
+         *
+         *            RMS dBFS   peak dBFS    W
+         *   Legacy    -19.70     -15.10    -18.55   (frozen contract; unity)
+         *   Nes       -22.98      -9.67    -19.65   -> +1.10 dB -> 37192
+         *   Hybrid    -24.01      -9.69    -20.43   -> +1.90 dB -> 40780
+         *
+         * with `gainQ15 = round(10^(dB/20) * 32768)`: the two integers below
+         * are exactly that value for 1.10 dB and 1.90 dB, so a reader can
+         * re-derive them from the dB figures above. Both trims are SMALLER
+         * than the equal-RMS trims that shipped first and were walked back
+         * (+3.28 / +4.31 dB, constants 47786 / 53854); the resulting RMS sits
+         * about 2.2 / 2.4 dB BELOW `Legacy`, which is the intended landing
+         * zone — a crest-weighted match must be quieter in RMS than the
+         * anchor, never louder. The float `Legacy` route reads -20.15 dBFS and
+         * is deliberately NOT matched: touching it would move the frozen path.
+         *
+         * `Legacy` never pays for this. The trim is applied only on the chain
+         * branch of the render path, and `Legacy` never takes that branch, so
+         * the multiply cannot reach the frozen arithmetic even as a no-op.
+         *
+         * The product bound is the same class as the coefficients above:
+         * |sample| <= 32767 and the largest trim is 40780, so
+         * 32767 * 40780 = 1 336 238 260 < 2^31 and the product fits `int32_t`.
+         * The result is clamped to the int16 rail like every other stage
+         * output — the trim is the only stage that can push a legal chain
+         * output back over it.
+         */
+        static constexpr int32_t kProfileTrimUnityQ15 = 32768;   ///< 1.0, `Legacy`
+        static constexpr int32_t kProfileTrimNesQ15 = 37192;     ///< +1.10 dB
+        static constexpr int32_t kProfileTrimHybridQ15 = 40780;  ///< +1.90 dB
+        static_assert(
+            static_cast<int64_t>(32767) * kProfileTrimHybridQ15 <= 2147483647LL,
+            "trim * sample must fit int32_t (32767 * 40780 = 1336238260)");
+
+        /** True when the profile owns the stage and no caller override exists. */
+        bool outputFilterActive_ = false;
+        /** False below the 6 kHz floor; the chain is then the two HPFs only. */
+        bool outputLpfActive_ = false;
+        int32_t outHpf1RQ15_ = 0;
+        int32_t outHpf2RQ15_ = 0;
+        int32_t outLpfB0Q15_ = 0;
+        int32_t outLpfB1Q15_ = 0;
+        int32_t outLpfB2Q15_ = 0;
+        int32_t outLpfA1Q15_ = 0;
+        int32_t outLpfA2Q15_ = 0;
+        // Recursion state, all clamped to the int16 range by the stage itself.
+        int32_t outHpf1PrevInQ15_ = 0;
+        int32_t outHpf1PrevOutQ15_ = 0;
+        int32_t outHpf2PrevInQ15_ = 0;
+        int32_t outHpf2PrevOutQ15_ = 0;
+        int32_t outLpfX1Q15_ = 0;
+        int32_t outLpfX2Q15_ = 0;
+        int32_t outLpfY1Q15_ = 0;
+        int32_t outLpfY2Q15_ = 0;
+        // Resolved corners in Hz; `outLpfCutoffHz_` is 0 when the LPF is off.
+        float outHpf1CutoffHz_ = kOutputHpf1Hz;
+        float outHpf2CutoffHz_ = kOutputHpf2Hz;
+        float outLpfCutoffHz_ = 0.0f;
+        /**
+         * Level trim of the ACTIVE profile, resolved with the activation
+         * itself (`recomputeOutputFilterCoefficients`) so it is configuration,
+         * never a per-sample or per-block computation. It stays at unity while
+         * the chain is inactive: an explicit `setHpfCutoffHz` asks for the
+         * historical one-pole, level included (S8).
+         */
+        int32_t outTrimQ15_ = kProfileTrimUnityQ15;
 
         // -- Soft-clip configuration (Hito 4 M11) --------------------------
         /**
@@ -935,12 +1441,153 @@ namespace pixelroot32::audio {
          */
         SoftClipMode softClipMode_ = SoftClipMode::Rational;
 
+        // -- Sound profile (S4) --------------------------------------------
+        /**
+         * Global character set for every voice. Configuration, not state:
+         * `init()` leaves it alone, so a stream restart keeps the caller's
+         * choice. T4 adds the core dispatch and the hot-switch
+         * synchronisation here.
+         */
+        SoundProfile profile_ = SoundProfile::Legacy;
+
         /**
          * Derive `hpfR_` / `hpfRQ15_` from `hpfCutoffHz_` and the current
          * sample rate. Called by `init` (so a configured corner follows a
          * rate change) and by `setHpfCutoffHz`. Never called per sample.
          */
         void recomputeHpfCoefficients();
+
+        /**
+         * @brief Derive the `Nes` / `Hybrid` output chain from profile and rate.
+         *
+         * Called by `init` (a configured corner is in Hz, so it follows the
+         * rate), by `setSoundProfile` (the profile decides whether the chain
+         * is installed) and by `setHpfCutoffHz` (the caller override flips it
+         * off). Never called per sample or per block: the render loop copies
+         * `outputFilterActive_` and the pre-computed Q15 coefficients into its
+         * block-local stage snapshot once, and the sample loop only reads that.
+         *
+         * The LPF is computed with the RBJ low-pass at Q = 1/sqrt(2) and its
+         * corner is `min(14000 Hz, 0.45 * fs)`, engaged only when
+         * `0.45 * fs >= 6000 Hz`. The transcendentals are confined here, on a
+         * configuration change, so no `exp`/`sin`/`cos` reaches the render
+         * path even on a soft-float target. They are evaluated in `float`,
+         * not `double`: the coefficients are quantised to Q15 immediately, so
+         * double precision buys nothing and pulls the soft-float libm
+         * transcendants into the image (the E2 flash regression).
+         */
+        void recomputeOutputFilterCoefficients();
+
+        /**
+         * @brief Clears the recursion state of the output chain.
+         *
+         * A new rate, a new profile or a reset must not leave a stale
+         * coefficient/state pair ringing; called from all three paths.
+         */
+        void resetOutputFilterState();
+
+        /**
+         * @struct OutputStageStateQ15
+         * @brief Block-local snapshot of the integer output stage.
+         *
+         * The stage is the only reader and writer of its own state, and it runs
+         * on every sample, so the render loop copies it out of the class once
+         * per block and writes it back once. Read through `this`, the ten
+         * recursion words plus the coefficients, the trim and the three flags
+         * cost twenty-two member loads and stores per sample for six multiplies
+         * of arithmetic; held in a local, the compiler is free to keep the words
+         * that stay live across iterations in registers.
+         *
+         * It holds no new state and changes no arithmetic: every field is a
+         * verbatim copy of a member below, and `captureOutputStageState` /
+         * `restoreOutputStageState` are the only two places that move between
+         * them. That mechanical copy is what makes the hoist bit-exact — a
+         * member added to the stage must be added to this struct and to both
+         * helpers, never handled inline at a call site.
+         */
+        struct OutputStageStateQ15 {
+            /** Stage selection; block-constant, resolved on a config change. */
+            bool chainActive;          ///< `outputFilterActive_`
+            bool lpfActive;            ///< `outputLpfActive_`
+            bool legacyHpfEnabled;     ///< `hpfEnabled_`
+            /** Coefficients, all Q15 in `int32_t` (see `kOutputCoeffQ15Max`). */
+            int32_t legacyRQ15;        ///< `hpfRQ15_`, the historical pole
+            int32_t hpf1RQ15;          ///< `outHpf1RQ15_`
+            int32_t hpf2RQ15;          ///< `outHpf2RQ15_`
+            int32_t lpfB0Q15;          ///< `outLpfB0Q15_`
+            int32_t lpfB1Q15;          ///< `outLpfB1Q15_`
+            int32_t lpfB2Q15;          ///< `outLpfB2Q15_`
+            int32_t lpfA1Q15;          ///< `outLpfA1Q15_`
+            int32_t lpfA2Q15;          ///< `outLpfA2Q15_`
+            /**
+             * Level trim of the active profile, Q15; applied after the chain,
+             * never on the `Legacy` branch (see `kProfileTrimNesQ15`).
+             */
+            int32_t trimQ15;           ///< `outTrimQ15_`
+            /** Recursion state; every word is saturated to the int16 rail. */
+            int32_t legacyPrevInQ15;   ///< `hpfPrevInQ15`
+            int32_t legacyPrevOutQ15;  ///< `hpfPrevOutQ15`
+            int32_t hpf1PrevInQ15;     ///< `outHpf1PrevInQ15_`
+            int32_t hpf1PrevOutQ15;    ///< `outHpf1PrevOutQ15_`
+            int32_t hpf2PrevInQ15;     ///< `outHpf2PrevInQ15_`
+            int32_t hpf2PrevOutQ15;    ///< `outHpf2PrevOutQ15_`
+            int32_t lpfX1Q15;          ///< `outLpfX1Q15_`
+            int32_t lpfX2Q15;          ///< `outLpfX2Q15_`
+            int32_t lpfY1Q15;          ///< `outLpfY1Q15_`
+            int32_t lpfY2Q15;          ///< `outLpfY2Q15_`
+        };
+
+        /**
+         * @brief Copies the live output stage into a block-local snapshot.
+         *
+         * Called once per rendered block, never per sample.
+         *
+         * @return Snapshot of every field `OutputStageStateQ15` names.
+         */
+        OutputStageStateQ15 captureOutputStageState() const;
+
+        /**
+         * @brief Writes a block-local snapshot's recursion state back.
+         *
+         * The counterpart of `captureOutputStageState`; called once per block,
+         * after the sample loop, so the next block (and every test accessor)
+         * sees the state the loop ended on. Only the recursion words travel
+         * back: the stage's configuration is read-only for the duration of a
+         * block, because its writers (`recomputeOutputFilterCoefficients`,
+         * `setSoundProfile`, `setHpfCutoffHz`, `resetOutputFilterState`) never
+         * run inside the loop. That includes the profile trim, which is
+         * configuration (see `kProfileTrimNesQ15`), not state.
+         *
+         * @param state Snapshot produced by `captureOutputStageState`.
+         */
+        void restoreOutputStageState(const OutputStageStateQ15& state);
+
+        /**
+         * @brief The complete integer output stage for one Q15 sample.
+         *
+         * The single entry point `renderIntegerCore` uses: the profile chain
+         * (HPF 90 Hz -> HPF 440 Hz -> Butterworth LPF) when `chainActive`,
+         * otherwise the historical single-pole HPF, which is the frozen
+         * `Legacy` arithmetic. Extracted verbatim so the same code the renderer
+         * runs can be driven over a test buffer.
+         *
+         * Every stage saturates its own state to [-32768, 32767], so a corrupt
+         * coefficient can never wrap the recursion. Every Q15 feedback product
+         * is `int32_t` (see the bounds above) and is rescaled by a truncating
+         * shift, not a division and not an arithmetic shift: a floor shift
+         * freezes the DC decay on a permanent offset, while division truncates
+         * toward zero (see the historical one-pole comment).
+         *
+         * `static` and `inline` because it is a pure function of its arguments:
+         * it reads nothing from `this`, so the per-sample path can carry the
+         * state in a local and the call disappears into the loop body.
+         *
+         * @param inputQ15 Post-shaping mix sample in Q15.
+         * @param state Stage configuration and recursion state, updated in place.
+         * @return Stage output, clamped to the int16 range.
+         */
+        static inline int32_t applyOutputStage(int32_t inputQ15,
+                                               OutputStageStateQ15& state);
 
         // -- Profiling ring buffer (thread-safe offload) --------------------
         ProfileEntry profileRing[PROFILE_RING_SIZE];
@@ -1017,6 +1664,8 @@ namespace pixelroot32::audio {
         int nesLinearCounterTickCountForTesting_ = 0;
         int nesSweepTickCountForTesting_ = 0;
         int nesIrqSetCountForTesting_ = 0;
+        /** Applications of `applyProfileCharacter` (S5 ordering proof). */
+        uint32_t profileApplyCount_ = 0;
 #endif
     };
 
