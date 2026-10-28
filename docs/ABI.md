@@ -167,7 +167,7 @@ The suite (`ctest`) includes `test_apu_mirror` with a **golden PCM** (`test/gold
 
 ### 9.1 Targets and case counts
 
-Measured 2026-10-28 on the sound-profile branch (`cmake -S . -B build -G "MinGW Makefiles" -DPR32_APU_BUILD_TESTS=ON`, `cmake --build build`, `cd build && ctest --output-on-failure` → `100% tests passed out of 13`). The case counts are Unity's summary line, each binary run from `test/`:
+Measured 2026-10-28 on the sound-profile branch (`cmake -S . -B build -G "MinGW Makefiles" -DPR32_APU_BUILD_TESTS=ON`, `cmake --build build`, `cd build && ctest --output-on-failure` → `100% tests passed out of 15`). The case counts are Unity's summary line, each binary run from `test/`:
 
 | Target | Cases | What it covers |
 |---|---|---|
@@ -178,13 +178,15 @@ Measured 2026-10-28 on the sound-profile branch (`cmake -S . -B build -G "MinGW 
 | `test_apu_mirror` | 37 | Tool Suite parity, byte-for-byte against the float golden |
 | `test_apu_output_filter` | 11 | E2 output chain: measured response, full-scale stability, `setHpfCutoffHz` precedence, `Legacy` one-pole |
 | `test_apu_output_filter_integer` | 11 | The same suite where `Legacy` has no float body (`PR32_APU_ENABLE_LEGACY_FLOAT=0`) |
+| `test_apu_wavetable_spectral` | 5 | E2/S4: the generated SAW mipmap — band limit per level, seam-free tables, the S5 alias sweep |
+| `test_apu_hybrid_wavetable` | 5 | E2/T3: `Hybrid` reads the tables (level from the voice's own increment, crossfade), `Nes`/`Legacy` keep the ramp, SINE inert |
 | `test_q15_smoke` | 15 | Integer/Q15 path smoke coverage |
 | `test_apu_integer_golden` | 1 | The integer core against the `Legacy` integer golden (FPU build with the float body off) |
 | `test_apu_integer_golden_no_fpu` | 1 | The same golden from a build with no FPU at all |
 | `test_apu_profile_golden` | 2 | `Nes` and `Hybrid` against their own goldens (FPU build with the float body off) |
 | `test_apu_profile_golden_no_fpu` | 2 | The same two goldens from a build with no FPU at all |
 | `test_library_link` | 4 | Public symbols exist in the shipped artifact (links, no `UNIT_TEST`) |
-| **Total** | **549** | 0 failures, 0 ignored, exit code 0 in all thirteen |
+| **Total** | **559** | 0 failures, 0 ignored, exit code 0 in all fifteen |
 
 The five continuous-duty cases added by the full-scale fix (`test_pulse_duty_full_scale_*`, `test_pulse_duty_zero_never_goes_positive`, `test_pulse_duty_interior_value_unchanged`) live in `test/test_apu_core.cpp`, so both core targets run them; that is the 205 → 210 step on the two rows above.
 

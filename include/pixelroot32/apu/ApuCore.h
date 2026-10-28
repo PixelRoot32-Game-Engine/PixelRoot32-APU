@@ -368,6 +368,17 @@ namespace pixelroot32::audio {
          * profile, not a fallback. An explicit `setHpfCutoffHz()` call wins
          * over all of this (S8).
          *
+         * SAW is the one waveform whose TIMBRE the profile changes (S4): only
+         * `Hybrid` reads a band-limited table, a mipmap of eight 256-point Q15
+         * octaves selected from the voice's own `f / fs`, crossfaded between
+         * adjacent levels so a glissando has no seam (S6). `Legacy` and `Nes`
+         * both keep the ideal ramp and its aliasing; `Nes` does so on purpose
+         * (P4) — its PULSE character deliberately reproduces the NES's own
+         * artefacts, and the untuned SAW is simply left alone rather than
+         * given a half-NES treatment. SINE is unchanged on every profile:
+         * it is a single harmonic, so band-limiting it would spend flash to
+         * remove an artefact it does not have (L5).
+         *
          * Thread safety: like `setVoiceNesOptions`, this mutates configuration
          * the renderer reads and is NOT safe to call concurrently with
          * rendering — write it from the audio thread. From the game thread use
@@ -729,6 +740,26 @@ namespace pixelroot32::audio {
          * @param slot Voice index [0, MAX_VOICES); out-of-range returns 0.
          */
         float getVoiceDutySweepPerSampleForTesting(int slot) const;
+        /**
+         * @brief Test-only: current Q32 phase increment of a voice slot.
+         * @note Available only when UNIT_TEST is defined. Not for game code.
+         * @param slot Voice index [0, MAX_VOICES); out-of-range returns 0.
+         * @return The increment the integer core renders the slot with, or 0.
+         */
+        uint32_t getVoicePhaseIncQ32ForTesting(int slot) const;
+        /**
+         * @brief Test-only: SAW mipmap level the `Hybrid` read selects.
+         *
+         * Exposes the production selector (`level = floor(log2(q)) + 9`,
+         * clamped to [0, 7], `q = phaseIncQ32 / 2^32`) so a test can assert it
+         * against the band layout of `AudioOscMipLUT.h` without reimplementing
+         * the renderer. Pure: it reads no voice state.
+         *
+         * @note Available only when UNIT_TEST is defined. Not for game code.
+         * @param phaseIncQ32 Phase increment in Q32 cycles per sample.
+         * @return Mipmap level in [0, SAW_MIP_LEVEL_COUNT - 1].
+         */
+        static int sawMipmapLevelForTesting(uint32_t phaseIncQ32);
 
         // -- NES frame counter test diagnostics (Hito 2 M3) ------------
         /**

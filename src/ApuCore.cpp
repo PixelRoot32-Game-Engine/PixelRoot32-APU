@@ -7,6 +7,7 @@
 #include "pixelroot32/apu/AudioMusicTypes.h"
 #include "pixelroot32/apu/AudioMixerLUT.h"
 #include "pixelroot32/apu/AudioOscLUT.h"
+#include "pixelroot32/apu/AudioOscMipLUT.h"
 
 #include <algorithm>
 #include <cmath>
@@ -61,6 +62,133 @@ namespace pixelroot32::audio {
     static auto generateSawSampleQ15 = [](AudioChannel& ch) -> int32_t {
         const int64_t v = ((int64_t)ch.phaseQ32 << 1) - (1LL << 32);
         return (int32_t)(v >> 17);
+    };
+
+    // ========================================================================
+    // Hybrid SAW: the band-limited mipmap read (E2/T3, S4 + S6)
+    // ========================================================================
+    // `Legacy` and `Nes` keep `generateSawSampleQ15` above, the ideal ramp with
+    // its audible aliasing. Only `Hybrid` gets the tables. The level and the
+    // crossfade weight are derived from the voice's OWN phase increment, never
+    // from `frequency`, so a sweep, LFO or pitch envelope is tracked sample by
+    // sample and no per-voice state is added (`AudioChannel` is size-pinned).
+
+    /**
+     * @brief Leading-zero count of a non-zero 32-bit value.
+     *
+     * The level depends only on which octave `phaseIncQ32` falls in, which is
+     * exactly what a leading-zero count answers. GCC/Clang targets (Xtensa
+     * `NSAU`, RISC-V `CLZ`, host) compile this to one instruction; the portable
+     * branch chain below is for anything else and is never reached on the
+     * boards this library ships to. Never called with 0.
+     *
+     * @param value Non-zero value to normalise.
+     * @return Number of leading zero bits, 0..31.
+     */
+    static inline int leadingZeros32(uint32_t value) {
+#if defined(__GNUC__) || defined(__clang__)
+        return __builtin_clz(value);
+#else
+        int count = 0;
+        if (value <= 0x0000FFFFu) { count += 16; value <<= 16; }
+        if (value <= 0x00FFFFFFu) { count += 8;  value <<= 8;  }
+        if (value <= 0x0FFFFFFFu) { count += 4;  value <<= 4;  }
+        if (value <= 0x3FFFFFFFu) { count += 2;  value <<= 2;  }
+        if (value <= 0x7FFFFFFFu) { count += 1; }
+        return count;
+#endif
+    }
+
+    /**
+     * @brief Mipmap level for an already-normalised leading-zero count.
+     *
+     * Level `L` covers `q` in `[2^-(9-L), 2^-(8-L))` (see
+     * `AudioOscMipLUT.h`), i.e. `L = floor(log2(q)) + 9`, clamped at both
+     * ends. With `inc = q * 2^32`, `8 - clz(inc)` is exactly that expression,
+     * so the whole selection is integer and needs no float conversion. This is
+     * the single clamp; both the per-sample path and the test hook go through
+     * it.
+     *
+     * @param zeros Leading-zero count of the increment.
+     * @return Level in [0, SAW_MIP_LEVEL_COUNT - 1].
+     */
+    static inline int sawMipLevelFromLeadingZeros(int zeros) {
+        const int level = 8 - zeros;
+        if (level < 0) return 0;
+        if (level > (int)SAW_MIP_LEVEL_COUNT - 1) {
+            return (int)SAW_MIP_LEVEL_COUNT - 1;
+        }
+        return level;
+    }
+
+    /**
+     * @brief Mipmap level whose octave of `q = f / fs` holds the increment.
+     *
+     * `inc == 0` means the oscillator does not advance; it answers level 0
+     * rather than calling `clz(0)`, which is undefined.
+     *
+     * @param phaseIncQ32 Phase increment in Q32 cycles per sample.
+     * @return Level in [0, SAW_MIP_LEVEL_COUNT - 1].
+     */
+    static inline int sawMipLevelForPhaseIncQ32(uint32_t phaseIncQ32) {
+        if (phaseIncQ32 == 0u) return 0;
+        return sawMipLevelFromLeadingZeros(leadingZeros32(phaseIncQ32));
+    }
+
+    /**
+     * @brief One Q15 point of a mipmap level, linearly interpolated.
+     *
+     * The bare `phase >> 24` read puts a ~-43 dBFS truncation floor under a
+     * table this steep; the linear blend of the two adjacent points is the
+     * read T2 measured to clear S5 (see tools/mipmap_gen/README.md). The
+     * fraction is halved before the multiply so the product of two full-range
+     * int16 neighbours cannot overflow `int32_t` on a 32-bit target; the cost
+     * is at most 1 LSB of rounding, inaudible against a Q15 sample.
+     *
+     * @param level Mipmap level to read.
+     * @param phaseQ32 Oscillator phase in Q32.
+     * @return Interpolated Q15 sample in [-32767, 32767].
+     */
+    static inline int32_t readSawMipSampleQ15(int level, uint32_t phaseQ32) {
+        const int index = (int)((phaseQ32 >> 24) & 255u);
+        const int next = (index + 1) & 255;
+        const int32_t a = SAW_MIP_Q15[level][index];
+        const int32_t b = SAW_MIP_Q15[level][next];
+        const int32_t fraction = (int32_t)((phaseQ32 >> 8) & 0xFFFFu);
+        return a + (int32_t)(((b - a) * (fraction >> 1) + 16384) >> 15);
+    }
+
+    /**
+     * @brief `Hybrid` SAW: two adjacent levels blended by the octave position.
+     *
+     * Blending, not switching, is what removes the glissando seam (S6). The
+     * position inside the level's octave is the Q8 mantissa of the increment
+     * after its leading one: at `w -> 255` the output is almost entirely
+     * level `L + 1`, and after the level increments `w -> 0` the output is
+     * still level `L + 1`. Level 7 has no upper neighbour, so it reads alone.
+     *
+     * @param ch Voice whose `phaseQ32`/`phaseIncQ32` are read.
+     * @return Q15 sample in [-32767, 32767].
+     */
+    static auto generateBandLimitedSawSampleQ15 = [](AudioChannel& ch) -> int32_t {
+        const uint32_t increment = ch.phaseIncQ32;
+        if (increment == 0u) {
+            // No advance: the phase never leaves its current point, so the
+            // level is irrelevant; level 0 is the alias-free choice.
+            return readSawMipSampleQ15(0, ch.phaseQ32);
+        }
+        const int zeros = leadingZeros32(increment);
+        const int level = sawMipLevelFromLeadingZeros(zeros);
+
+        const int32_t low = readSawMipSampleQ15(level, ch.phaseQ32);
+        if (level >= (int)SAW_MIP_LEVEL_COUNT - 1) {
+            return low;
+        }
+        // `increment << zeros` lands in [2^31, 2^32); bits 30..23 are the Q8
+        // position of the note inside its octave.
+        const int32_t weightQ8 = (int32_t)(((increment << zeros) >> 23) & 0xFFu);
+        const int32_t high = readSawMipSampleQ15(level + 1, ch.phaseQ32);
+        return low + (int32_t)(((high - low) * weightQ8 + 128) >> 8);
     };
     static auto generateNoiseSampleQ15 = [](AudioChannel& ch) -> int32_t {
         return (ch.lfsrState & 1u) ? 32767 : -32767;
@@ -1680,6 +1808,17 @@ namespace pixelroot32::audio {
         // profile except `Legacy` runs it; on `Legacy` an FPU build leaves it
         // at its note-on value. That is the same contract as `phaseQ32`.
         return voices[slot].envelope.currentLevelQ15;
+    }
+
+    uint32_t ApuCore::getVoicePhaseIncQ32ForTesting(int slot) const {
+        if (slot < 0 || slot >= MAX_VOICES) {
+            return 0u;
+        }
+        return voices[slot].phaseIncQ32;
+    }
+
+    int ApuCore::sawMipmapLevelForTesting(uint32_t phaseIncQ32) {
+        return sawMipLevelForPhaseIncQ32(phaseIncQ32);
     }
 #endif  // UNIT_TEST — the test-only accessors end here.
 
@@ -4139,6 +4278,12 @@ namespace pixelroot32::audio {
         const bool nesWeighted =
             (profileMixerCurve(profile_) == MixerCurve::NesWeighted);
 
+        // E2/S4: the mipmap read is `Hybrid` character, resolved once per block
+        // like the mixer curve rather than tested against `profile_` inside the
+        // sample loop. `Legacy` and `Nes` keep `generateSawSampleQ15`, the ideal
+        // ramp; `Nes` keeps its aliasing on purpose (P4).
+        const bool sawWavetable = (profile_ == SoundProfile::Hybrid);
+
         // S4/S5: everything the mix does to a voice that is CONSTANT for the
         // whole block is folded into one Q15 gain here, once per voice, instead
         // of being applied once per voice per sample:
@@ -4253,7 +4398,10 @@ namespace pixelroot32::audio {
                 } else if (auto gen = WAVE_GENERATORS_Q15[static_cast<int>(ch.type)]) {
                     // SAW: function pointer lookup. (TRIANGLE handled above,
                     // PULSE handled above, NOISE / SINE handled above.)
-                    s = gen(ch);
+                    // E2/S4: `Hybrid` reads the band-limited mipmap instead; the
+                    // other profiles reach the same ideal ramp as before.
+                    s = sawWavetable ? generateBandLimitedSawSampleQ15(ch)
+                                     : gen(ch);
                 } else {
                     // Fallback (should never reach)
                     s = 0;
