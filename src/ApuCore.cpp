@@ -108,6 +108,43 @@ namespace pixelroot32::audio {
     }
 
     /**
+     * @brief The unipolar NOISE gate a sound profile arms by default (S5/D-3).
+     *
+     * Tier 1 of the D-3 table owns the default and the voice may pin it. `Nes`
+     * and `Hybrid` gate the noise between 0 and the envelope level, which is
+     * what the hardware does and what makes the noise sit "on top of" the mix
+     * instead of subtracting as much energy as it adds; `Legacy` keeps the
+     * bipolar output frozen (S1), and any unknown value answers `Legacy`
+     * rather than being guessed.
+     *
+     * @param profile Profile in force.
+     * @return true when a NOISE voice should render the unipolar gate.
+     */
+    static inline bool profileDefaultNoiseUnipolar(SoundProfile profile) {
+        return profile != SoundProfile::Legacy;
+    }
+
+    /**
+     * @brief NOISE period LUT index the `Nes`/`Hybrid` profiles arm (S5).
+     *
+     * `$400E = $00`: the write the canonical NES init performs (see
+     * `initNesSafe`), i.e. the fastest of the sixteen published periods. The
+     * `Legacy` profile answers the 255 sentinel instead — "derive the period
+     * from the note" — so its noise keeps the frequency-derived clock.
+     */
+    static constexpr uint8_t kProfileNesNoiseLutIndex = 0;
+
+    /**
+     * @brief NOISE period LUT index a sound profile arms by default (S5).
+     *
+     * @param profile Profile in force.
+     * @return 0..15 for a LUT entry, 255 to derive the period from the note.
+     */
+    static inline uint8_t profileDefaultNoiseLutIndex(SoundProfile profile) {
+        return (profile == SoundProfile::Legacy) ? 255u : kProfileNesNoiseLutIndex;
+    }
+
+    /**
      * @brief The mixer curve a sound profile selects (S4/D-3).
      *
      * Tier 1 of the D-3 precedence table owns the mix shape, so the profile is
@@ -474,6 +511,56 @@ namespace pixelroot32::audio {
         if (period < 1u) period = 1u;
         return period;
     }
+
+    /**
+     * @brief Retune a NOISE voice from its period selector (S5 / Hito 3 M8).
+     *
+     * The single place that turns `nesNoiseLutIndex` into
+     * `noisePeriodSamples`, shared by the selector setter and by
+     * `applyProfileCharacter` so a profile default and an explicit write can
+     * never disagree about what an index means. 0..15 read the published NES
+     * table at the current rate; 255 (and any other sentinel) derives the
+     * period from the voice's own clock in Hz.
+     *
+     * No-op for every waveform other than NOISE, whose period the LFSR does
+     * not use. The countdown is clamped so a shorter period takes effect
+     * immediately instead of after the old, longer one elapses.
+     *
+     * @param v Voice to retune.
+     * @param sampleRate Output rate in Hz.
+     */
+    static inline void retuneNoisePeriodFromSelector(Voice& v, int sampleRate) {
+        if (v.type != WaveType::NOISE) return;
+        if (v.nesNoiseLutIndex < 16u) {
+            v.noisePeriodSamples =
+                nes_apu::nesNoisePeriodToSamples(v.nesNoiseLutIndex, sampleRate);
+        } else {
+            v.noisePeriodSamples = noise_clock_hz_to_period(v.frequency, sampleRate);
+        }
+        if (v.noiseCountdown > v.noisePeriodSamples) {
+            v.noiseCountdown = v.noisePeriodSamples;
+        }
+    }
+
+    /**
+     * @brief Level compensation of the unipolar NOISE gate, as a shift (S5/P9).
+     *
+     * A bipolar noise voice swings between -A and +A and carries AC RMS `A`. A
+     * unipolar one swings between 0 and A, so its mean is `A/2` — the DC the
+     * output blocker removes — and what is left is AC RMS `A/2`: the gate half
+     * the amplitude, i.e. -6.02 dB of energy.
+     *
+     * The compensation is therefore exactly x2 (`1 << 1`), applied once per
+     * sample after the volume and envelope multiplies and never by repeating
+     * them. It is not a taste knob: after it, the unipolar voice's AC RMS is
+     * `A` again, so the profile's MIXER weight
+     * (`kNesMixWeightNoise`, 0.00494/0.00752 of the pulse group) is the only
+     * thing that decides the noise group's level — which is what keeps S4's
+     * published ratio intact. Measured: 0.00 dB between the unipolar and the
+     * bipolar render of the same voice under the same weighting, and -3.65 dB
+     * from `Legacy`'s bipolar noise, that residual being exactly that weight.
+     */
+    static constexpr int kNoiseUnipolarCompensationShift = 1;
 
     static inline uint32_t time_sec_to_samples(float timeSec, int sr) {
         if (sr <= 0 || timeSec <= 0.0f) {
@@ -979,7 +1066,15 @@ namespace pixelroot32::audio {
         setVoiceNesEnvelopeEnabled(slot, opts.envelopeEnabled);
         setVoiceNesSweepUnitEnabled(slot, opts.sweepUnitEnabled);
         setVoicePulseDutyMode(slot, opts.pulseDutyIndex);
+        // S5: the selector setter also pins the selector against the profile's
+        // default, so the delegated call already records the tier-2 override.
         setVoiceNesNoiseLutMode(slot, opts.noiseLutIndex);
+        // S5: `noiseUnipolar` has no standalone setter on purpose (it is
+        // profile character with a per-voice override), so this write is the
+        // per-voice owner: resolve the value AND pin it, otherwise the profile
+        // would re-arm its own default on the very next note (D-3 tier 2).
+        voices[slot].noiseUnipolar = opts.noiseUnipolar;
+        voices[slot].noiseUnipolarOverridden = true;
     }
 
     VoiceNesOptions ApuCore::getVoiceNesOptions(int slot) const {
@@ -994,6 +1089,7 @@ namespace pixelroot32::audio {
         opts.sweepUnitEnabled = v.nesSweepUnit.unitEnabled;
         opts.pulseDutyIndex = v.pulseDutyIndex;
         opts.noiseLutIndex = v.nesNoiseLutIndex;
+        opts.noiseUnipolar = v.noiseUnipolar;
         return opts;
     }
 
@@ -2019,6 +2115,14 @@ namespace pixelroot32::audio {
         return voices[slot].nesNoiseLutIndex;
     }
 
+    // S5/E1: resolved unipolar gate of a voice slot.
+    bool ApuCore::isVoiceNoiseUnipolarForTesting(int slot) const {
+        if (slot < 0 || slot >= MAX_VOICES) {
+            return false;
+        }
+        return voices[slot].noiseUnipolar;
+    }
+
     // Hito 4 M10: master HPF test-only accessors.
     float ApuCore::getHpfRForTesting() const { return hpfR_; }
     int32_t ApuCore::getHpfRQ15ForTesting() const { return hpfRQ15_; }
@@ -2930,6 +3034,32 @@ namespace pixelroot32::audio {
         }
         ch.envelopeCurvePhaseQ15 = 0;
 
+        // S5 / D-3 tiers 1-2: the profile arms the unipolar NOISE gate and the
+        // NES period LUT. Both are resolved here — once per note-on, after the
+        // note and after `initNesSafe` — because the profile owns the DEFAULT
+        // only: a slot whose caller pinned either value keeps it across notes
+        // instead of being re-armed. `Legacy` answers "off, derive the period
+        // from the note", which is exactly what the note path already left
+        // behind, so its render arithmetic is untouched.
+        //
+        // Arming the LUT is a tier-2 owner of the NOISE period, so a note that
+        // asked for an explicit `noisePeriod` (or a frequency-derived clock)
+        // loses to it — the M8 precedence documented on `nesNoiseLutIndex`.
+        // `setVoiceNesNoiseLutMode(slot, 255)` is the documented way out.
+        if (!ch.noiseUnipolarOverridden) {
+            ch.noiseUnipolar = profileDefaultNoiseUnipolar(profile_);
+        }
+        if (!ch.nesNoiseLutOverridden) {
+            const uint8_t lutIndex = profileDefaultNoiseLutIndex(profile_);
+            if (ch.nesNoiseLutIndex != lutIndex) {
+                ch.nesNoiseLutIndex = lutIndex;
+                // The note computed its own period before this point, so the
+                // selector has to be applied now: otherwise the first note
+                // after a profile change would render the previous period.
+                retuneNoisePeriodFromSelector(ch, sampleRate);
+            }
+        }
+
 #if defined(UNIT_TEST)
         // Structural proof of the ordering above: a test observes exactly one
         // application per note-on, and only after the nesAccurate block ran.
@@ -3586,6 +3716,14 @@ namespace pixelroot32::audio {
             return tri_q15;
         };
         auto generateNoiseSampleQ15 = [](AudioChannel& ch) -> int32_t {
+            if (ch.noiseUnipolar) {
+                // S5/P9: the NES noise channel switches between silence and the
+                // envelope level, never to -level. Only the SOURCE changes: the
+                // level itself is still the volume x envelope multiply that runs
+                // below for every voice, and the AC-level compensation is the
+                // single shift that follows it.
+                return (ch.lfsrState & 1u) ? 32767 : 0;
+            }
             return (ch.lfsrState & 1u) ? 32767 : -32767;
         };
 
@@ -3686,6 +3824,16 @@ namespace pixelroot32::audio {
                 }
                 int32_t sv = (s * volQ15[c]) >> 15;
                 sv = (sv * envQ15) >> 15;
+
+                // S5/P9: the unipolar gate halves the AC amplitude of a NOISE
+                // voice (its mean is what the DC blocker removes), so the level
+                // is restored HERE — one shift, after the multiplies that are
+                // already there, not a second envelope multiply and not a
+                // division. `kNoiseUnipolarCompensationShift` documents why the
+                // factor is exactly 2 and what it leaves to the mixer weight.
+                if (ch.noiseUnipolar && ch.type == WaveType::NOISE) {
+                    sv <<= kNoiseUnipolarCompensationShift;
+                }
 
                 // Volume LFO (tremolo) — Q15 only, no float conversion.
                 if (ch.lfo.enabled && ch.lfo.target == LfoTarget::VOLUME) {
@@ -3950,19 +4098,14 @@ namespace pixelroot32::audio {
         // 0..15 -> LUT entry. 16..254 are invalid and fall back to the
         // documented 255 "derive from frequency" sentinel.
         v.nesNoiseLutIndex = (lutIndex < 16u) ? lutIndex : 255u;
+        // S5 / D-3 tier 2: an explicit selector pins the slot against the sound
+        // profile's default, so `255` here means "this voice derives its period
+        // from the note" for good, not only until the next note-on.
+        v.nesNoiseLutOverridden = true;
 
         // Retune now so the change is audible without waiting for a new
         // note, matching how setVoiceNesTimer re-syncs the pulse period.
-        if (v.type != WaveType::NOISE) return;
-        if (v.nesNoiseLutIndex < 16u) {
-            v.noisePeriodSamples =
-                nes_apu::nesNoisePeriodToSamples(v.nesNoiseLutIndex, sampleRate);
-        } else {
-            v.noisePeriodSamples = noise_clock_hz_to_period(v.frequency, sampleRate);
-        }
-        if (v.noiseCountdown > v.noisePeriodSamples) {
-            v.noiseCountdown = v.noisePeriodSamples;
-        }
+        retuneNoisePeriodFromSelector(v, sampleRate);
     }
 
 #if defined(UNIT_TEST)

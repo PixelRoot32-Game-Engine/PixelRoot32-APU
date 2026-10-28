@@ -286,6 +286,13 @@ namespace pixelroot32::audio {
          * selector indices land on the documented sentinels, and selecting
          * a noise LUT entry retunes a live NOISE voice immediately.
          *
+         * S5: two of the bundled fields — `noiseUnipolar` and `noiseLutIndex` —
+         * are also the per-slot override of a sound-profile default (D-3 tier
+         * 2), so applying this struct pins them: a profile will not re-arm its
+         * own value on the next note. `noiseUnipolar` has no standalone setter,
+         * which makes this method and `AudioCommandType::SET_NES_OPTIONS` its
+         * only per-voice entry points.
+         *
          * Not safe to call concurrently with rendering. Use
          * `AudioCommandType::SET_NES_OPTIONS` from the game thread — it
          * carries the same struct through the queue and applies it via this
@@ -900,6 +907,20 @@ namespace pixelroot32::audio {
          * @return 0..15 when a LUT entry is armed, 255 when off.
          */
         uint8_t getVoiceNesNoiseLutIndexForTesting(int slot) const;
+
+        // -- Unipolar NOISE test diagnostics (E1/S5) -------------------
+        /**
+         * @brief Test-only: resolved unipolar gate of a voice slot.
+         *
+         * Reports the per-voice mirror the integer core renders with, i.e. the
+         * value after `applyProfileCharacter` resolved the profile default and
+         * after any voice-level override. Never "undecided": the mirror is a
+         * plain flag, not a tri-state.
+         *
+         * @param slot Voice index [0, MAX_VOICES); out-of-range returns false.
+         * @return true when a NOISE voice gates between 0 and the level.
+         */
+        bool isVoiceNoiseUnipolarForTesting(int slot) const;
 
         // -- Master HPF test diagnostics (Hito 4 M10) ------------------
         /** @brief Test-only: current HPF feedback coefficient R. */

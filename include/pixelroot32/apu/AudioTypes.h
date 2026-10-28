@@ -620,6 +620,54 @@ namespace pixelroot32::audio {
         /** Continuous voice: no auto-disable; cleared only by STOP_CHANNEL / steal. */
         bool loop = false;
 
+        // ---- S5: NOISE character and its D-3 tier-2 overrides --------------
+        //
+        // Declared HERE, between `loop` and the sweep block, instead of at the
+        // end of the struct: these three bytes fill the alignment padding
+        // `loop` already forces, so `sizeof(AudioChannel)` — and therefore the
+        // pinned `ApuCore` size in test_apu_core.cpp — does not move. A tail
+        // append would cost a full 8-byte slot per voice and blow that budget.
+        //
+        // (No aggregate-initializer hazard: nothing in this repository
+        // positionally initializes an `AudioChannel`.)
+
+        /**
+         * @brief When type == NOISE: gate the LFSR output between 0 and the
+         *        envelope level instead of between -level and +level.
+         *
+         * S5/P9. This is the resolved value the renderer reads: the sound
+         * profile supplies it as a DEFAULT (`Nes`/`Hybrid` arm it, `Legacy`
+         * leaves it off) and a voice may override it (D-3 tier 2), which is
+         * what `noiseUnipolarOverridden` marks. On, a voice emits only 0 and
+         * non-negative levels — the NES behaviour, whose DC the output DC
+         * blocker removes — and its AC amplitude is compensated back to the
+         * bipolar one by the renderer, so switching profiles rebalances the mix
+         * instead of changing the noise loudness for free.
+         *
+         * Default false (bipolar, the frozen behaviour).
+         */
+        bool noiseUnipolar = false;
+
+        /**
+         * @brief Set once the caller pinned `noiseUnipolar` explicitly.
+         *
+         * D-3 tier 2. Without this bit the profile would re-arm its default on
+         * every note-on and a voice-level opt-out could never outlive the note
+         * it was written on. Cleared by `reset()` with the rest of the per-slot
+         * NES modes, so a recycled slot starts from the profile again.
+         */
+        bool noiseUnipolarOverridden = false;
+
+        /**
+         * @brief Set once the caller pinned `nesNoiseLutIndex` explicitly.
+         *
+         * Same D-3 tier-2 contract for the period selector: it is what lets
+         * `setVoiceNesNoiseLutMode(slot, 255)` mean "this slot derives its noise
+         * period from the note" even under a profile that arms the LUT, instead
+         * of being re-armed on the next note. Cleared by `reset()`.
+         */
+        bool nesNoiseLutOverridden = false;
+
         // Optional frequency/period sweep (melodic waves + NOISE clock)
         uint32_t sweepSamplesTotal = 0;   ///< Total samples for the sweep.
         uint32_t sweepSamplesRemaining = 0;///< Samples remaining in the sweep.
@@ -809,6 +857,12 @@ namespace pixelroot32::audio {
             triangleOctaveUp = false;     // Hito 1 M16: octave doubling opt-in
             pulseDutyIndex = 255;         // Hito 1 M2: 255 = continuous (legacy default)
             nesNoiseLutIndex = 255;       // Hito 3 M8: 255 = derive period from frequency
+            // S5: the noise character is per-slot state, so a reset slot goes
+            // back to "the profile decides" — the resolved value falls back to
+            // the bipolar gate and the overrides stop protecting a stale choice.
+            noiseUnipolar = false;
+            noiseUnipolarOverridden = false;
+            nesNoiseLutOverridden = false;
             noisePeriodSamples = 1;
             noiseCountdown = 0;
             sweepSamplesTotal = 0;
@@ -897,8 +951,16 @@ namespace pixelroot32::audio {
      * boundary through `AudioCommandType::SET_NES_OPTIONS`. The individual
      * setters remain the right tool for changing one thing.
      *
+     * The exception is `noiseUnipolar` (S5): it has no standalone setter on
+     * purpose, because it is profile character with a per-slot override rather
+     * than an independent sub-unit. This struct — and the command that carries
+     * it — is its only per-voice owner.
+     *
      * All defaults are "off", so a default-constructed instance disarms a
-     * voice completely.
+     * voice completely. That includes the two character fields: writing this
+     * struct also PINS `noiseUnipolar` and `noiseLutIndex` against the sound
+     * profile's defaults (D-3 tier 2), which is exactly what "disarm" has to
+     * mean once a profile arms them.
      *
      * NOTE: `noiseLfsrShort` is deliberately NOT here even though the
      * original M14 sketch listed it. That flag is owned per NOTE by
@@ -920,6 +982,19 @@ namespace pixelroot32::audio {
         uint8_t pulseDutyIndex = 255;
         /** M8 noise period: 0..15 select a LUT entry, 255 = from frequency. */
         uint8_t noiseLutIndex = 255;
+        /**
+         * S5/P9: gate the NOISE output between 0 and the envelope level
+         * instead of between -level and +level.
+         *
+         * Unlike `noiseLfsrShort` (per NOTE), this IS a per-SLOT mode, like the
+         * selectors above: the profile arms it by default for `Nes`/`Hybrid`
+         * and a write here pins it against that default (D-3 tier 2), so the
+         * choice survives the next note on the slot. `false` therefore means
+         * "bipolar noise", not "let the profile decide" — that value only
+         * exists while no caller has written this struct or the LUT selector on
+         * the slot.
+         */
+        bool noiseUnipolar = false;
     };
 
     /**
@@ -927,8 +1002,9 @@ namespace pixelroot32::audio {
      * @brief Named character sets applied to every voice.
      *
      * `Legacy` is the frozen compatibility contract: it reproduces the 2.0.0
-     * sound. `Nes` and `Hybrid` are aliases of `Legacy` until their character
-     * set lands, so selecting them must not change a single sample yet.
+     * sound. `Nes` and `Hybrid` select profile-owned character from E1 onwards
+     * (envelope curve, weighted mix, unipolar noise, stepped duty); the profile
+     * table in `docs/ABI.md` says what each one owns at a given phase.
      */
     enum class SoundProfile : uint8_t { Legacy = 0, Nes = 1, Hybrid = 2 };
 
@@ -990,19 +1066,27 @@ namespace pixelroot32::audio {
         /**
          * Used when type == SET_SOUND_PROFILE: profile to apply.
          *
-         * Declared here rather than beside `nesLengthHalt` because this is the
-         * only free slot: the byte lands in the alignment padding before
-         * `seekOffsetTicks`, so `sizeof(AudioCommand)` stays at 144. Taking the
-         * byte next to `nesLengthHalt` instead would push `nesOptions` past its
-         * 8-byte boundary and grow every queue slot to 152.
+         * Declared here rather than beside `nesLengthIndex` because this byte
+         * lands in the alignment padding before `seekOffsetTicks`, so
+         * `sizeof(AudioCommand)` stays at 144.
          */
         uint8_t soundProfile = 0;
+        /**
+         * Used when type == TRIGGER_NES_LENGTH: halt flag latched on the voice.
+         *
+         * Same padding slot as `soundProfile` above. It moved here when S5
+         * added `VoiceNesOptions::noiseUnipolar`: `nesLengthIndex` +
+         * `nesLengthHalt` + `nesOptions` used to fill exactly eight bytes
+         * before `subTracks`, and a seventh `nesOptions` byte spilled into the
+         * next 8-byte boundary and grew every queue slot to 152 (9 728 B for
+         * the 64-slot queue, over the 9 KB budget). One byte out of the group
+         * puts it back at eight.
+         */
+        bool nesLengthHalt = false;
         /** Used when type == MUSIC_SEEK: elapsed ticks from music play start. */
         uint64_t seekOffsetTicks = 0;
         /** Used when type == TRIGGER_NES_LENGTH: LUT index (clamped 0–31). */
         uint8_t nesLengthIndex = 0;
-        /** Used when type == TRIGGER_NES_LENGTH: halt flag latched on the voice. */
-        bool nesLengthHalt = false;
         /** Used when type == SET_NES_OPTIONS: the options to apply. */
         VoiceNesOptions nesOptions{};
         const MusicTrack* subTracks[MAX_SUB_TRACKS];
@@ -1015,9 +1099,9 @@ namespace pixelroot32::audio {
             : type(AudioCommandType::STOP_CHANNEL),
               masterBitcrushBits(0),
               soundProfile(0),
+              nesLengthHalt(false),
               seekOffsetTicks(0),
               nesLengthIndex(0),
-              nesLengthHalt(false),
               nesOptions(),
               subTracks{nullptr, nullptr, nullptr},
               subTrackCount(0) {

@@ -6265,11 +6265,27 @@ static int16_t gMixerProbe[kMixerProbeSamples];
 // Peak of the settled part of a one-voice render. The envelope reaches full
 // scale on its first sample (attack = 0), and the first 256 samples are still
 // skipped so the reading can never be a transient.
+//
+// A NOISE probe pins the BIPOLAR gate on purpose (S5/T3): the published weight
+// table was calibrated against a voice that swings between -level and +level,
+// and the unipolar gate the profiles now arm carries an exact x2 level
+// compensation (`ApuCore`'s `kNoiseUnipolarCompensationShift`). Measuring the
+// ratio on the compensated, half-wave-rectified waveform would report twice the
+// weight and say nothing about the mixer.
 static int32_t renderMixerProbePeak(SoundProfile profile, WaveType type,
                                     float volume, float duty) {
     ApuCore apu;
     configureMixerProbe(apu, profile);
     const InstrumentPreset preset = mixerProbePreset();
+    if (type == WaveType::NOISE) {
+        AudioCommand opts{};
+        opts.type = AudioCommandType::SET_NES_OPTIONS;
+        opts.channelIndex = (uint8_t)ApuCore::SFX_VOICE_BASE;
+        opts.nesOptions.noiseUnipolar = false;
+        // BEFORE the note: the bundled write also disarms the `$4015` channel
+        // enable, which would silence a voice that is already sounding.
+        TEST_ASSERT_TRUE(apu.submitCommand(opts));
+    }
     queueMixerProbeVoice(apu, type, volume, duty, preset);
     apu.generateSamples(gMixerProbe, kMixerProbeSamples);
     return peakMagnitude(gMixerProbe + 256, kMixerProbeSamples - 256);
@@ -6503,6 +6519,362 @@ void mixer_legacy_keeps_its_historical_level(void) {
     TEST_ASSERT_INT32_WITHIN_MESSAGE(1, one, renderMixerProbePeak(SoundProfile::Nes,
                                                                  WaveType::PULSE, 1.0f, 0.5f),
         "the pulse anchor must be exactly the Legacy weight");
+}
+
+// =============================================================================
+// S5 / P9: unipolar NOISE, the profile's period LUT and level compensation (E1/T3)
+// =============================================================================
+//
+// Every probe below reads the mixer's BARE output: `SoftClipMode::None` plus a
+// bypassed DC blocker (`configureMixerProbe`). That is not a convenience — the
+// default blocker is exactly the stage S5 argues about (it is what removes the
+// unipolar offset), so leaving it in would hide both the sign structure and the
+// amplitude the compensation has to restore.
+
+static constexpr int kNoiseCharacterSamples = 8192;
+
+/**
+ * @brief Renders one full-scale looping NOISE voice and returns its slot.
+ *
+ * @param profile Profile in force for the render.
+ * @param unipolarOverride -1 leaves the profile default in force; 0 or 1 pins
+ *        the gate through the queued `SET_NES_OPTIONS` path. The command goes
+ *        in BEFORE the note because the bundled write also disarms the `$4015`
+ *        channel enable, which would silence a voice that is already sounding.
+ *        The note-on that follows is then the thing that must respect the pin.
+ * @param out Destination buffer.
+ * @param samples Number of samples to render.
+ * @return Slot the voice landed on (a fresh core always uses the first SFX one).
+ */
+static int renderNoiseCharacter(SoundProfile profile, int unipolarOverride,
+                                int16_t* out, int samples) {
+    ApuCore apu;
+    configureMixerProbe(apu, profile);
+
+    if (unipolarOverride >= 0) {
+        AudioCommand opts{};
+        opts.type = AudioCommandType::SET_NES_OPTIONS;
+        opts.channelIndex = (uint8_t)ApuCore::SFX_VOICE_BASE;
+        opts.nesOptions.noiseUnipolar = (unipolarOverride != 0);
+        TEST_ASSERT_TRUE(apu.submitCommand(opts));
+    }
+
+    const InstrumentPreset preset = mixerProbePreset();
+    queueMixerProbeVoice(apu, WaveType::NOISE, 1.0f, 0.5f, preset);
+    apu.generateSamples(out, samples);
+    return ApuCore::SFX_VOICE_BASE;
+}
+
+/** @brief Mean and AC RMS of `pcm[from, to)`, in int16 units. */
+static void acRmsOf(const int16_t* pcm, int from, int to, double& mean, double& rms) {
+    double sum = 0.0;
+    double sumSq = 0.0;
+    for (int i = from; i < to; ++i) {
+        const double v = (double)pcm[i];
+        sum += v;
+        sumSq += v * v;
+    }
+    const double n = (double)(to - from);
+    mean = sum / n;
+    // AC power = E[x^2] - E[x]^2. Subtracting the mean is what makes a unipolar
+    // signal comparable with a bipolar one: the DC is not audio, it is the part
+    // the output blocker removes.
+    const double variance = (sumSq / n) - (mean * mean);
+    rms = std::sqrt(variance > 0.0 ? variance : 0.0);
+}
+
+/** @brief Ratio of two amplitudes in dB, for level assertions. */
+static double ratioDb(double reference, double measured) {
+    return 20.0 * std::log10(measured / reference);
+}
+
+/** @brief Bounds of a PCM range, plus how many samples sit at exactly 0. */
+struct NoiseShape {
+    int32_t minValue;
+    int32_t maxValue;
+    int32_t zeroCount;
+};
+
+static NoiseShape noiseShape(const int16_t* pcm, int from, int to) {
+    NoiseShape shape{0, 0, 0};
+    for (int i = from; i < to; ++i) {
+        const int32_t v = (int32_t)pcm[i];
+        if (v < shape.minValue) shape.minValue = v;
+        if (v > shape.maxValue) shape.maxValue = v;
+        if (v == 0) shape.zeroCount++;
+    }
+    return shape;
+}
+
+// S5/P9 shape: the unipolar gate can only ever produce 0 or the envelope level,
+// so a long render contains no negative sample at all — while the same voice
+// under `Legacy` swings both ways. Both runs are full scale with a flat
+// envelope, so "0 or positive" is the whole claim, not a level claim.
+void noise_unipolar_voice_never_renders_negative(void) {
+    static int16_t unipolar[kNoiseCharacterSamples];
+    static int16_t bipolar[kNoiseCharacterSamples];
+
+    renderNoiseCharacter(SoundProfile::Nes, -1, unipolar, kNoiseCharacterSamples);
+    renderNoiseCharacter(SoundProfile::Legacy, -1, bipolar, kNoiseCharacterSamples);
+
+    // Skip the attack/settling samples, exactly like the mixer probes.
+    const NoiseShape u = noiseShape(unipolar, 256, kNoiseCharacterSamples);
+    char message[192];
+    std::snprintf(message, sizeof(message),
+                  "the unipolar gate rendered a negative sample (%d)", (int)u.minValue);
+    TEST_ASSERT_GREATER_OR_EQUAL_INT32_MESSAGE(0, u.minValue, message);
+    TEST_ASSERT_GREATER_THAN_INT32_MESSAGE(1000, u.maxValue,
+        "the unipolar probe rendered silence");
+    // Both states must appear: a voice stuck at the level would also be
+    // "never negative" and would prove nothing about the gate.
+    TEST_ASSERT_GREATER_THAN_INT32_MESSAGE(0, u.zeroCount,
+        "the unipolar gate never closed");
+    TEST_ASSERT_GREATER_THAN_INT32_MESSAGE(u.zeroCount, kNoiseCharacterSamples - 256,
+        "the unipolar gate never opened");
+
+    // The reference: the same note under `Legacy` is bipolar, i.e. the shape
+    // above is the profile's doing and not a property of the noise source.
+    const NoiseShape b = noiseShape(bipolar, 256, kNoiseCharacterSamples);
+    TEST_ASSERT_LESS_THAN_INT32_MESSAGE(0, b.minValue,
+        "the Legacy noise voice must stay bipolar");
+    TEST_ASSERT_GREATER_THAN_INT32_MESSAGE(0, b.maxValue,
+        "the Legacy noise voice must stay bipolar");
+}
+
+// S5 level: the compensation is measured, not guessed. The gate halves the AC
+// amplitude (mean A/2, AC RMS A/2 against the bipolar A), so the renderer
+// restores it with one x2 shift — measured below as 0 dB against the SAME voice
+// with the gate off, under the same profile and therefore the same weighting.
+//
+// The second measurement is the cross-profile one: `Nes` unipolar against
+// `Legacy` bipolar lands 3.65 dB down, and that residual is nothing but S4's
+// published noise weight (0.00494 / 0.00752 = 0.6569). It is pinned here so the
+// number is a measured contract instead of a claim: matching `Legacy` exactly
+// would require doubling that weight, which is the mixer's (T2's) decision and
+// not T3's.
+void noise_unipolar_level_is_compensated(void) {
+    static int16_t unipolarNes[kNoiseCharacterSamples];
+    static int16_t bipolarNes[kNoiseCharacterSamples];
+    static int16_t bipolarLegacy[kNoiseCharacterSamples];
+
+    // The gate is pinned in BOTH directions on purpose. The published weight is
+    // measured over a window that holds only a few dozen LFSR clocks, so the
+    // run-length bias of that window is audible in the RMS; giving the two runs
+    // different periods would compare two different sample streams and swamp
+    // the 0 dB the compensation is supposed to show. Same clock, same stream,
+    // only the gate differs.
+    renderNoiseCharacter(SoundProfile::Nes, 1, unipolarNes, kNoiseCharacterSamples);
+    renderNoiseCharacter(SoundProfile::Nes, 0, bipolarNes, kNoiseCharacterSamples);
+    renderNoiseCharacter(SoundProfile::Legacy, -1, bipolarLegacy, kNoiseCharacterSamples);
+
+    double meanUni = 0.0, rmsUni = 0.0;
+    double meanBipolarNes = 0.0, rmsBipolarNes = 0.0;
+    double meanLegacy = 0.0, rmsLegacy = 0.0;
+    acRmsOf(unipolarNes, 256, kNoiseCharacterSamples, meanUni, rmsUni);
+    acRmsOf(bipolarNes, 256, kNoiseCharacterSamples, meanBipolarNes, rmsBipolarNes);
+    acRmsOf(bipolarLegacy, 256, kNoiseCharacterSamples, meanLegacy, rmsLegacy);
+
+    TEST_ASSERT_GREATER_THAN_MESSAGE(100.0, rmsUni, "the unipolar probe rendered silence");
+    TEST_ASSERT_GREATER_THAN_MESSAGE(100.0, rmsBipolarNes, "the bipolar probe rendered silence");
+    TEST_ASSERT_GREATER_THAN_MESSAGE(100.0, rmsLegacy, "the Legacy probe rendered silence");
+
+    char message[256];
+    const double compensationDb = ratioDb(rmsBipolarNes, rmsUni);
+    std::snprintf(message, sizeof(message),
+                  "unipolar %.2f RMS vs bipolar %.2f RMS at the same weighting: %.3f dB "
+                  "(limit 1 dB)", rmsUni, rmsBipolarNes, compensationDb);
+    TEST_ASSERT_TRUE_MESSAGE(compensationDb <= 1.0 && compensationDb >= -1.0, message);
+
+    // Cross-profile, measured and explained by the published weight.
+    const double crossDb = ratioDb(rmsLegacy, rmsUni);
+    const double weightDb = ratioDb(1.0, 0.00494 / 0.00752);
+    std::snprintf(message, sizeof(message),
+                  "Nes unipolar %.2f RMS vs Legacy bipolar %.2f RMS: %.3f dB, the "
+                  "published noise weight is %.3f dB", rmsUni, rmsLegacy, crossDb, weightDb);
+    TEST_ASSERT_TRUE_MESSAGE(crossDb <= weightDb + 0.3 && crossDb >= weightDb - 0.3, message);
+
+    // And the residual really is S4's weight applied to the same amplitude: the
+    // two bipolar renders differ by exactly that weight as well.
+    const double legacyVsNesDb = ratioDb(rmsLegacy, rmsBipolarNes);
+    std::snprintf(message, sizeof(message),
+                  "the bipolar Nes/Legacy gap is %.3f dB, expected %.3f dB",
+                  legacyVsNesDb, weightDb);
+    TEST_ASSERT_TRUE_MESSAGE(legacyVsNesDb <= weightDb + 0.3 && legacyVsNesDb >= weightDb - 0.3,
+                             message);
+}
+
+// S5 period + gate, D-3 tier 1: the profile supplies both defaults. `Nes` and
+// `Hybrid` arm the canonical `$400E = $00` entry — index 0 of
+// `nes_apu::kNesNoisePeriodLutNtsc` — so the note's own 1000 Hz clock (44
+// samples) does not decide the period; `Legacy` keeps both the bipolar gate and
+// the frequency-derived period.
+void profile_defaults_arm_the_nes_noise_character(void) {
+    int16_t buffer[256] = {0};
+
+    const SoundProfile nesProfiles[2] = {SoundProfile::Nes, SoundProfile::Hybrid};
+    for (int i = 0; i < 2; ++i) {
+        ApuCore apu;
+        apu.init(44100);
+        apu.reset();
+        apu.setSoundProfile(nesProfiles[i]);
+
+        const int slot = startLoopingNoiseVoice(apu, buffer);
+        TEST_ASSERT_EQUAL_UINT8_MESSAGE(0, apu.getVoiceNesNoiseLutIndexForTesting(slot),
+            "a NES-profile noise voice must arm the canonical LUT entry");
+        // `kNesNoisePeriodLutNtsc[0]` is 4 CPU cycles, which collapses onto the
+        // one-sample floor at 44.1 kHz — and is still 44x faster than the note.
+        TEST_ASSERT_EQUAL_UINT32(nes_apu::nesNoisePeriodToSamples(0, 44100),
+                                 apu.getVoiceNoisePeriodForTesting(slot));
+        TEST_ASSERT_NOT_EQUAL_UINT32(44u, apu.getVoiceNoisePeriodForTesting(slot));
+        TEST_ASSERT_TRUE_MESSAGE(apu.isVoiceNoiseUnipolarForTesting(slot),
+            "a NES-profile noise voice must gate between 0 and the level");
+    }
+
+    ApuCore legacy;
+    legacy.init(44100);
+    legacy.reset();
+    const int legacySlot = startLoopingNoiseVoice(legacy, buffer);
+    TEST_ASSERT_FALSE(legacy.isVoiceNoiseUnipolarForTesting(legacySlot));
+    TEST_ASSERT_EQUAL_UINT8(255, legacy.getVoiceNesNoiseLutIndexForTesting(legacySlot));
+    // 44100 / 1000 Hz = 44 samples: the legacy frequency-derived period.
+    TEST_ASSERT_EQUAL_UINT32(44u, legacy.getVoiceNoisePeriodForTesting(legacySlot));
+}
+
+// S5 period + gate, D-3 tier 2: an explicit voice-level selector beats the
+// profile's default for as long as the slot lives, not just for one note. The
+// slot is never reset here (the note simply ends), which is exactly the
+// lifetime a per-slot mode is documented to have.
+void profile_noise_defaults_yield_to_a_voice_override(void) {
+    ApuCore apu;
+    apu.init(44100);
+    apu.reset();
+    apu.setSoundProfile(SoundProfile::Nes);
+
+    static int16_t buffer[1024];
+    const int slot = startLoopingNoiseVoice(apu, buffer);
+    TEST_ASSERT_TRUE(apu.isVoiceNoiseUnipolarForTesting(slot));
+
+    // Index 12 is 762 CPU cycles: distinctive at 44.1 kHz, unlike entry 0.
+    apu.setVoiceNesNoiseLutMode(slot, 12);
+    TEST_ASSERT_EQUAL_UINT8(12, apu.getVoiceNesNoiseLutIndexForTesting(slot));
+    TEST_ASSERT_EQUAL_UINT32(nes_apu::nesNoisePeriodToSamples(12, 44100),
+                             apu.getVoiceNoisePeriodForTesting(slot));
+
+    // Explicitly off (255) also survives: "derive the period from the note".
+    apu.setVoiceNesNoiseLutMode(slot, 255);
+    TEST_ASSERT_EQUAL_UINT8(255, apu.getVoiceNesNoiseLutIndexForTesting(slot));
+    TEST_ASSERT_EQUAL_UINT32(44u, apu.getVoiceNoisePeriodForTesting(slot));
+
+    // Now let the voice die and re-trigger the same slot: the profile default
+    // must not be re-armed over the pinned selector.
+    AudioCommand stop{};
+    stop.type = AudioCommandType::STOP_CHANNEL;
+    stop.channelIndex = (uint8_t)slot;
+    TEST_ASSERT_TRUE(apu.submitCommand(stop));
+    apu.generateSamples(buffer, 64);
+
+    // STOP_CHANNEL resets the slot, so the per-slot mode is gone by contract —
+    // re-arm it and prove a note-on keeps it.
+    apu.setVoiceNesNoiseLutMode(slot, 12);
+    const int slot2 = startLoopingNoiseVoice(apu, buffer);
+    TEST_ASSERT_EQUAL_INT(slot, slot2);
+    TEST_ASSERT_EQUAL_UINT8(12, apu.getVoiceNesNoiseLutIndexForTesting(slot));
+    TEST_ASSERT_EQUAL_UINT32(nes_apu::nesNoisePeriodToSamples(12, 44100),
+                             apu.getVoiceNoisePeriodForTesting(slot));
+}
+
+// Queues one short NOISE note and renders past its end. No preset release, so
+// the voice is idle (not lingering in RELEASE) when this returns, and the next
+// note on the slot reuses it WITHOUT a reset — which is what makes the per-slot
+// override test meaningful.
+static void playShortNoiseNote(ApuCore& apu, int16_t* scratch, int samples) {
+    InstrumentPreset preset = mixerProbePreset();
+    preset.releaseTime = 0.0f;
+
+    AudioCommand cmd{};
+    cmd.type = AudioCommandType::PLAY_EVENT;
+    cmd.event.type = WaveType::NOISE;
+    cmd.event.frequency = 1000.0f;
+    cmd.event.duration = 0.002f;   // ~88 samples at 44.1 kHz
+    cmd.event.volume = 1.0f;
+    cmd.event.loop = false;
+    cmd.event.preset = &preset;
+    TEST_ASSERT_TRUE(apu.submitCommand(cmd));
+    apu.generateSamples(scratch, samples);
+}
+
+// S5 / D-3 tier 2, the case the precedence table exists to protect:
+// `SET_NES_OPTIONS` with the flag off returns a `Nes` noise voice to bipolar
+// noise, and the profile does NOT re-arm its own default on the next note.
+void noise_unipolar_override_survives_the_next_note(void) {
+    ApuCore apu;
+    apu.init(44100);
+    apu.reset();
+    apu.setSoundProfile(SoundProfile::Nes);
+    apu.setSoftClipMode(SoftClipMode::None);
+    apu.setHpfCutoffHz(0.0f);
+
+    static int16_t buffer[1024];
+    const int slot = ApuCore::SFX_VOICE_BASE;
+
+    playShortNoiseNote(apu, buffer, 256);
+    TEST_ASSERT_FALSE_MESSAGE(apu.isVoiceEnabledForTesting(slot),
+        "the short note must idle the slot for the next note to reuse it");
+    TEST_ASSERT_TRUE_MESSAGE(apu.isVoiceNoiseUnipolarForTesting(slot),
+        "the profile default must arm the gate on the first note");
+
+    AudioCommand opts{};
+    opts.type = AudioCommandType::SET_NES_OPTIONS;
+    opts.channelIndex = (uint8_t)slot;
+    opts.nesOptions.noiseUnipolar = false;
+    TEST_ASSERT_TRUE(apu.submitCommand(opts));
+    apu.generateSamples(buffer, 256);
+    TEST_ASSERT_FALSE_MESSAGE(apu.isVoiceNoiseUnipolarForTesting(slot),
+        "SET_NES_OPTIONS with the flag off must return the voice to bipolar noise");
+
+    // Next note on the same slot: still bipolar.
+    playShortNoiseNote(apu, buffer, 256);
+    TEST_ASSERT_FALSE_MESSAGE(apu.isVoiceNoiseUnipolarForTesting(slot),
+        "the profile must not re-arm a gate the voice pinned off");
+
+    // And audibly so. A looping note on the same slot makes the gate visible;
+    // the re-triggered LFSR starts on an all-ones run, so the window has to
+    // cover more than 15 clocks to contain a negative sample — the period here
+    // is the note's own 1000 Hz (44 samples), so 2 048 samples is 46 clocks.
+    const int loopSlot = startLoopingNoiseVoice(apu, buffer);
+    TEST_ASSERT_EQUAL_INT(slot, loopSlot);
+    static int16_t longPcm[2048];
+    apu.generateSamples(longPcm, 2048);
+    const NoiseShape shape = noiseShape(longPcm, 0, 2048);
+    TEST_ASSERT_LESS_THAN_INT32_MESSAGE(0, shape.minValue,
+        "the pinned-off voice must render bipolar noise again");
+}
+
+// PRESERVE (T3): `Legacy` keeps the bipolar gate at its historical level, the
+// frequency-derived period and no LUT. The committed fixtures and both integer
+// goldens pin the same bytes end to end; this case pins the voice-level claims
+// so a future profile default cannot quietly reach the frozen path.
+void noise_legacy_character_is_unchanged(void) {
+    ApuCore apu;
+    apu.init(44100);
+    apu.reset();
+
+    int16_t buffer[256] = {0};
+    const int slot = startLoopingNoiseVoice(apu, buffer);
+    TEST_ASSERT_FALSE(apu.isVoiceNoiseUnipolarForTesting(slot));
+    TEST_ASSERT_EQUAL_UINT8(255, apu.getVoiceNesNoiseLutIndexForTesting(slot));
+    TEST_ASSERT_EQUAL_UINT32(44u, apu.getVoiceNoisePeriodForTesting(slot));
+
+    static int16_t pcm[kNoiseCharacterSamples];
+    renderNoiseCharacter(SoundProfile::Legacy, -1, pcm, kNoiseCharacterSamples);
+    const NoiseShape shape = noiseShape(pcm, 256, kNoiseCharacterSamples);
+    TEST_ASSERT_LESS_THAN_INT32(0, shape.minValue);
+    TEST_ASSERT_GREATER_THAN_INT32(0, shape.maxValue);
+    // 0.4 * 32767 = 13106.8: the historical Legacy level, untouched by the
+    // compensation (which only ever applies to a unipolar voice).
+    TEST_ASSERT_INT32_WITHIN_MESSAGE(1, 13107, peakMagnitude(pcm + 256,
+                                                            kNoiseCharacterSamples - 256),
+        "the Legacy noise level must stay at MIXER_SCALE * 32767");
 }
 
 // =============================================================================
@@ -6762,6 +7134,14 @@ int main(int argc, char** argv) {
     RUN_TEST(mixer_nes_weighted_applies_before_the_hpf);
     RUN_TEST(mixer_nes_weighted_stays_bounded_and_monotonic_per_clip_mode);
     RUN_TEST(mixer_legacy_keeps_its_historical_level);
+
+    // S5: unipolar NOISE, the profile period LUT and level compensation (E1/T3)
+    RUN_TEST(noise_unipolar_voice_never_renders_negative);
+    RUN_TEST(noise_unipolar_level_is_compensated);
+    RUN_TEST(profile_defaults_arm_the_nes_noise_character);
+    RUN_TEST(profile_noise_defaults_yield_to_a_voice_override);
+    RUN_TEST(noise_unipolar_override_survives_the_next_note);
+    RUN_TEST(noise_legacy_character_is_unchanged);
 
     // Integration tests
     RUN_TEST(test_apu_core_integration_full_pipeline);
