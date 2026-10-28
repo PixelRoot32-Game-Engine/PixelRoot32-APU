@@ -2,36 +2,21 @@
 
 Format: [semver](https://semver.org/). Changes that alter rendered PCM or struct ABI require a major or minor bump with an explicit note.
 
-## [Unreleased]
+## [2.1.0] - 2026-10-28
 
 Sound profiles, one integer render core on every platform, a smaller command
 queue, one audible fix on no-FPU builds, and the audible character of the `Nes`
 and `Hybrid` profiles. **On `PR32_APU_HAS_FPU=1` builds with the default profile
 the rendered PCM is unchanged** (float golden `7FF568A5…5DE9`); every sound
-change lives on the integer path, and the two a consumer can hear are listed
+change lives on the integer path, and the one a consumer can hear is listed
 first.
 
-### Breaking changes
-
-1. **The integer/Q15 DC blocker now decays instead of parking a −199 offset**
-   once a voice is silenced. The recursion truncated `R·y[n-1]` towards −∞, so
-   every negative `y` with `|y| < 32768/(1−R)` — about 200 with the default
-   `R = 32604` — was a fixed point: after silencing a PULSE voice the output
-   stayed frozen at −199 for good. It now truncates towards zero, the same
-   operation the float conversion performs, so `|y|` drops at least one LSB per
-   silent sample whatever the coefficient. Measured on the canonical track with
-   `PR32_APU_HAS_FPU=0`: **21 982 of 22 050 samples differ** from 2.0.0,
-   `max|Δ|` = **127 LSB**, and the mean of the tail (last 2 050 samples) goes
-   from **−68 to 0**. The difference is the DC offset that used to stay glued,
-   not a different waveform. **Affects builds with `PR32_APU_HAS_FPU=0` only**
-   (ESP32-C3 and any `-DPR32_APU_HAS_FPU=0` build); desktop, ESP32 and
-   ESP32-S3 render the float path and are untouched. **Any reference or
-   measurement taken from the integer path before this change must be
-   regenerated, not inherited.** The new immutable reference is
-   `test/golden/fixtures/apu_integer_core_canonical_s16le_44100.pcm`
-   (`F59501D6…3902D`). This alters rendered PCM, so the policy at the top of
-   this file requires a major or minor bump; **which of the two is the release
-   owner's decision**, and this entry claims no version number.
+This is a **minor** release, not a major one, on the distinction the 2.0.0
+entry established: that release changed the output of the **default**
+configuration (`TRIANGLE` quantised without opt-in, the integer path 4.4x
+louder), while this one leaves it byte-identical. Nothing is removed or
+renamed, the profiles are new and were never released, and the audible
+change is a defect fix on a route only no-FPU builds take.
 
 ### Added
 
@@ -180,6 +165,23 @@ first.
 
 ### Fixed
 
+- **Integer path only: the Q15 DC blocker now decays instead of parking a −199
+  offset** once a voice is silenced. The recursion truncated `R·y[n−1]` towards
+  −∞, so every negative `y` with `|y| < 32768/(1−R)` — about 200 with the default
+  `R = 32604` — was a fixed point: after silencing a PULSE voice the output
+  stayed frozen at −199 for good. It now truncates towards zero, the same
+  operation the float conversion performs, so `|y|` drops at least one LSB per
+  silent sample whatever the coefficient. Measured on the canonical track with
+  `PR32_APU_HAS_FPU=0`: **21 982 of 22 050 samples differ** from 2.0.0,
+  `max|Δ|` = **127 LSB**, and the mean of the tail (last 2 050 samples) goes
+  from **−68 to 0**. The difference is the DC offset that used to stay glued,
+  not a different waveform. **Affects builds with `PR32_APU_HAS_FPU=0` only**
+  (ESP32-C3 and any `-DPR32_APU_HAS_FPU=0` build); desktop, ESP32 and
+  ESP32-S3 render the float path and are untouched. **Any reference or
+  measurement taken from the integer path before this change must be
+  regenerated, not inherited.** The new immutable reference is
+  `test/golden/fixtures/apu_integer_core_canonical_s16le_44100.pcm`
+  (`F59501D6…3902D`).
 - **Integer path only: a 100 % PULSE duty now renders a constant high level
   instead of a flat line.** `set_pulse_duty` mirrored the clamped float duty
   into Q32 as `(uint32_t)(duty * 2^32)`. At exactly `duty == 1.0` the product
@@ -192,8 +194,8 @@ first.
   (`7FF568A5…5DE9`) and the integer golden (`F59501D6…3902D`) still reproduce
   byte for byte, and `Nes`/`Hybrid` still render the integer reference. The
   input that changes is exactly `duty == 1.0` on the integer path — a no-FPU
-  build, or `Nes`/`Hybrid` on any build. No version is claimed here: the bump
-  is the release owner's decision, as with the DC-blocker fix above.
+  build, or `Nes`/`Hybrid` on any build. It ships in 2.1.0 as a defect fix, for
+  the same reason as the DC-blocker entry above.
 
 ### Migration
 
