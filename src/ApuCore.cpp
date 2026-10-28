@@ -85,6 +85,115 @@ namespace pixelroot32::audio {
     // Internal helper functions
     // ============================================================================
 
+    /**
+     * @brief The envelope curve a sound profile supplies as its default (S2/D-2).
+     *
+     * The profile is the first tier of the D-3 precedence table: it owns the
+     * default, and a note that names a curve of its own wins over it. This is
+     * the single place that mapping lives, so `applyProfileCharacter` cannot
+     * drift from what the profiles are documented to sound like.
+     *
+     * `Nes` deliberately answers `Linear`: its character is the 4-bit
+     * `nesEnvelope` clocked at 240 Hz, which is a different mechanism and not
+     * the exponential ramp. `Legacy` answers `Linear` because its curve is
+     * frozen (S1), and any unknown value is treated as `Legacy` rather than
+     * guessed.
+     *
+     * @param profile Profile in force.
+     * @return Curve the profile supplies when the note asks for none.
+     */
+    static inline EnvelopeCurve profileDefaultEnvelopeCurve(SoundProfile profile) {
+        return (profile == SoundProfile::Hybrid) ? EnvelopeCurve::Exponential
+                                                 : EnvelopeCurve::Linear;
+    }
+
+    /** Q15 envelope scale: 1.0. */
+    static constexpr int32_t kEnvelopeFullScaleQ15 = 32768;
+    /** Q15 clock phase that means "one shape step per sample". */
+    static constexpr uint32_t kCurveFullRateQ15 = 32768u;
+    /**
+     * Upper bound for one stage's shape-step count.
+     *
+     * The count is computed from a level in Q15, so the tight bound is ~1 500
+     * steps (a full-scale span to −60 dB takes 1 356); the constant only exists
+     * so a corrupt preset can never turn the note-on helper into an unbounded
+     * loop.
+     */
+    static constexpr uint16_t kMaxCurveSteps = 2048;
+
+    /**
+     * @brief Shape iterations the exponential curve needs to fall 60 dB.
+     *
+     * Runs the very recurrence the renderer runs
+     * (`level -= ((level - 1) >> 8) + 1`) until the level is 60 dB below
+     * `spanQ15`. A closed form is not available: the recurrence's `+1` term is
+     * a fixed-size step that dominates once the level is small, so the exact
+     * count (1 356 for a full-scale span) is far below the continuous estimate
+     * (1 766 for τ = 256 samples). Calibrating with the continuous estimate
+     * would make every −60 dB time 30 % short.
+     *
+     * Called once per note-on per stage, never per sample.
+     *
+     * @param spanQ15 Distance the stage has to travel, in Q15.
+     * @return Shape iterations to −60 dB of that span (at least 1).
+     */
+    static uint16_t curveStepsForSpanQ15(int32_t spanQ15) {
+        if (spanQ15 <= 1) {
+            return 1;
+        }
+        const int32_t target = spanQ15 / 1000;  // −60 dB
+        int32_t level = spanQ15;
+        uint16_t steps = 0;
+        while (level > target && steps < kMaxCurveSteps) {
+            level -= ((level - 1) >> 8) + 1;
+            ++steps;
+        }
+        return (steps == 0) ? 1 : steps;
+    }
+
+    /**
+     * @brief Clock rate that spreads the exponential's −60 dB span over a stage.
+     *
+     * The S-DSP recurrence is the SHAPE; this is its RATE. The shape's natural
+     * rate is one step per sample (τ = 256 samples = 5.8 ms at 44.1 kHz), which
+     * ignores `decayTime`/`releaseTime` and therefore cannot satisfy S2's
+     * "−60 dB in the theoretical time": a note would fall silent in ~30 ms and
+     * then jump back to its sustain level. Deriving the rate from the stage
+     * duration makes the configured time mean what it says — the time to fall
+     * 60 dB — and the stage ends ON its target instead of sailing past it.
+     *
+     * The clock never steps more than once per sample (rate ≤ 32768). A stage
+     * shorter than the shape's own span cannot hold the shape at that limit, so
+     * it returns 0 and the caller keeps the frozen linear ramp: stepping once
+     * per sample instead would leave the level far above its target and snap
+     * there at the stage boundary, which is exactly the audible discontinuity
+     * this calibration exists to remove (a 5 ms release would snap ~7 dB).
+     *
+     * @param spanQ15 Distance the stage has to travel, in Q15.
+     * @param stageSamples Duration of the stage in samples (0 = no stage).
+     * @return Shape steps per sample in Q15, or 0 to keep the linear ramp.
+     */
+    static uint16_t exponentialCurveRateQ15(int32_t spanQ15, uint32_t stageSamples) {
+        if (stageSamples == 0 || spanQ15 <= 0) {
+            return 0;  // no distance to travel, or no stage: nothing to clock
+        }
+        const uint16_t steps = curveStepsForSpanQ15(spanQ15);
+        if (stageSamples < (uint32_t)steps) {
+            return 0;  // shape does not fit: the linear ramp is the continuous one
+        }
+        // Rounded UP so that a stage of exactly `steps` samples performs the
+        // whole span instead of stopping one step short of the target.
+        const uint64_t rate =
+            (((uint64_t)steps << 15) + (uint64_t)stageSamples - 1u) / (uint64_t)stageSamples;
+        if (rate < 1u) {
+            return 1;  // slowest representable clock; a stall is impossible
+        }
+        if (rate > kCurveFullRateQ15) {
+            return (uint16_t)kCurveFullRateQ15;
+        }
+        return (uint16_t)rate;
+    }
+
     static inline uint32_t frequency_hz_to_phase_inc_q32(float hz, int sr) {
         if (sr <= 0) return 0u;
         if (hz < 0.0f) hz = 0.0f;
@@ -1032,6 +1141,23 @@ namespace pixelroot32::audio {
 
     uint32_t ApuCore::getProfileApplyCountForTesting() const {
         return profileApplyCount_;
+    }
+
+    EnvelopeCurve ApuCore::getVoiceEnvelopeCurveForTesting(int slot) const {
+        if (slot < 0 || slot >= MAX_VOICES) {
+            return EnvelopeCurve::ProfileDefault;
+        }
+        return voices[slot].envelopeCurve;
+    }
+
+    int32_t ApuCore::getVoiceEnvelopeLevelQ15ForTesting(int slot) const {
+        if (slot < 0 || slot >= MAX_VOICES) {
+            return 0;
+        }
+        // The integer core is the only body that ticks this mirror, and every
+        // profile except `Legacy` runs it; on `Legacy` an FPU build leaves it
+        // at its note-on value. That is the same contract as `phaseQ32`.
+        return voices[slot].envelope.currentLevelQ15;
     }
 #endif  // UNIT_TEST — the test-only accessors end here.
 
@@ -2292,6 +2418,10 @@ namespace pixelroot32::audio {
         if (ch.envelope.releaseSamples > 0) {
             ch.envelope.stage = EnvelopeState::Stage::RELEASE;
             ch.envelope.sampleCounter = 0;
+            // S2: the exponential clock is shared by both stages, so rewind it
+            // when the release starts; otherwise the decay's leftover phase
+            // would pull the first release step up to one step interval early.
+            ch.envelopeCurvePhaseQ15 = 0;
             ch.remainingSamples = ch.envelope.releaseSamples;
         } else {
             ch.enabled = false;
@@ -2381,6 +2511,14 @@ namespace pixelroot32::audio {
         env.attackDeltaQ15 = (env.attackSamples > 0) ? (32768 / (int32_t)env.attackSamples) : 32768;
         env.decayDeltaQ15 = (env.decaySamples > 0) ? ((32768 - env.sustainLevelQ15) / (int32_t)env.decaySamples) : 0;
         env.releaseDeltaQ15 = (env.releaseSamples > 0) ? (env.sustainLevelQ15 / (int32_t)env.releaseSamples) : 0;
+
+        // S2 / D-3 tier 3: the note's own request, unresolved. `ProfileDefault`
+        // means "the profile decides" and is resolved by `applyProfileCharacter`,
+        // which runs after the `nesAccurate` block below; storing the request
+        // (not a resolved value) is what keeps the profile a default instead of
+        // an override.
+        ch->envelopeCurve = event.preset ? event.preset->envelopeCurve
+                                         : EnvelopeCurve::ProfileDefault;
 
         // LFO initialization
         ch->lfo.enabled = false;
@@ -2602,11 +2740,50 @@ namespace pixelroot32::audio {
     // note's own ADSR/LFO/sweep/pitch-envelope values keep winning inside their
     // own domain.
     //
-    // E0 (this phase): `Nes` and `Hybrid` are exact aliases of what the note
-    // path already left, so there is nothing to write — any value assigned here
-    // would have to be the value already in place. E1 changes ONLY this body.
+    // E0 left this body empty because `Nes` and `Hybrid` were exact aliases.
+    // E1 gives it its first real assignment: the envelope curve.
     void ApuCore::applyProfileCharacter(int slot) {
-        (void)slot;
+        Voice& ch = voices[slot];
+
+        // S2 / D-3: the profile supplies the DEFAULT curve only. A note that
+        // named one keeps it — the note owns the field inside its own domain
+        // and the profile is the fallback. This is also why `nesAccurate`
+        // cannot erase the character: `initNesSafe` ran above and does not
+        // touch this field, so resolving it here still wins.
+        if (ch.envelopeCurve == EnvelopeCurve::ProfileDefault) {
+            ch.envelopeCurve = profileDefaultEnvelopeCurve(profile_);
+        }
+
+        // S2: derive the exponential clock from the stage durations. This is the
+        // first point where the curve is resolved, and it runs once per note-on,
+        // never per sample. `Legacy` answers `Linear` and leaves the clock at 0,
+        // so its render arithmetic is untouched.
+        if (ch.envelopeCurve == EnvelopeCurve::Exponential) {
+            // DECAY: the attack always lands on full scale, so the distance to
+            // travel is the excursion above the sustain level.
+            const int32_t decaySpan =
+                (ch.envelope.sustainLevelQ15 < kEnvelopeFullScaleQ15)
+                    ? (kEnvelopeFullScaleQ15 - ch.envelope.sustainLevelQ15)
+                    : 0;
+            ch.decayCurveRateQ15 = exponentialCurveRateQ15(
+                decaySpan, ch.envelope.decaySamples);
+            // RELEASE: the stage targets silence. It normally starts at the
+            // sustain level, but a note shorter than its own decay releases from
+            // wherever the decay had reached — and a sustain of 0 would then
+            // describe a span of 0, i.e. a release that cannot move and snaps.
+            // Full scale is the conservative span for that case: it can only
+            // make the release end at or before its duration, never after.
+            const int32_t releaseSpan = (ch.envelope.sustainLevelQ15 > 0)
+                ? ch.envelope.sustainLevelQ15
+                : kEnvelopeFullScaleQ15;
+            ch.releaseCurveRateQ15 = exponentialCurveRateQ15(
+                releaseSpan, ch.envelope.releaseSamples);
+        } else {
+            ch.decayCurveRateQ15 = 0;
+            ch.releaseCurveRateQ15 = 0;
+        }
+        ch.envelopeCurvePhaseQ15 = 0;
+
 #if defined(UNIT_TEST)
         // Structural proof of the ordering above: a test observes exactly one
         // application per note-on, and only after the nesAccurate block ran.
@@ -2740,13 +2917,83 @@ namespace pixelroot32::audio {
         }
     }
 
+    /**
+     * @brief One step of the S-DSP-style exponential envelope decrement (S2/P1).
+     *
+     * `level -= ((level - 1) >> 8) + 1`, the shape the audit's P1 specifies,
+     * applied to the distance between the current level and the stage's end
+     * target. Acting on the excursion rather than on the raw level is what lets
+     * a decay finish AT its sustain level (a release, whose target is 0, is
+     * therefore bit-for-bit the plain recurrence): the stage boundary is then a
+     * −60 dB step instead of the jump back to sustain.
+     *
+     * Above the last 8 bits the recurrence is a first-order decay with a time
+     * constant of 256 samples; the `+1` term is what keeps it moving below that,
+     * where a plain `level -= level >> 8` would park at 1 forever.
+     *
+     * The expression needs no explicit clamp: at offset 0 it evaluates to
+     * `0 - ((-1 >> 8) + 1) == 0`, so the offset cannot go negative — the
+     * "floored at 0" clause of the spec is intrinsic.
+     *
+     * @param levelQ15 Level in Q15; decremented in place.
+     * @param floorQ15 Value the stage ends on (sustain for DECAY, 0 for RELEASE).
+     */
+    static inline void applyExponentialEnvelopeStepQ15(int32_t& levelQ15, int32_t floorQ15) {
+        int32_t offset = levelQ15 - floorQ15;
+        if (offset <= 0) {
+            levelQ15 = floorQ15;
+            return;
+        }
+        offset -= ((offset - 1) >> 8) + 1;
+        if (offset < 0) {
+            offset = 0;
+        }
+        levelQ15 = floorQ15 + offset;
+    }
+
+    /**
+     * @brief Runs the exponential clock for one sample and applies a step when due.
+     *
+     * The clock is a Q15 phase accumulator: it advances by `rateQ15` per sample
+     * and performs one shape step each time it crosses 1.0, so the shape keeps
+     * its exact arithmetic while its RATE follows the stage duration. Chosen
+     * over a stride counter because the fractional part makes the rate exact for
+     * any duration (a stride of `stageSamples / steps` would quantise long
+     * stages by up to one full step) and because `phase + rate < 2 * 32768`
+     * cannot overflow a `uint16_t` while the rate is capped at one step per
+     * sample.
+     *
+     * @param ch Voice whose clock and level are advanced.
+     * @param floorQ15 Value the stage ends on.
+     * @param rateQ15 Shape steps per sample in Q15 (1..32768).
+     */
+    static inline void tickExponentialEnvelopeQ15(AudioChannel& ch, int32_t floorQ15,
+                                                  uint16_t rateQ15) {
+        const uint32_t phase = (uint32_t)ch.envelopeCurvePhaseQ15 + (uint32_t)rateQ15;
+        if (phase < kCurveFullRateQ15) {
+            ch.envelopeCurvePhaseQ15 = (uint16_t)phase;
+            return;
+        }
+        ch.envelopeCurvePhaseQ15 = (uint16_t)(phase - kCurveFullRateQ15);
+        applyExponentialEnvelopeStepQ15(ch.envelope.currentLevelQ15, floorQ15);
+    }
+
     // ------------------------------------------------------------------
     // ADSR Envelope state machine (fixed-point Q15, portable integer core)
     // ------------------------------------------------------------------
     // Compiled unconditionally: the integer core exists in every build (S2),
     // so this tick must never be hidden behind an FPU guard again.
+    //
+    // S2: the curve applies to DECAY and RELEASE only. ATTACK stays linear on
+    // purpose — a linear ramp is predictable and curving it buys nothing — and
+    // `Linear` keeps the frozen `Legacy` arithmetic untouched, branch included.
+    //
+    // The exponential branches on the stage's clock rate: a rate of 0 means the
+    // stage is shorter than the shape's span and deliberately falls back to the
+    // same linear delta (see `exponentialCurveRateQ15`).
     static inline void tickEnvelopeQ15(AudioChannel& ch) {
         auto& env = ch.envelope;
+        const bool exponential = (ch.envelopeCurve == EnvelopeCurve::Exponential);
         switch (env.stage) {
             case EnvelopeState::Stage::ATTACK:
                 env.sampleCounter++;
@@ -2764,7 +3011,12 @@ namespace pixelroot32::audio {
                 break;
             case EnvelopeState::Stage::DECAY:
                 env.sampleCounter++;
-                env.currentLevelQ15 -= env.decayDeltaQ15;
+                if (exponential && ch.decayCurveRateQ15 != 0) {
+                    tickExponentialEnvelopeQ15(ch, env.sustainLevelQ15,
+                                               ch.decayCurveRateQ15);
+                } else {
+                    env.currentLevelQ15 -= env.decayDeltaQ15;
+                }
                 if (env.sampleCounter >= env.decaySamples) {
                     env.currentLevelQ15 = env.sustainLevelQ15;
                     env.sampleCounter = 0;
@@ -2775,7 +3027,11 @@ namespace pixelroot32::audio {
                 break;
             case EnvelopeState::Stage::RELEASE:
                 env.sampleCounter++;
-                env.currentLevelQ15 -= env.releaseDeltaQ15;
+                if (exponential && ch.releaseCurveRateQ15 != 0) {
+                    tickExponentialEnvelopeQ15(ch, 0, ch.releaseCurveRateQ15);
+                } else {
+                    env.currentLevelQ15 -= env.releaseDeltaQ15;
+                }
                 if (env.sampleCounter >= env.releaseSamples || env.currentLevelQ15 <= 0) {
                     env.currentLevelQ15 = 0;
                     env.stage = EnvelopeState::Stage::OFF;
@@ -3365,6 +3621,9 @@ namespace pixelroot32::audio {
                             && ch.envelope.releaseSamples > 0) {
                             ch.envelope.stage = EnvelopeState::Stage::RELEASE;
                             ch.envelope.sampleCounter = 0;
+                            // S2: rewind the shared exponential clock at the
+                            // stage change (see beginReleaseOnMusicTrack).
+                            ch.envelopeCurvePhaseQ15 = 0;
                             ch.remainingSamples = ch.envelope.releaseSamples;
                         } else {
                             ch.enabled = false;

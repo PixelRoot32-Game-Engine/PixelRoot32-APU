@@ -19,6 +19,7 @@
 #include <cmath>
 #include <cstring>
 #include "test_config.h"
+#include "golden/apu_mirror_canonical_track.h"
 #include "pixelroot32/apu/ApuCore.h"
 #include "pixelroot32/apu/ApuConfig.h"
 #include "pixelroot32/apu/AudioTypes.h"
@@ -5586,8 +5587,10 @@ void test_sound_profile_survives_init(void) {
 // Both suite binaries run this file, so every case below has to hold whichever
 // core the build contains: `test_apu_core` has the float body, while
 // `test_apu_core_integer` is built with PR32_APU_HAS_FPU=0. `Nes` and `Hybrid`
-// select the integer core in both builds (S3) and, in E0, are exact aliases of
-// `Legacy`'s sound, so no case here may expect them to differ audibly.
+// select the integer core in both builds (S3), so a case may say what those two
+// profiles sound like without knowing which core the build compiled. Since E1
+// they are no longer aliases of `Legacy` — `Hybrid` carries the exponential
+// envelope — and the cases below pin what each one renders.
 
 // Queues one looping SINE note. Split from the render calls so the caller can
 // put a `setSoundProfile` call between two blocks: a profile change cannot land
@@ -5629,10 +5632,17 @@ static int32_t maxAdjacentStep(const int16_t* pcm, int from, int to) {
 // after the `nesAccurate` / `initNesSafe` block. The counter is the structural
 // proof: exactly one application per note-on, and the canonical safe state the
 // block installed is still what the voice reports afterwards.
+//
+// E1 extends the same case instead of adding a sibling: the character the
+// profile writes is now visible (the envelope curve), so the ordering claim is
+// checked twice — once structurally (the counter) and once by observing a value
+// only the last step can produce. Run under `Hybrid`, whose exponential curve
+// differs from everything the note path leaves behind.
 void profile_apply_runs_after_nes_accurate_init(void) {
     ApuCore apu;
     apu.init(44100);
     apu.reset();
+    apu.setSoundProfile(SoundProfile::Hybrid);
 
     TEST_ASSERT_EQUAL_UINT32(0, apu.getProfileApplyCountForTesting());
 
@@ -5644,6 +5654,10 @@ void profile_apply_runs_after_nes_accurate_init(void) {
     TEST_ASSERT_EQUAL_UINT32(1, apu.getProfileApplyCountForTesting());
     // Ordering: the profile did not undo the safe state the note left behind.
     assertNesSafeCommon(apu, slot);
+    // S2: `initNesSafe` cleared every NES sub-unit above and still did not
+    // erase the profile's curve, which is what "applied last" has to mean.
+    TEST_ASSERT_EQUAL_INT((int)EnvelopeCurve::Exponential,
+                          (int)apu.getVoiceEnvelopeCurveForTesting(slot));
 
     // Silence the voice without starting a note: the counter must not move.
     AudioCommand stop{};
@@ -5658,40 +5672,89 @@ void profile_apply_runs_after_nes_accurate_init(void) {
     const int slot2 = playPresetNote(apu, buffer, WaveType::PULSE, preset);
     TEST_ASSERT_EQUAL_UINT32(2, apu.getProfileApplyCountForTesting());
     assertNesSafeCommon(apu, slot2);
+    TEST_ASSERT_EQUAL_INT((int)EnvelopeCurve::Exponential,
+                          (int)apu.getVoiceEnvelopeCurveForTesting(slot2));
 }
 
-// S3: in E0 `Nes` and `Hybrid` are aliases — same core, same bytes. This is
-// also the E0 promise of S15.3, pinned where the dispatch lives.
-void profile_nes_and_hybrid_render_identical_bytes(void) {
+// S3, E1 contract change. E0 pinned `Nes` == `Hybrid` byte for byte because
+// neither profile had any character yet. E1 gives `Hybrid` the exponential
+// envelope, so that aliasing is broken on purpose and the assertion that goes
+// with it is replaced by the two claims underneath it:
+//
+//   * `Nes` still renders the `Legacy` curve — its own character is the 4-bit
+//     `nesEnvelope` at 240 Hz, which is not wired in T1 (T3/T4 complete it).
+//     The committed integer golden is what pins its bytes; here we pin that it
+//     resolves to `Linear` and therefore renders the same bytes as an explicit
+//     linear override, while an exponential override does change them.
+//   * `Hybrid` defaults to `Exponential`, and the exponential is exactly the
+//     curve it renders: same bytes as an explicit exponential override,
+//     different bytes from a linear one.
+//
+// The E0 claim that is still true is kept: both profiles run the same integer
+// core, so forcing the same curve on both makes their bytes identical again.
+static void renderCurveProbe(SoundProfile profile, EnvelopeCurve curve,
+                             int16_t* out, int samples) {
+    ApuCore apu;
+    apu.init(44100);
+    apu.reset();
+    apu.setSoundProfile(profile);
+
+    // Every parameter of the note is identical across probes; only the profile
+    // and the preset's curve change, so a byte difference can only come from
+    // the curve. `INSTR_PULSE_LEAD` decays (0.18 s) and releases (0.22 s), so
+    // both curved stages are exercised inside the window.
+    InstrumentPreset preset = INSTR_PULSE_LEAD;
+    preset.envelopeCurve = curve;
+
+    AudioCommand cmd{};
+    cmd.type = AudioCommandType::PLAY_EVENT;
+    cmd.event.type = WaveType::PULSE;
+    cmd.event.frequency = 440.0f;
+    cmd.event.duration = 1.0f;
+    cmd.event.volume = 0.8f;
+    cmd.event.duty = 0.25f;
+    cmd.event.loop = true;
+    cmd.event.preset = &preset;
+    TEST_ASSERT_TRUE(apu.submitCommand(cmd));
+    apu.generateSamples(out, samples);
+}
+
+void profile_nes_and_hybrid_differ_only_by_the_envelope_curve(void) {
     constexpr int kSamples = 4096;
-    static int16_t nes[kSamples];
-    static int16_t hybrid[kSamples];
+    static int16_t nesDefault[kSamples];
+    static int16_t hybridDefault[kSamples];
+    static int16_t nesLinear[kSamples];
+    static int16_t hybridLinear[kSamples];
+    static int16_t nesExponential[kSamples];
 
-    auto render = [](SoundProfile profile, int16_t* out) {
-        ApuCore apu;
-        apu.init(44100);
-        apu.reset();
-        apu.setSoundProfile(profile);
-
-        AudioCommand cmd{};
-        cmd.type = AudioCommandType::PLAY_EVENT;
-        cmd.event.type = WaveType::PULSE;
-        cmd.event.frequency = 440.0f;
-        cmd.event.duration = 1.0f;
-        cmd.event.volume = 0.8f;
-        cmd.event.duty = 0.25f;
-        cmd.event.loop = true;
-        TEST_ASSERT_TRUE(apu.submitCommand(cmd));
-        apu.generateSamples(out, kSamples);
-    };
-
-    render(SoundProfile::Nes, nes);
-    render(SoundProfile::Hybrid, hybrid);
+    renderCurveProbe(SoundProfile::Nes, EnvelopeCurve::ProfileDefault, nesDefault, kSamples);
+    renderCurveProbe(SoundProfile::Hybrid, EnvelopeCurve::ProfileDefault, hybridDefault, kSamples);
+    renderCurveProbe(SoundProfile::Nes, EnvelopeCurve::Linear, nesLinear, kSamples);
+    renderCurveProbe(SoundProfile::Hybrid, EnvelopeCurve::Linear, hybridLinear, kSamples);
+    renderCurveProbe(SoundProfile::Nes, EnvelopeCurve::Exponential, nesExponential, kSamples);
 
     // Guard against comparing two silent buffers: two equal silences prove
     // nothing about the core, only that nothing rendered.
-    TEST_ASSERT_TRUE(peakMagnitude(nes, kSamples) > 1000);
-    TEST_ASSERT_EQUAL_INT(0, std::memcmp(nes, hybrid, sizeof(nes)));
+    TEST_ASSERT_TRUE(peakMagnitude(nesDefault, kSamples) > 1000);
+    TEST_ASSERT_TRUE(peakMagnitude(hybridDefault, kSamples) > 1000);
+
+    // E1: the defaults are no longer aliases. `Hybrid`'s exponential is the
+    // only difference in T1, so the curve is what has to show up here.
+    TEST_ASSERT_TRUE_MESSAGE(
+        std::memcmp(nesDefault, hybridDefault, sizeof(nesDefault)) != 0,
+        "E1: Hybrid must no longer render the same bytes as Nes");
+
+    // Same curve -> same bytes: the two profiles still share one core.
+    TEST_ASSERT_EQUAL_INT(0, std::memcmp(nesLinear, hybridLinear, sizeof(nesLinear)));
+
+    // `Nes` in T1 renders the `Legacy` curve: its default is byte-identical to
+    // an explicit linear override, and an exponential override *would* move it
+    // (which is what keeps the equality above from being vacuous).
+    TEST_ASSERT_EQUAL_INT(0, std::memcmp(nesDefault, nesLinear, sizeof(nesLinear)));
+    TEST_ASSERT_TRUE(std::memcmp(nesDefault, nesExponential, sizeof(nesExponential)) != 0);
+
+    // `Hybrid`'s default IS the exponential curve, not something in between.
+    TEST_ASSERT_TRUE(std::memcmp(hybridDefault, hybridLinear, sizeof(hybridLinear)) != 0);
 }
 
 // S6: the measurable no-click criterion. 0.5 s at 44100 Hz, profile switched
@@ -5808,6 +5871,345 @@ void profile_setter_is_idempotent_for_state(void) {
     // And the seam is continuous in absolute terms, so the equality above is
     // not simply two identically-broken renders.
     TEST_ASSERT_TRUE(maxAdjacentStep(repeated, kBlock, kBlock + 8) < (32767 / 4));
+}
+
+// =============================================================================
+// S2 / S3: envelope curve, its profile default and the D-3 precedence (E1/T1)
+// =============================================================================
+
+// S2: the new field is appended, so a positional literal written against the
+// 19-field layout keeps meaning exactly what it meant, and the zero value is
+// the "the profile decides" sentinel rather than a third curve. If this ever
+// becomes non-zero, every shipped `INSTR_*` preset silently changes shape.
+void instrument_preset_envelope_curve_is_appended_and_zero(void) {
+    TEST_ASSERT_EQUAL_UINT8(0, (uint8_t)EnvelopeCurve::ProfileDefault);
+
+    // The same literal the published-ABI case uses: 17 positional values,
+    // stopping at `pitchSweepDurationSec`. Everything after it is defaulted.
+    constexpr InstrumentPreset positional{
+        0.8f, 0.5f, 4, 0.25f, 7,
+        0.01f, 0.02f, 0.75f, 0.03f,
+        LfoTarget::VOLUME, 6.0f, 0.4f, 0.05f,
+        true, 0.125f, 880.0f, 1.5f
+    };
+    TEST_ASSERT_EQUAL_INT((int)EnvelopeCurve::ProfileDefault,
+                          (int)positional.envelopeCurve);
+    // The shipped presets are positional too, and none of them opts in.
+    TEST_ASSERT_EQUAL_INT((int)EnvelopeCurve::ProfileDefault,
+                          (int)INSTR_PULSE_LEAD.envelopeCurve);
+    TEST_ASSERT_EQUAL_INT((int)EnvelopeCurve::ProfileDefault,
+                          (int)INSTR_KICK.envelopeCurve);
+}
+
+// D-3, three tiers: the profile supplies the default curve, the note may
+// override it, and the `nesAccurate` safe state must not erase either — it
+// clears NES sub-units, not the character the profile resolved.
+//
+// The observable is the resolved per-voice mirror. Under `Legacy` the frozen
+// float body ignores the curve by design (S1), so what is asserted there is the
+// contract `initVoiceFromEvent` owes the integer core, not a PCM claim.
+void profile_envelope_curve_precedence_matches_d3(void) {
+    struct CurveCase {
+        SoundProfile profile;
+        EnvelopeCurve presetCurve;
+        bool nesAccurate;
+        EnvelopeCurve expected;
+        const char* name;
+    };
+    static const CurveCase cases[] = {
+        {SoundProfile::Legacy, EnvelopeCurve::ProfileDefault, false,
+         EnvelopeCurve::Linear,
+         "Legacy default is the frozen linear ramp"},
+        {SoundProfile::Legacy, EnvelopeCurve::Exponential, false,
+         EnvelopeCurve::Exponential,
+         "a note overrides the Legacy default"},
+        {SoundProfile::Hybrid, EnvelopeCurve::ProfileDefault, false,
+         EnvelopeCurve::Exponential,
+         "Hybrid default is exponential"},
+        {SoundProfile::Hybrid, EnvelopeCurve::Linear, false,
+         EnvelopeCurve::Linear,
+         "a note overrides the Hybrid default"},
+        {SoundProfile::Hybrid, EnvelopeCurve::ProfileDefault, true,
+         EnvelopeCurve::Exponential,
+         "nesAccurate must not erase the profile character"},
+        {SoundProfile::Nes, EnvelopeCurve::ProfileDefault, false,
+         EnvelopeCurve::Linear,
+         "Nes keeps the Legacy curve until its 4-bit envelope lands"},
+        {SoundProfile::Nes, EnvelopeCurve::ProfileDefault, true,
+         EnvelopeCurve::Linear,
+         "nesAccurate must not change Nes either"},
+        {SoundProfile::Nes, EnvelopeCurve::Exponential, true,
+         EnvelopeCurve::Exponential,
+         "initNesSafe must not erase a note override"},
+    };
+
+    for (const CurveCase& c : cases) {
+        ApuCore apu;
+        apu.init(44100);
+        apu.reset();
+        apu.setSoundProfile(c.profile);
+
+        InstrumentPreset preset = INSTR_PULSE_LEAD;
+        preset.envelopeCurve = c.presetCurve;
+        preset.nesAccurate = c.nesAccurate;
+
+        int16_t scratch[256] = {0};
+        const int slot = playPresetNote(apu, scratch, WaveType::PULSE, preset);
+        TEST_ASSERT_EQUAL_INT_MESSAGE((int)c.expected,
+                                      (int)apu.getVoiceEnvelopeCurveForTesting(slot),
+                                      c.name);
+    }
+}
+
+// Plays a note and advances the render by exactly one sample, so the caller
+// owns the envelope clock: every further `generateSamples(1)` is one
+// `tickEnvelopeQ15` step and the level can be read between them.
+static int startOneSampleNote(ApuCore& apu, WaveType type,
+                              const InstrumentPreset& preset,
+                              float durationSec, bool loop) {
+    AudioCommand cmd{};
+    cmd.type = AudioCommandType::PLAY_EVENT;
+    cmd.event.type = type;
+    cmd.event.frequency = 440.0f;
+    cmd.event.duration = durationSec;
+    cmd.event.volume = 0.5f;
+    cmd.event.duty = 0.5f;
+    cmd.event.loop = loop;
+    cmd.event.preset = &preset;
+    TEST_ASSERT_TRUE(apu.submitCommand(cmd));
+
+    int16_t tick[1] = {0};
+    apu.generateSamples(tick, 1);
+
+    for (int s = ApuCore::SFX_VOICE_BASE; s < ApuCore::MAX_VOICES; ++s) {
+        if (apu.isVoiceEnabledForTesting(s)) {
+            return s;
+        }
+    }
+    TEST_FAIL_MESSAGE("the envelope probe did not land on an SFX slot");
+    return -1;
+}
+
+// The decay the exponential curve is checked against, in Q15 samples.
+static constexpr int kEnvelopeDecaySamples = 4410;  // 0.1 s at 44100 Hz
+
+// Reference iteration of the shape, used by the tests below to know what the
+// curve is expected to do without duplicating the renderer's clock.
+static int32_t stepShapeOnce(int32_t level) {
+    return level - (((level - 1) >> 8) + 1);
+}
+
+// S9.2 / S2: the exponential decay reaches −60 dB in the **stage's own time**,
+// within ±5 %, and keeps its shape while doing it.
+//
+// That is the clause the first E1 cut broke: the plain recurrence runs at τ =
+// 256 samples (5.8 ms at 44.1 kHz) no matter what `decayTime` says, so a
+// 0.1 s decay hit −60 dB after ~30 ms and then sat silent until the stage
+// ended, where it jumped back up to the sustain level. The shape is now clocked
+// from the stage duration (`exponentialCurveRateQ15`), so the configured time
+// means exactly what it says.
+//
+// Two properties are pinned here:
+//   * the −60 dB crossing lands on the stage duration;
+//   * the ramp is still the exponential shape, not a linear one: the level
+//     halves after 176 of the 1 356 shape iterations that span −60 dB, i.e.
+//     after ~572 of 4 410 samples, where a linear ramp would halve at 2 205.
+void envelope_exponential_decay_reaches_minus_60_db_at_the_stage_end(void) {
+    ApuCore apu;
+    apu.init(44100);
+    apu.reset();
+    apu.setSoundProfile(SoundProfile::Hybrid);
+
+    InstrumentPreset preset = INSTR_PULSE_LEAD;
+    preset.attackTime = 0.0f;      // one sample: the decay starts at full scale
+    preset.decayTime = 0.1f;       // kEnvelopeDecaySamples
+    preset.sustainLevel = 0.0f;    // −60 dB of full scale is the stage's target
+    preset.releaseTime = 0.005f;
+
+    const int slot = startOneSampleNote(apu, WaveType::PULSE, preset, 0.0f, true);
+
+    TEST_ASSERT_EQUAL_INT((int)EnvelopeCurve::Exponential,
+                          (int)apu.getVoiceEnvelopeCurveForTesting(slot));
+    // The attack stays linear (S2) and the one-sample ramp lands on full scale.
+    TEST_ASSERT_EQUAL_INT32(32768, apu.getVoiceEnvelopeLevelQ15ForTesting(slot));
+
+    // −60 dB of a Q15 envelope: 32768 × 10^(-60/20) ≈ 33.
+    constexpr int32_t kMinus60DbQ15 = 33;
+
+    // What the shape does in iterations: the half-level point and the −60 dB
+    // point, both counted on the same recurrence the renderer runs.
+    int32_t model = 32768;
+    int halfSteps = -1;
+    int fullSteps = 0;
+    while (model > kMinus60DbQ15 / 2) {
+        model = stepShapeOnce(model);
+        ++fullSteps;
+        if (halfSteps < 0 && model <= 16384) {
+            halfSteps = fullSteps;
+        }
+    }
+    const int expectedHalf = (kEnvelopeDecaySamples * halfSteps) / fullSteps;
+
+    int halfSample = -1;
+    int crossing = -1;
+    int32_t previous = 32768;
+    for (int n = 1; n <= kEnvelopeDecaySamples; ++n) {
+        int16_t tick[1] = {0};
+        apu.generateSamples(tick, 1);
+        const int32_t level = apu.getVoiceEnvelopeLevelQ15ForTesting(slot);
+        // The curve never rises and never parks: every change is a decrease.
+        TEST_ASSERT_TRUE_MESSAGE(level <= previous, "the envelope rose");
+        TEST_ASSERT_TRUE_MESSAGE(level >= 0, "the envelope went negative");
+        if (halfSample < 0 && level <= 16384) {
+            halfSample = n;
+        }
+        if (crossing < 0 && level <= kMinus60DbQ15) {
+            crossing = n;
+        }
+        previous = level;
+    }
+
+    TEST_ASSERT_TRUE_MESSAGE(crossing > 0,
+                             "the envelope never reached -60 dB inside the stage");
+    const int tolerance = (kEnvelopeDecaySamples * 5) / 100;  // ±5 %
+    TEST_ASSERT_INT_WITHIN(tolerance, kEnvelopeDecaySamples, crossing);
+
+    TEST_ASSERT_TRUE_MESSAGE(halfSample > 0, "the envelope never fell by half");
+    TEST_ASSERT_INT_WITHIN((expectedHalf * 5) / 100, expectedHalf, halfSample);
+    // ... and it is not a linear ramp wearing an exponential's name.
+    TEST_ASSERT_TRUE(halfSample < (kEnvelopeDecaySamples / 2));
+}
+
+// S2: the release uses the same clock and the same shape, calibrated on its own
+// stage. The span is the sustain level (the release starts there), so −60 dB
+// lands at the end of `releaseTime` instead of ~30 ms into it.
+void envelope_exponential_release_reaches_minus_60_db_at_the_stage_end(void) {
+    ApuCore apu;
+    apu.init(44100);
+    apu.reset();
+    apu.setSoundProfile(SoundProfile::Hybrid);
+
+    InstrumentPreset preset = INSTR_PULSE_LEAD;
+    preset.attackTime = 0.0f;
+    preset.decayTime = 0.0f;       // attack -> sustain directly
+    preset.sustainLevel = 0.5f;    // the release starts at 16384
+    preset.releaseTime = 0.1f;     // 4410 samples (equal to the sr/10 clamp)
+
+    constexpr int kReleaseSamples = 4410;
+    // 0.01 s = 441 samples of sustain, then the automatic release.
+    const int slot = startOneSampleNote(apu, WaveType::PULSE, preset, 0.01f, false);
+    TEST_ASSERT_EQUAL_INT((int)EnvelopeCurve::Exponential,
+                          (int)apu.getVoiceEnvelopeCurveForTesting(slot));
+    TEST_ASSERT_EQUAL_INT32(16384, apu.getVoiceEnvelopeLevelQ15ForTesting(slot));
+
+    int releaseStart = -1;
+    int crossing = -1;
+    int32_t previous = apu.getVoiceEnvelopeLevelQ15ForTesting(slot);
+    for (int n = 1; n <= kReleaseSamples + 512; ++n) {
+        int16_t tick[1] = {0};
+        apu.generateSamples(tick, 1);
+        const int32_t level = apu.getVoiceEnvelopeLevelQ15ForTesting(slot);
+        if (releaseStart < 0) {
+            if (level < previous) {
+                releaseStart = n;
+            }
+        } else if (crossing < 0 && level <= 33) {
+            crossing = n - releaseStart;
+            break;
+        }
+        previous = level;
+    }
+
+    TEST_ASSERT_TRUE_MESSAGE(releaseStart > 0, "the release never began");
+    TEST_ASSERT_TRUE_MESSAGE(crossing > 0,
+                             "the release never reached -60 dB inside the stage");
+    const int tolerance = (kReleaseSamples * 5) / 100;
+    TEST_ASSERT_INT_WITHIN(tolerance, kReleaseSamples, crossing);
+    // The note is still above the noise floor at the end of the stage, i.e. the
+    // release no longer goes silent early (the defect this correction fixes).
+    TEST_ASSERT_TRUE(apu.getVoiceEnvelopeLevelQ15ForTesting(slot) > 0);
+}
+
+// S2: a stage shorter than the shape's own −60 dB span cannot hold the shape at
+// one step per sample. Stepping once per sample anyway would leave the level far
+// above its target and snap there at the boundary — a 5 ms release would jump
+// ~7 dB — so such a stage keeps the frozen linear ramp, which lands exactly on
+// its target. This is the documented fallback, not an accident.
+void envelope_exponential_short_stage_keeps_the_linear_ramp(void) {
+    ApuCore apu;
+    apu.init(44100);
+    apu.reset();
+    apu.setSoundProfile(SoundProfile::Hybrid);
+
+    InstrumentPreset preset = INSTR_PULSE_LEAD;
+    preset.attackTime = 0.0f;
+    preset.decayTime = 0.002f;     // 88 samples, far below the 1356 step span
+    preset.sustainLevel = 0.0f;
+
+    constexpr int kShortStage = 88;
+    constexpr int32_t kLinearDelta = 32768 / kShortStage;  // 372
+
+    const int slot = startOneSampleNote(apu, WaveType::PULSE, preset, 0.0f, true);
+    TEST_ASSERT_EQUAL_INT((int)EnvelopeCurve::Exponential,
+                          (int)apu.getVoiceEnvelopeCurveForTesting(slot));
+    TEST_ASSERT_EQUAL_INT32(32768, apu.getVoiceEnvelopeLevelQ15ForTesting(slot));
+
+    int32_t previous = 32768;
+    // The last sample is the stage-end snap, so the constant-step claim covers
+    // the 87 samples before it.
+    for (int n = 1; n < kShortStage; ++n) {
+        int16_t tick[1] = {0};
+        apu.generateSamples(tick, 1);
+        const int32_t level = apu.getVoiceEnvelopeLevelQ15ForTesting(slot);
+        // A constant step per sample is the linear ramp.
+        TEST_ASSERT_EQUAL_INT32_MESSAGE(previous - kLinearDelta, level,
+                                        "a short stage must keep the linear ramp");
+        previous = level;
+    }
+
+    int16_t tick[1] = {0};
+    apu.generateSamples(tick, 1);
+    // The stage ends at its target with nothing left to snap: the linear ramp
+    // already brought the level to the noise floor, so there is no click.
+    TEST_ASSERT_TRUE(previous < 512);
+    TEST_ASSERT_EQUAL_INT32(0, apu.getVoiceEnvelopeLevelQ15ForTesting(slot));
+}
+
+// The defect this correction fixes, measured where it was audible: the canonical
+// track's lead under `Hybrid`. `INSTR_PULSE_LEAD` decays for 0.18 s (7938
+// samples) down to a 0.88 sustain, so the mix must never fall silent inside that
+// window. The broken cut silenced the note for ~145 ms of every note and then
+// jumped back up to the sustain level.
+void profile_hybrid_canonical_note_never_falls_silent_before_decay_ends(void) {
+    constexpr int kNoteSamples = 11025;  // 0.25 s of the first note at 120 bpm
+    constexpr int kDecayEnd = 7938;      // 0.18 s of DECAY
+    static int16_t hybrid[kNoteSamples];
+
+    ApuCore apu;
+    apu.init(44100);
+    apu.setSoundProfile(SoundProfile::Hybrid);
+    // render_canonical() resets and re-initialises the core, which is fine: the
+    // profile is configuration, so init() keeps it.
+    apu_golden::render_canonical(apu, hybrid, kNoteSamples);
+
+    // Past the attack ramp, inside the decay window: the longest run of exact
+    // zeros. A pulse wave at 440 Hz alternates every ~50 samples, so a run this
+    // long can only mean the envelope is at zero, not a waveform crossing.
+    int run = 0;
+    int longest = 0;
+    for (int i = 128; i < kDecayEnd; ++i) {
+        if (hybrid[i] == 0) {
+            ++run;
+            if (run > longest) longest = run;
+        } else {
+            run = 0;
+        }
+    }
+    TEST_ASSERT_TRUE_MESSAGE(longest < 256,
+                             "the envelope fell silent inside its decay stage");
+
+    // And it is still sounding when the decay ends (sustain 0.88).
+    TEST_ASSERT_TRUE(peakMagnitude(hybrid + kDecayEnd - 1024, 1024) > 1000);
 }
 
 // =============================================================================
@@ -6046,11 +6448,19 @@ int main(int argc, char** argv) {
     RUN_TEST(test_sound_profile_survives_init);
 
     // S3 / S5 / S6: core dispatch, profile character and the hot switch
-    RUN_TEST(profile_nes_and_hybrid_render_identical_bytes);
+    RUN_TEST(profile_nes_and_hybrid_differ_only_by_the_envelope_curve);
     RUN_TEST(profile_apply_runs_after_nes_accurate_init);
     RUN_TEST(profile_hot_switch_does_not_click);
     RUN_TEST(profile_accessors_follow_the_active_core);
     RUN_TEST(profile_setter_is_idempotent_for_state);
+
+    // S2 / S3: envelope curve, profile default and D-3 precedence (E1/T1)
+    RUN_TEST(instrument_preset_envelope_curve_is_appended_and_zero);
+    RUN_TEST(profile_envelope_curve_precedence_matches_d3);
+    RUN_TEST(envelope_exponential_decay_reaches_minus_60_db_at_the_stage_end);
+    RUN_TEST(envelope_exponential_release_reaches_minus_60_db_at_the_stage_end);
+    RUN_TEST(envelope_exponential_short_stage_keeps_the_linear_ramp);
+    RUN_TEST(profile_hybrid_canonical_note_never_falls_silent_before_decay_ends);
 
     // Integration tests
     RUN_TEST(test_apu_core_integration_full_pipeline);

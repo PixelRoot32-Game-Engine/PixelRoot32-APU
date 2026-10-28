@@ -917,6 +917,31 @@ namespace pixelroot32::audio {
          * @return Monotonic count since construction.
          */
         uint32_t getProfileApplyCountForTesting() const;
+
+        // -- Envelope curve test diagnostics (E1/S2) -------------------
+        /**
+         * @brief Test-only: resolved ADSR curve of a voice slot.
+         *
+         * Reports the per-voice mirror after `initVoiceFromEvent` has run, i.e.
+         * the value the renderer will use: never `ProfileDefault`.
+         *
+         * @param slot Voice index [0, MAX_VOICES); out-of-range returns
+         *             `EnvelopeCurve::ProfileDefault`.
+         * @return Resolved curve of the slot.
+         */
+        EnvelopeCurve getVoiceEnvelopeCurveForTesting(int slot) const;
+
+        /**
+         * @brief Test-only: current Q15 ADSR level of a voice slot.
+         *
+         * Exposes the mirror the integer core actually renders with, so the
+         * envelope curve can be compared against its analytic model sample by
+         * sample instead of being inferred from PCM.
+         *
+         * @param slot Voice index [0, MAX_VOICES); out-of-range returns 0.
+         * @return Envelope level in Q15 (0..32768), or 0 if invalid.
+         */
+        int32_t getVoiceEnvelopeLevelQ15ForTesting(int slot) const;
 #endif
 
     private:

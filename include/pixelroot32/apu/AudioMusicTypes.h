@@ -205,6 +205,28 @@ struct InstrumentPreset {
      * `test_shipped_presets_keep_deprecated_alias_in_sync` guards this.
      */
     bool noiseShortMode = false;
+
+    /**
+     * @brief Shape of this note's ADSR decay and release (E1, S2).
+     *
+     * `ProfileDefault` (= 0, the default) means "the active sound profile
+     * decides": `Legacy` and `Nes` keep the frozen linear ramp, `Hybrid`
+     * renders the exponential one. Any other value is the note overriding the
+     * profile — the third tier of the D-3 precedence table, where the profile
+     * wins over the per-voice opt-ins but the note still wins inside its own
+     * domain (ADSR is one of those domains).
+     *
+     * `ApuCore::applyProfileCharacter` resolves this into the voice's own
+     * mirror on every note-on, so the renderer never sees `ProfileDefault`.
+     * Under `Legacy` the mirror resolves correctly but the frozen float body
+     * ignores it; only the integer core (which `Nes`/`Hybrid` always select)
+     * applies the curve, per S1.
+     *
+     * Deliberately the LAST member: every shipped `INSTR_*` preset and every
+     * consumer literal is a positional aggregate initializer, so a new field
+     * may only be appended, and its zero value must mean "nothing changed".
+     */
+    EnvelopeCurve envelopeCurve = EnvelopeCurve::ProfileDefault;
 };
 
 constexpr InstrumentPreset INSTR_PULSE_LEAD{

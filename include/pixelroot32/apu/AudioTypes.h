@@ -114,6 +114,33 @@ namespace pixelroot32::audio {
     enum class SweepCurve : uint8_t { Linear = 0, Exponential = 1 };
 
     /**
+     * @enum EnvelopeCurve
+     * @brief Shape of the ADSR decay and release ramps.
+     *
+     * `Linear` is the frozen 2.0.0 shape: a constant step per sample from the
+     * attack peak down to the sustain level. `Exponential` is the S-DSP-style
+     * decay `level -= ((level - 1) >> 8) + 1`, which is what makes a plucked
+     * note sound plucked instead of organ-like — the ear integrates amplitude
+     * roughly logarithmically, so a linear ramp is heard as "holds, then cuts".
+     *
+     * The attack stays linear on purpose (P1): a linear ramp is predictable and
+     * curving it buys nothing audible.
+     *
+     * Declared here, next to `SweepCurve`, because the type is needed by both
+     * the preset (the note's request) and `AudioChannel` (the per-voice
+     * resolved mirror), and this is the header `AudioMusicTypes.h` already
+     * builds on — the reverse include would be circular.
+     */
+    enum class EnvelopeCurve : uint8_t {
+        /** The profile decides. The value the renderer must never see. */
+        ProfileDefault = 0,
+        /** Constant decrement per sample: the frozen `Legacy` shape. */
+        Linear = 1,
+        /** `level -= ((level - 1) >> 8) + 1`, floored at 0. */
+        Exponential = 2
+    };
+
+    /**
      * @brief Master output shaping curve applied to the summed mix.
      *
      * Runs on the accumulated mix `S` BEFORE the DC blocker, so the filter
@@ -646,6 +673,48 @@ namespace pixelroot32::audio {
         NesEnvelope nesEnvelope;
 
         /**
+         * @brief Resolved ADSR curve for this voice (S2).
+         *
+         * `initVoiceFromEvent` stores the note's request here and
+         * `applyProfileCharacter` — which runs last, after the `nesAccurate`
+         * block — replaces `ProfileDefault` with the profile's default. So the
+         * renderer only ever sees `Linear` or `Exponential`, the value stays
+         * per note, and a preset override survives both the profile and the
+         * NES safe state (D-3).
+         *
+         * Default `Linear`: the frozen shape, i.e. what a voice renders before
+         * any note has resolved it.
+         *
+         * Note: appended at the END of AudioChannel to keep aggregate
+         * initializers in test literals positionally stable (see Hito 0/1
+         * lessons on aggregate-initializer hazards).
+         */
+        EnvelopeCurve envelopeCurve = EnvelopeCurve::Linear;
+
+        /**
+         * @brief Clock of the exponential curve (S2): one rate per stage plus a
+         *        shared Q15 phase accumulator.
+         *
+         * `decayCurveRateQ15` / `releaseCurveRateQ15` are the number of shape
+         * steps per sample, in Q15 (32768 = one step per sample), and `0` means
+         * "this stage is shorter than the shape's own span, so it keeps the
+         * frozen linear ramp". The phase is shared because DECAY and RELEASE can
+         * never run at the same time; it is rewound when a note starts and when
+         * a release is armed.
+         *
+         * They are written by `initVoiceFromEvent`'s character step and are only
+         * read while `envelopeCurve == Exponential`, so a linear voice never
+         * pays for them beyond the storage.
+         *
+         * Note: these three fields cost `sizeof(AudioChannel)` nothing — they
+         * fill the tail padding the enum above already forced. See the
+         * AudioChannel size note in test_apu_core.cpp.
+         */
+        uint16_t decayCurveRateQ15 = 0;
+        uint16_t releaseCurveRateQ15 = 0;
+        uint16_t envelopeCurvePhaseQ15 = 0;
+
+        /**
          * @brief Resets the channel to a clean disabled state.
          */
         void reset() {
@@ -664,6 +733,15 @@ namespace pixelroot32::audio {
             // the canonical track PCM byte-for-byte identical.
             nesEnvelope = NesEnvelope{};
             nesEnvelope.lengthCounter = &nesLengthCounter;
+            // S2: the resolved ADSR curve is per note. A reset slot is back to
+            // the frozen linear shape, not to `ProfileDefault`: the renderer
+            // must never have to interpret that value.
+            envelopeCurve = EnvelopeCurve::Linear;
+            // The exponential clock is re-derived on every note-on; zeroing it
+            // here keeps a reset slot from carrying a stale rate into a render.
+            decayCurveRateQ15 = 0;
+            releaseCurveRateQ15 = 0;
+            envelopeCurvePhaseQ15 = 0;
             enabled = false;
             type = WaveType::PULSE;
             phase = 0.0f;
