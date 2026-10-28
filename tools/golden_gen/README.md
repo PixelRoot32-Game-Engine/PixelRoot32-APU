@@ -1,56 +1,54 @@
-# golden_gen — dorado del núcleo entero (S9)
+# golden_gen — integer-core golden PCM (S9)
 
-Renderiza el track canónico de `test/golden/apu_mirror_canonical_track.h`
-(44 100 Hz, 22 050 muestras) con un perfil de sonido y escribe PCM S16LE crudo,
-sin cabecera: el mismo formato que los fixtures dorados.
+Renders the canonical track from `test/golden/apu_mirror_canonical_track.h`
+(44 100 Hz, 22 050 samples) with a sound profile and writes raw S16LE PCM, no
+header: the same format as the golden fixtures.
 
-El perfil decide **qué cuerpo de render** corre (S3). Y esa es justamente la
-propiedad que este harness fija: el cuerpo entero tiene que dar los mismos bytes
-en cualquier build que lo compile. Por eso el mismo `main.cpp` se compila tres
-veces, cambiando solo la configuración del núcleo.
+The profile decides **which render body** runs (S3), and that is exactly the
+property this harness pins: the integer body must produce the same bytes in any
+build that compiles it. That is why the same `main.cpp` is built three times,
+changing only the core configuration.
 
 ```bash
-python tools/golden_gen/run.py          # verifica
-python tools/golden_gen/run.py --write  # regenera el fixture entero
+python tools/golden_gen/run.py          # verify
+python tools/golden_gen/run.py --write  # regenerate the integer fixture
 ```
 
 ---
 
-## Los tres builds
+## The three builds
 
-| Objetivo | Definiciones | Qué cuerpo renderiza `--profile legacy` |
+| Target | Defines | Body rendered by `--profile legacy` |
 |---|---|---|
-| `apu_golden_gen` | por defecto (`PR32_APU_HAS_FPU` se autodetecta a 1 en host) | float congelado |
-| `apu_golden_gen_nofpu` | `PR32_APU_HAS_FPU=0` | entero (la ruta que hoy corre el C3) |
-| `apu_golden_gen_integer` | `PR32_APU_HAS_FPU=1 PR32_APU_ENABLE_LEGACY_FLOAT=0` | entero (la palanca de S2.5) |
+| `apu_golden_gen` | defaults (`PR32_APU_HAS_FPU` autodetects to 1 on host) | frozen float |
+| `apu_golden_gen_nofpu` | `PR32_APU_HAS_FPU=0` | integer (the path the C3 runs today) |
+| `apu_golden_gen_integer` | `PR32_APU_HAS_FPU=1 PR32_APU_ENABLE_LEGACY_FLOAT=0` | integer (the S2.5 lever) |
 
-Los tres se construyen desde el bloque `PR32_APU_BUILD_TESTS` de
-`CMakeLists.txt`, así que un solo `cmake --build build` los deja listos junto
-con las suites.
+All three are built from the `PR32_APU_BUILD_TESTS` block of `CMakeLists.txt`, so
+a single `cmake --build build` leaves them ready next to the suites.
 
-## Las tres comprobaciones
+## The three checks
 
-`run.py` construye los tres binarios, renderiza a un directorio temporal del
-sistema y compara en este orden:
+`run.py` builds the three binaries, renders into a temporary system directory and
+compares in this order:
 
-1. **El tool reproduce el fixture histórico.** `apu_golden_gen --profile legacy`
-   tiene que ser **byte a byte** `test/golden/fixtures/apu_mirror_canonical_s16le_44100.pcm`.
-   Es una puerta, no una tolerancia: si no coincide, el run se detiene y lo
-   reporta con el diff. Un generador que no reproduce la referencia congelada no
-   sirve para producir otra.
-2. **El núcleo entero no depende del build.** `apu_golden_gen_nofpu --profile legacy`
-   y `apu_golden_gen_integer --profile legacy` tienen que ser **byte a byte**
-   iguales. Si difieren, quedó una ruta que todavía usa float: se arregla el
-   núcleo, no el dorado.
-3. **El fixture entero describe ese render.** Sin `--write`, el archivo
+1. **The tool reproduces the historical fixture.** `apu_golden_gen --profile legacy`
+   must be **byte for byte** `test/golden/fixtures/apu_mirror_canonical_s16le_44100.pcm`.
+   It is a gate, not a tolerance: on a mismatch the run stops and prints the diff.
+   A generator that cannot reproduce the frozen reference is not fit to produce
+   another one.
+2. **The integer core does not depend on the build.** `apu_golden_gen_nofpu --profile legacy`
+   and `apu_golden_gen_integer --profile legacy` must be **byte for byte** equal.
+   If they differ, some path still uses float: fix the core, not the golden.
+3. **The integer fixture describes that render.** Without `--write`, the file
    `test/golden/fixtures/apu_integer_core_canonical_s16le_44100.pcm` (44 100 B)
-   tiene que coincidir byte a byte con el render. Con `--write` se reescribe
-   desde el build `nofpu`.
+   must match the render byte for byte. With `--write` it is rewritten from the
+   `nofpu` build.
 
-Imprime el SHA-256 de los tres renders, del fixture float de referencia y del
-fixture entero, y termina con una línea `OK` o `FAIL` (exit code 0/1).
+It prints the SHA-256 of the three renders, of the reference float fixture and of
+the integer fixture, and ends with an `OK` or `FAIL` line (exit code 0/1).
 
-## Comandos exactos
+## Exact commands
 
 ```bash
 cmake -S . -B build -G "MinGW Makefiles" --fresh -DPR32_APU_BUILD_TESTS=ON
@@ -58,12 +56,13 @@ cmake --build build --target apu_golden_gen apu_golden_gen_nofpu apu_golden_gen_
 ./build/apu_golden_gen --profile legacy --out test/golden/fixtures/apu_integer_core_canonical_s16le_44100.pcm
 ```
 
-`run.py` es la vía recomendada: hace esos pasos y además las tres comprobaciones.
-El render directo no compara nada.
+`run.py` is the recommended path: it performs those steps plus the three checks.
+A direct render compares nothing.
 
-## Relación con `test_apu_integer_golden`
+## Relation to `test_apu_integer_golden`
 
-El fixture que este harness escribe es el que consume `test/test_apu_integer_golden.cpp`,
-compilado dos veces: con FPU elige el perfil `Nes` (el `Legacy` de ese build es
-float) y sin FPU elige `Legacy`. En E0 ambos son alias exactos del mismo cuerpo
-(S3), así que los dos objetivos afirman el mismo archivo.
+The fixture this harness writes is the one consumed by
+`test/test_apu_integer_golden.cpp`, compiled twice: with an FPU it selects the
+`Nes` profile (that build's `Legacy` is float) and without an FPU it selects
+`Legacy`. In E0 both are exact aliases of the same body (S3), so the two targets
+assert the same file.
