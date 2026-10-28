@@ -31,6 +31,7 @@ Consumers with dynamic presets must guarantee address stability (the Tool Suite 
 - `SweepCurve::Exponential` degrades to `Linear` if both initial/final Hz are not > 0.
 - In NOISE, the sweep interpolates the LFSR clock/period, not melodic pitch.
 - Shared clock `automationAgeSamples`: one increment per sample feeds both duty and pitch.
+- **Duty mirror at full scale**: `AudioEvent::duty` is clamped to [0, 1] and `AudioChannel::dutyCycleQ32` mirrors it for the integer core as `duty * 2^32`, **saturating at `0xFFFFFFFF` for `duty == 1.0`**. The natural product is exactly 2^32 there, which does not fit in `uint32_t`; the wrapped 0 made `phaseQ32 < dutyCycleQ32` false for every phase, so a full-scale pulse rendered flat while the float body rendered a constant high. No other value changes, so the integer golden is untouched.
 
 ### Three-level precedence, profile < voice < note
 
@@ -170,8 +171,8 @@ Measured 2026-10-28 on the sound-profile branch (`cmake -S . -B build -G "MinGW 
 
 | Target | Cases | What it covers |
 |---|---|---|
-| `test_apu_core` | 205 | Core behaviour on the float core (as selected by the default profile) |
-| `test_apu_core_integer` | 205 | The same source against the integer core (`PR32_APU_HAS_FPU=0`) |
+| `test_apu_core` | 210 | Core behaviour on the float core (as selected by the default profile) |
+| `test_apu_core_integer` | 210 | The same source against the integer core (`PR32_APU_HAS_FPU=0`) |
 | `test_audio_command_queue` | 10 | SPSC queue, capacity and the `AudioCommand` ABI pins |
 | `test_audio_music_types` | 35 | Music types, `InstrumentPreset` layout, shipped presets |
 | `test_apu_mirror` | 37 | Tool Suite parity, byte-for-byte against the float golden |
@@ -181,7 +182,9 @@ Measured 2026-10-28 on the sound-profile branch (`cmake -S . -B build -G "MinGW 
 | `test_apu_profile_golden` | 2 | `Nes` and `Hybrid` against their own goldens (FPU build with the float body off) |
 | `test_apu_profile_golden_no_fpu` | 2 | The same two goldens from a build with no FPU at all |
 | `test_library_link` | 4 | Public symbols exist in the shipped artifact (links, no `UNIT_TEST`) |
-| **Total** | **517** | 0 failures, 0 ignored, exit code 0 in all eleven |
+| **Total** | **522** | 0 failures, 0 ignored, exit code 0 in all eleven |
+
+The five continuous-duty cases added by the full-scale fix (`test_pulse_duty_full_scale_*`, `test_pulse_duty_zero_never_goes_positive`, `test_pulse_duty_interior_value_unchanged`) live in `test/test_apu_core.cpp`, so both core targets run them; that is the 205 → 210 step on the two rows above.
 
 ### 9.2 Golden PCM
 

@@ -90,6 +90,23 @@ first.
 - **Build**: `PR32_APU_ENABLE_LEGACY_FLOAT` (default `PR32_APU_HAS_FPU`) controls whether the float body of `generateSamples` is compiled; the integer body is always compiled. With the default value nothing changes for a consumer that defines nothing. `-DPR32_APU_ENABLE_LEGACY_FLOAT=0` is the supported flash lever on an FPU target: the float body disappears and `Legacy` falls back to the integer core. A build that keeps both bodies pays the second body in flash (budget for `esp32dev`: ≤ 8 KB of `.text` over the base).
 - **Engine-side (consumer contract, PixelRoot32 Game Engine)**: the audio render block moves from 256/128 samples to **512 (FPU) / 1024 (no FPU)**, with `PR32_AUDIO_MAX_BLOCK_SAMPLES = 1024`. The I2S and DAC backends derive `dma_buf_count = clamp(blockSize / 128, 2, 8)` over a fixed `dma_buf_len = 128`, which puts the objective latency at **23.2 ms** (dual-core) / **46.4 ms** (single-core) at 22 050 Hz and **16 / 32 ms** at 32 000 Hz. Because the block is the render granularity, **a queued command can now be applied up to one render block later**; that is the price of the lower wake-up rate, not a queue regression.
 
+### Fixed
+
+- **Integer path only: a 100 % PULSE duty now renders a constant high level
+  instead of a flat line.** `set_pulse_duty` mirrored the clamped float duty
+  into Q32 as `(uint32_t)(duty * 2^32)`. At exactly `duty == 1.0` the product
+  is 2^32, which does not fit in `uint32_t`, so the conversion yielded 0 and the
+  integer generator's `phaseQ32 < dutyCycleQ32` was never true — while the
+  float body compares against the float `dutyCycle` (1.0) and was always
+  correct. The mirror now saturates to `0xFFFFFFFF` at that boundary; **every
+  other `duty` keeps the identical expression**, so the rest of the PCM is
+  byte-identical and no fixture was regenerated: the float golden
+  (`7FF568A5…5DE9`) and the integer golden (`F59501D6…3902D`) still reproduce
+  byte for byte, and `Nes`/`Hybrid` still render the integer reference. The
+  input that changes is exactly `duty == 1.0` on the integer path — a no-FPU
+  build, or `Nes`/`Hybrid` on any build. No version is claimed here: the bump
+  is the release owner's decision, as with the DC-blocker fix above.
+
 ### Migration
 
 - Consumers on `PR32_APU_HAS_FPU=0` targets that calibrated levels or wrote PCM references against the integer path must regenerate them: the path no longer leaves a −199 DC offset behind a silenced voice.
