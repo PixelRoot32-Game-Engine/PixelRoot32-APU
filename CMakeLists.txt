@@ -94,6 +94,15 @@ if(PR32_APU_BUILD_TESTS)
     pr32_apu_add_test(test_apu_hybrid_wavetable
         EXTRA_DEFS PR32_APU_ENABLE_LEGACY_FLOAT=0)
 
+    # E2 level parity: the fixed per-profile trim must make a `Legacy` ->
+    # `Nes` -> `Hybrid` switch level-neutral on the canonical track, measured
+    # by rendering all three, not by reading a fixture. Built with the float
+    # `Legacy` body off so the anchor renders through the same integer core the
+    # trim lives in — the like-for-like route (the float route is 0.45 dB away
+    # and is deliberately not touched).
+    pr32_apu_add_test(test_apu_profile_level
+        EXTRA_DEFS PR32_APU_ENABLE_LEGACY_FLOAT=0)
+
     # Q15 / integer path exercised natively — the coverage gap identified in
     # the extraction analysis (no firmware build compiled this path).
     add_executable(test_q15_smoke test/test_q15_smoke.cpp src/ApuCore.cpp)

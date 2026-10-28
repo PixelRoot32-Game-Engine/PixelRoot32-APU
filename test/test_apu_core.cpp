@@ -5931,8 +5931,97 @@ void profile_nes_and_hybrid_differ_only_by_the_envelope_curve(void) {
         std::memcmp(nesDefault, hybridDefault, sizeof(nesDefault)) != 0,
         "E1: Hybrid must no longer render the same bytes as Nes");
 
-    // Same curve -> same bytes: the two profiles still share one core.
-    TEST_ASSERT_EQUAL_INT(0, std::memcmp(nesLinear, hybridLinear, sizeof(nesLinear)));
+    // E2 changed what "same curve" means here. Bytes stopped matching when each
+    // audible profile got its own fixed level trim (`ApuCore.h`:
+    // `kProfileTrimNesQ15` = 47786 for `Nes`, `kProfileTrimHybridQ15` = 53854
+    // for `Hybrid`), so the same curve no longer produces the same samples.
+    // What still holds is the stronger claim: the two renders share one shape,
+    // and the trim ratio is the ONLY difference between them.
+    constexpr int kNesTrimQ15 = 47786;     // ApuCore::kProfileTrimNesQ15
+    constexpr int kHybridTrimQ15 = 53854;  // ApuCore::kProfileTrimHybridQ15
+
+    // Quantisation bound, derived rather than tuned. The renderer truncates
+    // once per profile (`out = (raw * gain) >> 15`, toward zero), so comparing
+    // the two renders carries one truncation on each side, and the Nes-side
+    // error reaches the Hybrid scale multiplied by 53854/47786 = 1.127. The
+    // total is 1.127 + 1 < 2.127 LSB, so two integers further apart than 2 LSB
+    // cannot have come from the same underlying sample. The division below must
+    // truncate toward zero the same way the renderer does, which is plain
+    // integer division - `lround` would be a different operation and would
+    // hide a rounding change in the stage.
+    int32_t worstTrimDeviationLsb = 0;
+    for (int i = 0; i < kSamples; ++i) {
+        const int32_t expected = static_cast<int32_t>(
+            static_cast<int64_t>(nesLinear[i]) * kHybridTrimQ15 / kNesTrimQ15);
+        const int32_t deviation = static_cast<int32_t>(hybridLinear[i]) - expected;
+        const int32_t magnitude = (deviation < 0) ? -deviation : deviation;
+        if (magnitude > worstTrimDeviationLsb) {
+            worstTrimDeviationLsb = magnitude;
+        }
+        char message[192] = {};
+        std::snprintf(message, sizeof(message),
+                      "sample %d: Nes %d scales to %d, Hybrid renders %d "
+                      "(limit +-2 LSB)",
+                      i, static_cast<int>(nesLinear[i]), static_cast<int>(expected),
+                      static_cast<int>(hybridLinear[i]));
+        TEST_ASSERT_INT32_WITHIN_MESSAGE(2, expected,
+                                         static_cast<int32_t>(hybridLinear[i]),
+                                         message);
+    }
+
+    // The peak must move by exactly the trim ratio; 0.5 % is wide enough for
+    // one LSB of quantisation on a peak of a few thousand and narrow enough
+    // that a different gain cannot pass.
+    const double peakRatio =
+        static_cast<double>(peakMagnitude(hybridLinear, kSamples)) /
+        static_cast<double>(peakMagnitude(nesLinear, kSamples));
+    const double trimRatio =
+        static_cast<double>(kHybridTrimQ15) / static_cast<double>(kNesTrimQ15);
+    char ratioMessage[160] = {};
+    std::snprintf(ratioMessage, sizeof(ratioMessage),
+                  "peak ratio %.6f vs trim ratio %.6f (limit 0.5 %%)", peakRatio,
+                  trimRatio);
+    TEST_ASSERT_TRUE_MESSAGE(std::fabs(peakRatio / trimRatio - 1.0) <= 0.005,
+                             ratioMessage);
+
+    // Shape: a zero crossing of the Nes render is still a zero crossing of the
+    // Hybrid render. The allowance is |sample| <= 2 on either side of the
+    // crossing - the same quantisation bound as above - because a sample that
+    // close to zero can legitimately change sign under a x1.127 gain without
+    // the waveform moving. A crossing at a larger amplitude cannot flip.
+    constexpr int kTrimRoundingLsb = 2;
+    int sharedCrossings = 0;
+    for (int i = 1; i < kSamples; ++i) {
+        const int32_t prev = nesLinear[i - 1];
+        const int32_t cur = nesLinear[i];
+        const bool nesCrosses = (prev > 0 && cur < 0) || (prev < 0 && cur > 0);
+        if (!nesCrosses) {
+            continue;
+        }
+        const int32_t prevMagnitude = (prev < 0) ? -prev : prev;
+        const int32_t curMagnitude = (cur < 0) ? -cur : cur;
+        if (prevMagnitude <= kTrimRoundingLsb || curMagnitude <= kTrimRoundingLsb) {
+            continue;  // exempted: the trim's rounding can flip a near-zero sign
+        }
+        const bool hybridCrosses =
+            (hybridLinear[i - 1] > 0 && hybridLinear[i] < 0) ||
+            (hybridLinear[i - 1] < 0 && hybridLinear[i] > 0);
+        char message[192] = {};
+        std::snprintf(message, sizeof(message),
+                      "zero crossing lost at sample %d (Nes %d -> %d, Hybrid %d -> %d)",
+                      i, static_cast<int>(prev), static_cast<int>(cur),
+                      static_cast<int>(hybridLinear[i - 1]),
+                      static_cast<int>(hybridLinear[i]));
+        TEST_ASSERT_TRUE_MESSAGE(hybridCrosses, message);
+        ++sharedCrossings;
+    }
+    TEST_ASSERT_TRUE_MESSAGE(sharedCrossings > 0,
+                             "no zero crossing left to compare: the shape check "
+                             "would be vacuous");
+    std::printf("  curve probe: worst trim deviation %d LSB, %d shared zero "
+                "crossings, peak ratio %.6f (trim ratio %.6f)\n",
+                static_cast<int>(worstTrimDeviationLsb), sharedCrossings, peakRatio,
+                trimRatio);
 
     // `Nes` in T1 renders the `Legacy` curve: its default is byte-identical to
     // an explicit linear override, and an exponential override *would* move it

@@ -255,8 +255,10 @@ namespace pixelroot32::audio {
          * the output corner, so it OUTRANKS the sound profile. Once it has
          * been called, `Nes` and `Hybrid` do NOT install their output filter
          * chain; the historical single-pole HPF runs at the caller's corner
-         * instead. `reset()` clears that override, so the profile owns the
-         * stage again on the following block. This mirrors the
+         * instead — level included, because the profile's fixed gain trim is
+         * part of the chain and is suppressed with it. `reset()` clears that
+         * override, so the profile owns the stage again on the following
+         * block. This mirrors the
          * `pulseDutyOverridden` / `noiseUnipolarOverridden` /
          * `nesNoiseLutOverridden` tier-2 convention of E1. Calling it with
          * <= 0 still counts as an explicit choice (an overridden bypass).
@@ -367,6 +369,21 @@ namespace pixelroot32::audio {
          * the two high-passes only, which is a documented property of the
          * profile, not a fallback. An explicit `setHpfCutoffHz()` call wins
          * over all of this (S8).
+         *
+         * The stage also carries the profile's LEVEL TRIM, so a profile switch
+         * is a change of character and not of loudness. The chain alone put
+         * `Nes` 3.28 dB and `Hybrid` 4.31 dB below `Legacy` on the canonical
+         * track, so each of those profiles is lifted by exactly that much after
+         * the chain and before the master bitcrush. `Legacy` is the frozen
+         * anchor and stays at unity — it never runs the chain, so it never runs
+         * the multiply either. Both the amount and the activation are resolved
+         * once per configuration change. The trim is tied to the chain, so an
+         * explicit `setHpfCutoffHz()` suppresses it too: that caller asked for
+         * the historical one-pole, level included. The price is headroom —
+         * matched RMS on a 13–14 dB crest factor puts `Nes`/`Hybrid` peaks at
+         * roughly two thirds of full scale on a dense mix, where `Legacy` uses
+         * a third — so a consumer that mixes by peak rather than by ear should
+         * check its master level after switching.
          *
          * SAW is the one waveform whose TIMBRE the profile changes (S4): only
          * `Hybrid` reads a band-limited table, a mipmap of eight 256-point Q15
@@ -1309,6 +1326,43 @@ namespace pixelroot32::audio {
                 9223372036854775807LL,
             "the five-term accumulator must fit int64_t");
 
+        /**
+         * Fixed per-profile output trim, Q15, applied after the chain and
+         * before the master bitcrush.
+         *
+         * The chain alone made a profile switch a level change, which is what
+         * the listener heard on hardware. Measured RMS of the committed
+         * canonical fixtures (22 050 samples at 44 100 Hz), with the INTEGER
+         * `Legacy` route as the anchor because the trim lives in that core:
+         *
+         *   Legacy  -19.70 dBFS   (frozen contract; exactly unity here)
+         *   Nes     -22.98 dBFS   -> +3.28 dB -> 47786  (x1.45831)
+         *   Hybrid  -24.01 dBFS   -> +4.31 dB -> 53854  (x1.64349)
+         *
+         * with `gainQ15 = round(10^(dB/20) * 32768)`. The integers below are
+         * that value; re-deriving it from the two-decimal dB figures printed
+         * here agrees within 0.01 dB. The float `Legacy` route reads -20.15
+         * dBFS and is 0.45 dB away, and is deliberately NOT matched: touching
+         * it would move the frozen path.
+         *
+         * `Legacy` never pays for this. The trim is applied only on the chain
+         * branch of the render path, and `Legacy` never takes that branch, so
+         * the multiply cannot reach the frozen arithmetic even as a no-op.
+         *
+         * The product bound is the same class as the coefficients above:
+         * |sample| <= 32767 and the largest trim is 53854, so
+         * 32767 * 53854 = 1 764 634 018 < 2^31 and the product fits `int32_t`.
+         * The result is clamped to the int16 rail like every other stage
+         * output — the trim is the only stage that can push a legal chain
+         * output back over it.
+         */
+        static constexpr int32_t kProfileTrimUnityQ15 = 32768;   ///< 1.0, `Legacy`
+        static constexpr int32_t kProfileTrimNesQ15 = 47786;     ///< +3.28 dB
+        static constexpr int32_t kProfileTrimHybridQ15 = 53854;  ///< +4.31 dB
+        static_assert(
+            static_cast<int64_t>(32767) * kProfileTrimHybridQ15 <= 2147483647LL,
+            "trim * sample must fit int32_t (32767 * 53854 = 1764634018)");
+
         /** True when the profile owns the stage and no caller override exists. */
         bool outputFilterActive_ = false;
         /** False below the 6 kHz floor; the chain is then the two HPFs only. */
@@ -1333,6 +1387,14 @@ namespace pixelroot32::audio {
         float outHpf1CutoffHz_ = kOutputHpf1Hz;
         float outHpf2CutoffHz_ = kOutputHpf2Hz;
         float outLpfCutoffHz_ = 0.0f;
+        /**
+         * Level trim of the ACTIVE profile, resolved with the activation
+         * itself (`recomputeOutputFilterCoefficients`) so it is configuration,
+         * never a per-sample or per-block computation. It stays at unity while
+         * the chain is inactive: an explicit `setHpfCutoffHz` asks for the
+         * historical one-pole, level included (S8).
+         */
+        int32_t outTrimQ15_ = kProfileTrimUnityQ15;
 
         // -- Soft-clip configuration (Hito 4 M11) --------------------------
         /**
@@ -1394,10 +1456,10 @@ namespace pixelroot32::audio {
          * The stage is the only reader and writer of its own state, and it runs
          * on every sample, so the render loop copies it out of the class once
          * per block and writes it back once. Read through `this`, the ten
-         * recursion words plus the coefficients and the three flags cost twenty
-         * member loads and stores per sample for six multiplies of arithmetic;
-         * held in a local, the compiler is free to keep the words that stay
-         * live across iterations in registers.
+         * recursion words plus the coefficients, the trim and the three flags
+         * cost twenty-two member loads and stores per sample for six multiplies
+         * of arithmetic; held in a local, the compiler is free to keep the words
+         * that stay live across iterations in registers.
          *
          * It holds no new state and changes no arithmetic: every field is a
          * verbatim copy of a member below, and `captureOutputStageState` /
@@ -1420,6 +1482,11 @@ namespace pixelroot32::audio {
             int32_t lpfB2Q15;          ///< `outLpfB2Q15_`
             int32_t lpfA1Q15;          ///< `outLpfA1Q15_`
             int32_t lpfA2Q15;          ///< `outLpfA2Q15_`
+            /**
+             * Level trim of the active profile, Q15; applied after the chain,
+             * never on the `Legacy` branch (see `kProfileTrimNesQ15`).
+             */
+            int32_t trimQ15;           ///< `outTrimQ15_`
             /** Recursion state; every word is saturated to the int16 rail. */
             int32_t legacyPrevInQ15;   ///< `hpfPrevInQ15`
             int32_t legacyPrevOutQ15;  ///< `hpfPrevOutQ15`
@@ -1451,7 +1518,8 @@ namespace pixelroot32::audio {
          * back: the stage's configuration is read-only for the duration of a
          * block, because its writers (`recomputeOutputFilterCoefficients`,
          * `setSoundProfile`, `setHpfCutoffHz`, `resetOutputFilterState`) never
-         * run inside the loop.
+         * run inside the loop. That includes the profile trim, which is
+         * configuration (see `kProfileTrimNesQ15`), not state.
          *
          * @param state Snapshot produced by `captureOutputStageState`.
          */

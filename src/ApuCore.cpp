@@ -1376,6 +1376,27 @@ namespace pixelroot32::audio {
         outputFilterActive_ = profileWantsChain && !hpfCutoffOverridden_ &&
                               sampleRate > 0;
 
+        // Level trim of the active profile (see `kProfileTrimNesQ15`). Resolved
+        // HERE, next to the activation it belongs to, so it is configuration
+        // and never a per-sample or per-block computation. The amount follows
+        // the PROFILE, but it is applied only while the chain is active: an
+        // explicit `setHpfCutoffHz` asks for the historical one-pole and that
+        // includes its level, so the trim goes quiet with the chain (S8).
+        switch (profile_) {
+            case SoundProfile::Nes:
+                outTrimQ15_ = kProfileTrimNesQ15;
+                break;
+            case SoundProfile::Hybrid:
+                outTrimQ15_ = kProfileTrimHybridQ15;
+                break;
+            case SoundProfile::Legacy:
+            default:
+                // `Legacy` is the anchor: exactly unity, and the render loop's
+                // chain branch never runs for it, so no multiply is paid.
+                outTrimQ15_ = kProfileTrimUnityQ15;
+                break;
+        }
+
         // LPF policy (audit P3 risk iii): at 8 000 Hz `0.45 * fs` is 3 600 Hz,
         // which would cut most of the passband and "switch off" the sound
         // instead of approximating the NES's 14 kHz roof. Below the 6 kHz
@@ -1510,6 +1531,7 @@ namespace pixelroot32::audio {
         state.lpfB2Q15 = outLpfB2Q15_;
         state.lpfA1Q15 = outLpfA1Q15_;
         state.lpfA2Q15 = outLpfA2Q15_;
+        state.trimQ15 = outTrimQ15_;
         state.legacyPrevInQ15 = hpfPrevInQ15;
         state.legacyPrevOutQ15 = hpfPrevOutQ15;
         state.hpf1PrevInQ15 = outHpf1PrevInQ15_;
@@ -1525,11 +1547,11 @@ namespace pixelroot32::audio {
 
     void ApuCore::restoreOutputStageState(const OutputStageStateQ15& state) {
         // Only the recursion state travels back. The stage's configuration —
-        // the three selection flags and the seven coefficients — is read-only
-        // for the duration of a block: its only writers are
+        // the three selection flags, the seven coefficients and the profile
+        // trim — is read-only for the duration of a block: its only writers are
         // `recomputeOutputFilterCoefficients`, `setSoundProfile`,
         // `setHpfCutoffHz` and `resetOutputFilterState`, and none of them can
-        // run inside the sample loop. Writing those eleven words back would be
+        // run inside the sample loop. Writing those twelve words back would be
         // unchanged values stored into unchanged fields, paid in flash on a
         // budget where that is the scarce resource.
         //
@@ -4838,6 +4860,21 @@ namespace pixelroot32::audio {
             // `outStage`, so the per-sample path carries no call and no
             // `this`-relative state access.
             int32_t hpfOutQ15 = applyOutputStage(inputQ15, outStage);
+
+            // E2 level parity: the profile's fixed trim, after the chain and
+            // before the master bitcrush. `chainActive` is block-constant and
+            // is false for `Legacy`, so the frozen path never executes this
+            // multiply, not even as a no-op. It sits here rather than inside
+            // `applyOutputStage` on purpose: the stage's measured response is
+            // the cascade itself (S2 pins the transfer function, not the
+            // profile's loudness), and the trim is a render-path gain.
+            // `trimQ15 * sample` fits int32_t (32767 * 53854 < 2^31, see the
+            // header's static_assert), and the saturation below is the clamp
+            // this gain needs: it is the only stage that can push a legal
+            // chain output back over the int16 rail.
+            if (outStage.chainActive) {
+                hpfOutQ15 = q15_truncate_from_int32(outStage.trimQ15 * hpfOutQ15);
+            }
 
             // Hito 5 M12: the fixed -6 dB headroom pad (`>>1`, Q15 -> Q14) is
             // gone; this path now lands at the same level as the float one.
