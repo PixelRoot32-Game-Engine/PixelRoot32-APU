@@ -79,6 +79,13 @@ if(PR32_APU_BUILD_TESTS)
     add_test(NAME test_apu_output_filter_integer COMMAND test_apu_output_filter_integer
              WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test)
 
+    # E2/S4, S5 (and the S6 groundwork): the generated SAW mipmap tables are
+    # band-limited per level, the table has no seam of its own, and the
+    # mipmapped synthesis folds down at least 10 dB less energy below the
+    # fundamental than the ideal ramp it will replace. Nothing is wired into
+    # the renderer here, so no golden moves.
+    pr32_apu_add_test(test_apu_wavetable_spectral)
+
     # Q15 / integer path exercised natively — the coverage gap identified in
     # the extraction analysis (no firmware build compiled this path).
     add_executable(test_q15_smoke test/test_q15_smoke.cpp src/ApuCore.cpp)
