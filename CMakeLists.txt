@@ -81,6 +81,48 @@ if(PR32_APU_BUILD_TESTS)
     add_test(NAME test_apu_core_integer COMMAND test_apu_core_integer
              WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test)
 
+    # S9: the integer core's golden PCM. One source, two routes into the same
+    # core — `Nes` on an FPU build, `Legacy` on a no-FPU build — so a byte
+    # difference between the targets means the integer core still depends on
+    # the build, which is the defect the fixture exists to catch.
+    add_executable(test_apu_integer_golden test/test_apu_integer_golden.cpp src/ApuCore.cpp)
+    target_compile_definitions(test_apu_integer_golden PRIVATE UNIT_TEST=1)
+    target_include_directories(test_apu_integer_golden PRIVATE include test test/support)
+    target_link_libraries(test_apu_integer_golden PRIVATE pr32_apu_unity)
+    add_test(NAME test_apu_integer_golden COMMAND test_apu_integer_golden
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test)
+
+    add_executable(test_apu_integer_golden_no_fpu test/test_apu_integer_golden.cpp src/ApuCore.cpp)
+    target_compile_definitions(test_apu_integer_golden_no_fpu PRIVATE
+        UNIT_TEST=1 PR32_APU_HAS_FPU=0)
+    target_include_directories(test_apu_integer_golden_no_fpu PRIVATE
+        include test test/support)
+    target_link_libraries(test_apu_integer_golden_no_fpu PRIVATE pr32_apu_unity)
+    add_test(NAME test_apu_integer_golden_no_fpu COMMAND test_apu_integer_golden_no_fpu
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test)
+
+    # S9: host fixture generator, built three ways from the same source. The
+    # only difference is which core the build compiles in, because that is the
+    # property tools/golden_gen/run.py has to prove byte-stable.
+    function(pr32_apu_add_golden_gen name)
+        cmake_parse_arguments(ARG "" "" "EXTRA_DEFS" ${ARGN})
+        add_executable(${name} tools/golden_gen/main.cpp src/ApuCore.cpp)
+        target_compile_definitions(${name} PRIVATE ${ARG_EXTRA_DEFS})
+        target_include_directories(${name} PRIVATE include test)
+        target_compile_features(${name} PRIVATE cxx_std_17)
+    endfunction()
+
+    # Default host defines: PR32_APU_HAS_FPU autodetects to 1, so `legacy`
+    # renders the frozen float body — the build that must reproduce the
+    # historical mirror fixture byte for byte.
+    pr32_apu_add_golden_gen(apu_golden_gen)
+    # No FPU: `legacy` falls to the integer core, the path an ESP32-C3 runs.
+    pr32_apu_add_golden_gen(apu_golden_gen_nofpu EXTRA_DEFS PR32_APU_HAS_FPU=0)
+    # FPU target with the float body switched off (S2 clause 5): the same
+    # integer core reached by the other supported route.
+    pr32_apu_add_golden_gen(apu_golden_gen_integer EXTRA_DEFS
+        PR32_APU_HAS_FPU=1 PR32_APU_ENABLE_LEGACY_FLOAT=0)
+
     # Consumer link surface. Every suite above recompiles src/ApuCore.cpp with
     # UNIT_TEST=1, so a definition left inside a `#if defined(UNIT_TEST)` block
     # still resolves for them — and the shipped library silently loses the
