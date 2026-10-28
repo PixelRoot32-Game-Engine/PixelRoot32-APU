@@ -105,6 +105,28 @@ if(PR32_APU_BUILD_TESTS)
     add_test(NAME test_apu_integer_golden_no_fpu COMMAND test_apu_integer_golden_no_fpu
              WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test)
 
+    # S7: one golden per audible profile, each compiled twice for the same
+    # reason as the integer fixture above. `Nes` and `Hybrid` always render the
+    # integer core, so the two targets differ only in the build around it (FPU
+    # with the float body switched off, and no FPU at all) and must agree byte
+    # for byte; `Legacy` keeps its two committed references untouched.
+    add_executable(test_apu_profile_golden test/test_apu_profile_golden.cpp src/ApuCore.cpp)
+    target_compile_definitions(test_apu_profile_golden PRIVATE
+        UNIT_TEST=1 PR32_APU_ENABLE_LEGACY_FLOAT=0)
+    target_include_directories(test_apu_profile_golden PRIVATE include test test/support)
+    target_link_libraries(test_apu_profile_golden PRIVATE pr32_apu_unity)
+    add_test(NAME test_apu_profile_golden COMMAND test_apu_profile_golden
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test)
+
+    add_executable(test_apu_profile_golden_no_fpu test/test_apu_profile_golden.cpp src/ApuCore.cpp)
+    target_compile_definitions(test_apu_profile_golden_no_fpu PRIVATE
+        UNIT_TEST=1 PR32_APU_HAS_FPU=0)
+    target_include_directories(test_apu_profile_golden_no_fpu PRIVATE
+        include test test/support)
+    target_link_libraries(test_apu_profile_golden_no_fpu PRIVATE pr32_apu_unity)
+    add_test(NAME test_apu_profile_golden_no_fpu COMMAND test_apu_profile_golden_no_fpu
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test)
+
     # S9: host fixture generator, built three ways from the same source. The
     # only difference is which core the build compiles in, because that is the
     # property tools/golden_gen/run.py has to prove byte-stable.
