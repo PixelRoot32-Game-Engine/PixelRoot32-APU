@@ -2,7 +2,210 @@
 
 Format: [semver](https://semver.org/). Changes that alter rendered PCM or struct ABI require a major or minor bump with an explicit note.
 
-## [Unreleased]
+## [2.1.0] - 2026-10-28
+
+Sound profiles, one integer render core on every platform, a smaller command
+queue, one audible fix on no-FPU builds, and the audible character of the `Nes`
+and `Hybrid` profiles. **On `PR32_APU_HAS_FPU=1` builds with the default profile
+the rendered PCM is unchanged** (float golden `7FF568A5…5DE9`); every sound
+change lives on the integer path, and the one a consumer can hear is listed
+first.
+
+This is a **minor** release, not a major one, on the distinction the 2.0.0
+entry established: that release changed the output of the **default**
+configuration (`TRIANGLE` quantised without opt-in, the integer path 4.4x
+louder), while this one leaves it byte-identical. Nothing is removed or
+renamed, the profiles are new and were never released, and the audible
+change is a defect fix on a route only no-FPU builds take.
+
+### Added
+
+- **Audio character**: `Nes` and `Hybrid` are no longer byte-identical aliases.
+  Four changes, all inside the integer core they already run, while `Legacy`
+  stays byte-identical on both of its routes (`7FF568A5…5DE9` float,
+  `F59501D6…3902D` integer) — neither of those fixtures is regenerated.
+  - **Envelope curve (P1).** `EnvelopeCurve { ProfileDefault, Linear,
+    Exponential }` is the **last** member of `InstrumentPreset`, so every
+    positional literal keeps its meaning and `ProfileDefault` means "the profile
+    decides". `Hybrid` decays and releases exponentially
+    (`level -= ((level - 1) >> 8) + 1`, floor at 0) and reaches −60 dB in the
+    stage's own time ±5 %; ATTACK stays linear because a predictable attack is
+    worth more than a matching curve, and a stage shorter than the shape's own
+    −60 dB span keeps the linear ramp so it still ends on its target instead of
+    snapping (~7 dB on the default 5 ms release). `Nes` stays linear and lets its
+    existing 4-bit `nesEnvelope` at 240 Hz be the character.
+  - **Weighted mix (P2a).** `MixerCurve::NesWeighted` applies the published NES
+    balance before the HPF — pulses `0.00752 × (p1 + p2)`, triangle `0.00851`,
+    noise `0.00494`, DMC `0.00335` — normalised to the pulse group (Q12 4096 /
+    4635 / 2691 / 1825), so a full-scale pulse keeps exactly the amplitude
+    `Legacy` gives it: triangle lands +1.07 dB against a pulse and noise
+    −3.65 dB, and the DMC term is reserved until a DMC voice exists.
+  - **Unipolar noise (P9).** `Nes`/`Hybrid` switch NOISE between 0 and the
+    envelope level instead of ±level, with one exact ×2 compensation after the
+    volume and envelope multiplies: −0.001 dB against bipolar at the same
+    weighting, and −3.649 dB against `Legacy` — which is exactly the published
+    noise weight, not a lost level. They also arm the NES period LUT (index 0,
+    `$400E = $00`), and arming it retunes the period, so a preset's own
+    `noisePeriod` is replaced under those profiles;
+    `setVoiceNesNoiseLutMode(slot, 255)` opts out.
+  - **Stepped duty (S6).** PULSE renders the four NES patterns (12.5 / 25 / 50 /
+    75 %) snapped round-half-up from the note's `duty`, instead of the
+    continuous comparison. A note that **animates** duty (`dutySteps`,
+    `dutySweep`) keeps the continuous generator, because one static 2-bit index
+    cannot express animation; `setVoicePulseDutyMode(slot, 255)` pins continuous
+    duty under a NES profile.
+
+  The profile supplies the **default** of each and the note keeps winning inside
+  its own domain (ADSR, LFO, `duty`, sweep, pitch envelope, `noisePeriod`) — the
+  three-level precedence of `docs/ABI.md` §3. Two new immutable goldens pin the
+  result: `apu_nes_canonical_s16le_44100.pcm` (`225CE203…B18B8`) and
+  `apu_hybrid_canonical_s16le_44100.pcm` (`7E77507E…72343`), each reproduced
+  byte for byte by an FPU build with the float body switched off and by a
+  no-FPU build, because both profiles run the same integer core. Blind A/B
+  material is `tools/profiles_ab`: the same track rendered through the three
+  profiles as three RMS-matched WAVs plus a separate key, so the profiles can be
+  judged by ear rather than by a metric.
+- **API**: `SoundProfile { Legacy = 0, Nes = 1, Hybrid = 2 }` in `AudioTypes.h`, with `ApuCore::setSoundProfile(SoundProfile)` (audio thread), `ApuCore::getSoundProfile() const` (plain read, any thread) and `AudioCommandType::SET_SOUND_PROFILE`, so the game thread selects a profile through `submitCommand()` the same way it already sends `SET_NES_OPTIONS`. Default is `Legacy`. The profile is **configuration, not state**: `init(int sampleRate)` does not reset it, while voices are still reset. An unknown value is ignored rather than clamped to a neighbouring profile. The profile selects the **render core**, once per block and not per voice: `Legacy` renders the float core on FPU builds, `Nes`/`Hybrid` render the integer core everywhere, and on a build without FPU every profile renders the integer core. The profile is the first of three precedence levels — profile < voice < note — and its character hook (`applyProfileCharacter`) runs **last** in `initVoiceFromEvent`, after `initNesSafe`, while the note keeps winning inside its own domain (ADSR times and levels, LFO, `duty`, sweep, pitch envelope, `noisePeriod`). `Legacy` remains the default; the audible character of `Nes` and `Hybrid` is the entry above.
+- **Behavior**: a profile change in the middle of playback does not cut the sounding voices. `setSoundProfile` computes the destination core from its argument, syncs the envelope mirror **only when the core actually changes**, resets the output stage, and applies character to the following notes. **Float → integer is the seamless, tested direction** (`Legacy` → `Nes`/`Hybrid` on an FPU build): no consecutive-sample step above `0.25 × 32767` and no rails. `integer → float` re-frames phase and duty to their note-on values, so it is a **note-boundary change**: switch between notes, or with the voices silent.
+- **Tools**: `tools/golden_gen` renders the canonical track with a selected profile, verifies the (never regenerated) float golden and writes/verifies the integer one (`python tools/golden_gen/run.py --write`); the two profile goldens were produced with `--profile nes` and `--profile hybrid`. `tools/apu_bench` measures the host CPU baseline (p50/p99 per block, µs per sample, the `{Legacy, Nes} × {22 050, 32 000} × {1, 8}` matrix) and `tools/apu_bench_firmware` does the same on a board with `esp_timer_get_time()`. `tools/profiles_ab` renders one excerpt through the three profiles and writes three 16-bit mono 44 100 Hz WAVs matched to the same RMS, under neutral names with the key in a separate file, so the A/B is blind. The integer golden added here, `apu_integer_core_canonical_s16le_44100.pcm` (44 100 B, `F59501D6…3902D`), is produced by two independent integer builds that must agree byte-for-byte, and the tool refuses to write it unless the default build still reproduces the float golden.
+- **Audio character, E2 (P3 + P4)**: `Nes` and `Hybrid` gain the NES output
+  stage and `Hybrid` gains a band-limited SAW. `Legacy` is untouched on both of
+  its routes, and neither `Legacy` fixture is regenerated.
+  - **Output chain.** HPF 90 Hz, HPF 440 Hz and a second-order Butterworth
+    low-pass at `min(14 kHz, 0.45 · fs)`, applied once to the summed mix where
+    the historical one-pole high-pass used to sit. Coefficients are derived on
+    `init(rate)`, `setSoundProfile` and `setHpfCutoffHz` — never per sample and
+    never per block. The low-pass is skipped when `0.45 · fs < 6 kHz`, because
+    at 8 kHz that corner is 3.6 kHz and would gut the passband instead of
+    approximating the 14 kHz roof.
+  - **Precedence.** `setHpfCutoffHz` is the caller's explicit knob and outranks
+    the profile: once called, the profile does not install its chain and the
+    historical one-pole keeps running at that corner. `reset()` clears the
+    override. This mirrors the `pulseDutyOverridden` / `noiseUnipolarOverridden`
+    convention of the character work above.
+  - **Level trim: switching profile is no longer a loudness change — and the
+    first attempt at it was wrong.** The chain left `Nes` at **−22.98 dBFS** and
+    `Hybrid` at **−24.01 dBFS** RMS on the canonical track, against the integer
+    `Legacy` anchor's **−19.70 dBFS**. The trim that ships is matched on
+    **crest-weighted loudness, `0.75 × RMS dBFS + 0.25 × peak dBFS`**, a
+    documented heuristic rather than a standard: **+1.10 dB** (`Nes`,
+    37192/32768) and **+1.90 dB** (`Hybrid`, 40780/32768), applied after the
+    chain and before the master bitcrush, resolved once per configuration
+    change with the chain's activation.
+    **The failed first attempt is part of the record.** It matched raw RMS
+    instead: +3.28 dB and +4.31 dB, landing both profiles at −19.70 dBFS, within
+    0.01 dB of `Legacy`. It measured perfect and it was wrong — on hardware the
+    user reported `Nes` and `Hybrid` as **louder and clearer than `Legacy` in
+    every sample**. The crest factors are why: 13.3 / 14.3 dB for the chain
+    against 4.6 dB for `Legacy`, so an RMS match lifts every transient by 3–4 dB
+    and the ear reads that as more power. Equal RMS is only a proxy for equal
+    loudness when the crest factors are comparable. A metric can pass while the
+    sound is wrong; that is why the test now asserts the weighted figure, prints
+    RMS/peak/crest beside it, and separately forbids RMS from rising above
+    `Legacy`'s.
+    **Where it landed.** Measured on the canonical track, `Nes` reads
+    −18.554 weighted against `Legacy`'s −18.549 (**−0.005 dB**) and `Hybrid`
+    −18.528 (**+0.021 dB**), with RMS **2.18 / 2.41 dB below** `Legacy` — between
+    the un-trimmed state and the rejected RMS-matched one, which is the intended
+    zone. Canonical peaks are now **12 210** (`Nes`, 37 % of full scale) and
+    **13 370** (`Hybrid`, 41 %) against `Legacy`'s 5 758 (18 %); on the listening
+    demo's denser `complex` piece they land near **16 960** and **16 620**
+    (about half scale), against the rejected attempt's ≈21 800 / ≈21 950. Still
+    less room than `Legacy` leaves, but nothing clips: check the master level on
+    a dense mix instead of assuming it. `Legacy` is the frozen anchor and stays
+    at exact unity — it does not take the chain branch, so it never runs the
+    multiply — and both of its fixtures are byte-identical through both
+    attempts. The trim is part of the chain: `setHpfCutoffHz()` suppresses chain
+    and trim together, because that caller asked for the historical one-pole,
+    level included. The per-sample cost is one multiply and the clamp the loop
+    already performs, on the two profiles that run the chain; `Legacy`'s work is
+    unchanged.
+  - **Band-limited SAW (`Hybrid` only).** Eight 256-point Q15 tables keyed on
+    `q = f / fs` (never on absolute Hz, because the band limit is Nyquist), one
+    per octave, with harmonic counts 128 down to 1 taken from the band's worst
+    case. The read interpolates the two adjacent points and blends the level in
+    force with its upper neighbour by the note's position inside the octave, so
+    a glide crossing a band edge has no step. `Legacy` and `Nes` keep the ideal
+    ramp; `Nes` keeps its aliasing on purpose, and its PULSE character is the
+    deliberate reproduction of it. **`SINE` keeps `SINE_LUT_Q15` on every
+    profile**: a sine is one harmonic and cannot alias, which was measured
+    rather than assumed, so four kilobytes of SINE tables would buy nothing.
+  - **Goldens.** The two canonical profile fixtures were regenerated, because
+    the chain changes both profiles. Two new fixtures
+    (`apu_{nes,hybrid}_wavetable_s16le_44100.pcm`) pin the `Hybrid` SAW end to
+    end, because the canonical track is PULSE-only and would not have seen it:
+    a 220 → 900 Hz glide crosses two band edges inside a single note.
+  - **Measured cost, both boards, p99 per 512-sample block at 22 050 Hz.**
+    Classic ESP32: `Legacy` flat (−0.1 %), `Nes` 8 voices **+5.10 %**, `Hybrid`
+    8 voices **+6.98 %** — the profile that carries both changes misses the
+    +6 % budget by one point at 26 % of the block, and the level trim is what
+    pushed it there. Flash **+8 692 B** of the 8 704 B allowance: 12 B of
+    margin, which is a warning rather than an achievement. C3: `Nes`
+    **+5.21 %**, `Hybrid` **+6.85 %** — the same miss within 0.15 points, from a
+    different instruction set and clock — and `Legacy` is **+2.2 %** there,
+    because a board without an FPU renders `Legacy` through the integer core
+    this phase rewrote. On the C3 at 32 000 Hz with eight voices the profiles
+    now measure 50.1 % (`Nes`) and 50.9 % (`Hybrid`) of the block against the
+    half-block rule that decides whether a target keeps 32 kHz, so **32 000 Hz
+    is withdrawn for those two profiles on that board** while `Legacy` keeps it
+    at 48.7 %.
+    `docs/ABI.md` §9.7 and §9.8 carry the tables, the procedure needed to reach
+    the C3 at all, the two optimisations that were measured and rejected, and
+    what the last one cost in alias margin (18.52 → 13.71 dB).
+- **Tools**: `tools/mipmap_gen` generates and verifies the SAW tables
+  (`python tools/mipmap_gen/generate.py --write|--check`); `tools/golden_gen`
+  gained `--scene <canonical|wavetable>`, defaulting to `canonical`, so every
+  pre-existing invocation renders byte-identically.
+
+### Changed
+
+- **ABI (size)**: `AUDIO_COMMAND_QUEUE_CAPACITY` default drops from **128 to 64**, range **32–64** (the ceiling is the 9 KB RAM budget, not throughput: 64 × 144 B = 9 216 B, effective depth 63). Drop policy is unchanged — a full queue still discards the newest command and increments `droppedCommands`. Consequence for the largest consumer type: `sizeof(ApuCore)` goes from **22 416 to 13 264 B** on the host ABI (13 288 B with `UNIT_TEST`). The per-voice NES character adds 8 B to `AudioChannel` (**336 B**), which is the +64 B over the pre-character 13 200 / 13 224 B and is still inside the 13 312 B pin. The 32-bit target figure was 9 800 B before the character work and is re-measured with the firmware bench rather than restated. `sizeof(AudioCommand)` stays at **144 B**: the new `soundProfile` byte fitted in the existing padding before `seekOffsetTicks`, and the seventh `VoiceNesOptions` byte made `nesLengthHalt` move into the same padding group instead of pushing every slot to 152 B. E2's output-filter state raises `sizeof(ApuCore)` again to **13 344 B** (13 368 B with `UNIT_TEST`), **+80 B**, and its pin moves from 13 312 to **13 376 B**. `sizeof(AudioChannel)` and `sizeof(AudioCommand)` do not move: the per-sample mipmap level and crossfade weight are derived from `phaseIncQ32` instead of stored.
+- **Build**: `PR32_APU_ENABLE_LEGACY_FLOAT` (default `PR32_APU_HAS_FPU`) controls whether the float body of `generateSamples` is compiled; the integer body is always compiled. With the default value nothing changes for a consumer that defines nothing. `-DPR32_APU_ENABLE_LEGACY_FLOAT=0` is the supported flash lever on an FPU target: the float body disappears and `Legacy` falls back to the integer core. A build that keeps both bodies pays the second body in flash (budget for `esp32dev`: ≤ 8 KB of `.text` over the base).
+- **Engine-side (consumer contract, PixelRoot32 Game Engine)**: the audio render block moves from 256/128 samples to **512 (FPU) / 1024 (no FPU)**, with `PR32_AUDIO_MAX_BLOCK_SAMPLES = 1024`. The I2S and DAC backends derive `dma_buf_count = clamp(blockSize / 128, 2, 8)` over a fixed `dma_buf_len = 128`, which puts the objective latency at **23.2 ms** (dual-core) / **46.4 ms** (single-core) at 22 050 Hz and **16 / 32 ms** at 32 000 Hz. Because the block is the render granularity, **a queued command can now be applied up to one render block later**; that is the price of the lower wake-up rate, not a queue regression.
+
+### Fixed
+
+- **Integer path only: the Q15 DC blocker now decays instead of parking a −199
+  offset** once a voice is silenced. The recursion truncated `R·y[n−1]` towards
+  −∞, so every negative `y` with `|y| < 32768/(1−R)` — about 200 with the default
+  `R = 32604` — was a fixed point: after silencing a PULSE voice the output
+  stayed frozen at −199 for good. It now truncates towards zero, the same
+  operation the float conversion performs, so `|y|` drops at least one LSB per
+  silent sample whatever the coefficient. Measured on the canonical track with
+  `PR32_APU_HAS_FPU=0`: **21 982 of 22 050 samples differ** from 2.0.0,
+  `max|Δ|` = **127 LSB**, and the mean of the tail (last 2 050 samples) goes
+  from **−68 to 0**. The difference is the DC offset that used to stay glued,
+  not a different waveform. **Affects builds with `PR32_APU_HAS_FPU=0` only**
+  (ESP32-C3 and any `-DPR32_APU_HAS_FPU=0` build); desktop, ESP32 and
+  ESP32-S3 render the float path and are untouched. **Any reference or
+  measurement taken from the integer path before this change must be
+  regenerated, not inherited.** The new immutable reference is
+  `test/golden/fixtures/apu_integer_core_canonical_s16le_44100.pcm`
+  (`F59501D6…3902D`).
+- **Integer path only: a 100 % PULSE duty now renders a constant high level
+  instead of a flat line.** `set_pulse_duty` mirrored the clamped float duty
+  into Q32 as `(uint32_t)(duty * 2^32)`. At exactly `duty == 1.0` the product
+  is 2^32, which does not fit in `uint32_t`, so the conversion yielded 0 and the
+  integer generator's `phaseQ32 < dutyCycleQ32` was never true — while the
+  float body compares against the float `dutyCycle` (1.0) and was always
+  correct. The mirror now saturates to `0xFFFFFFFF` at that boundary; **every
+  other `duty` keeps the identical expression**, so the rest of the PCM is
+  byte-identical and no fixture was regenerated: the float golden
+  (`7FF568A5…5DE9`) and the integer golden (`F59501D6…3902D`) still reproduce
+  byte for byte, and `Nes`/`Hybrid` still render the integer reference. The
+  input that changes is exactly `duty == 1.0` on the integer path — a no-FPU
+  build, or `Nes`/`Hybrid` on any build. It ships in 2.1.0 as a defect fix, for
+  the same reason as the DC-blocker entry above.
+
+### Migration
+
+- On `esp32-c3-devkitm-1`, `Nes` and `Hybrid` are **22 050 Hz only**: at 32 000 Hz with eight voices they measure 50.1 % and 50.9 % of the block, over the half-block rule that decides whether a target keeps that rate. `Legacy` keeps both rates (48.7 %). The library renders at the rate it is given and has no per-target policy, so this binds wherever the rate is configured.
+- Consumers on `PR32_APU_HAS_FPU=0` targets that calibrated levels or wrote PCM references against the integer path must regenerate them: the path no longer leaves a -199 DC offset behind a silenced voice.
+- Consumers that sized a buffer from `AUDIO_COMMAND_QUEUE_CAPACITY` should read it rather than hard-coding 128; the default is now 64, and more than 63 outstanding commands between consumer passes will be dropped.
+- Consumers that selected `Nes` or `Hybrid` while this release sat unreleased should re-check their levels: the mix balance changed on purpose (a triangle is +1.07 dB against a pulse, noise −3.65 dB), `Hybrid` envelopes now decay exponentially, PULSE duty snaps to the nearest NES step, and noise percussion follows the NES period LUT instead of the preset's own `noisePeriod`. No released version ever exposed those profiles as aliases, so there is nothing to migrate from.
+- Consumers already using `Nes`/`Hybrid` must re-check their levels **again** after E2: the output chain takes the canonical track from -19.7/-20.7 dBFS to -23.0/-24.0 dBFS RMS while nearly doubling the peak, because the 440 Hz high-pass removes low-mid energy and the two cascaded high-passes spike on every edge. E2 ships a fixed per-profile trim matched on crest-weighted loudness (0.75 x RMS + 0.25 x peak) to the `Legacy` anchor, so the profiles end up 2.2/2.4 dB BELOW `Legacy` in RMS while level with it on the weighted figure - deliberately, because an earlier RMS-matched trim (+3.28/+4.31 dB) measured equal and sounded louder on hardware. Peak growth is reduced but not gone: `Nes`/`Hybrid` peak at ~37 %/41 % of full scale on the canonical track and ~52 %/51 % on a dense mix, against `Legacy`'s 18 %/36 %. Anything calibrated against a `Nes`/`Hybrid` render before this release - including recorded references and loudness budgets - must be re-measured, not inherited.
+- Consumers on FPU builds that set `setHpfCutoffHz()` to a custom corner keep exactly that one-pole filter under every profile: the profile chain does not install over an explicit corner, and `reset()` clears the override. That is the escape hatch if the NES chain is not wanted on a specific build.
+- Nothing else changes: the default profile is `Legacy`, and on FPU builds it still renders the same bytes as 2.0.0.
 
 ## [2.0.0] - 2026-08-08
 
@@ -54,7 +257,7 @@ bearing.
 - **API**: configurable master HPF (Hito 4 M10). Adds `ApuCore::setHpfCutoffHz(float cutoffHz)`. The output stage runs a single-pole DC blocker `y[n] = x[n] - x[n-1] + R*y[n-1]`; `R` used to be the hardcoded literal `0.995f` (and `32604` on the Q15 path), which pins the COEFFICIENT rather than the corner frequency — that is ~35.2 Hz at 44100 Hz but ~17.6 Hz at 22050 Hz, so the filter silently changed character with the sample rate. The cutoff is now stored in Hz and `R = exp(-2*pi*fc/fs)` is derived from it and the current rate, recomputed by `init()` when the rate changes and clamped strictly inside (0, 1) so the recursion cannot go unstable. `cutoffHz <= 0` bypasses the filter entirely, with the filter state kept coherent so re-enabling does not step from a stale value. Reference points: ~35 Hz is this library's historical corner, ~90 Hz approximates the NES's analog output HPF. Until the setter is called the APU keeps the historical coefficient bit-for-bit — deliberately NOT a computed 35 Hz, which would differ in the last bits and move the canonical golden PCM. `reset()` restores that legacy default, the same way it already restores the master volume and bitcrush depth. Applied to both the float and Q15 hot paths. Rendered PCM is unchanged for existing consumers and the golden PCM fixture is byte-for-byte identical.
 - **Tests (UNIT_TEST)**: 9 new Hito 4 M10 tests in `test_apu_core.cpp` plus 3 in `test_q15_smoke.cpp`. Coverage: the untouched default holding the exact legacy coefficient, coefficient derivation at 90/240 Hz, the same corner surviving a sample-rate change (with the legacy coefficient shown NOT to, as contrast), `init()` recomputing on a rate change, bypass on zero/negative cutoff, `reset()` restoring the legacy default, extreme cutoffs staying stable, and two behavioural tests measuring DC directly on a 12.5%-duty pulse — bypass keeps the offset (~5900 at 44100) while every active corner removes it and a higher corner settles it faster (~1970 / ~760 / ~410 at 35 / 90 / 240 Hz). The Q15 path gets its own DC test because `test_apu_core` compiles with the FPU path and would never exercise the integer branch.
 - **API**: NES NOISE period LUT (Hito 3 M8). Adds `nes_apu::kNesNoisePeriodLutNtsc[16]` (the canonical `$400E` NTSC table, in CPU cycles) and `nes_apu::nesNoisePeriodToSamples(uint8_t index, int sampleRate)` in `ApuConfig.h`, plus `AudioChannel::nesNoiseLutIndex` (default 255) and `ApuCore::setVoiceNesNoiseLutMode(int slot, uint8_t lutIndex)`. Index 0..15 selects a LUT entry as the LFSR shift period instead of deriving it from the note frequency; 255 keeps the legacy behaviour and 16..254 are stored as 255. The table is kept in CPU cycles and converted at the current sample rate (`samples = cycles * sampleRate / 1789773`, floored at 1 sample), so the same index yields the same timbre at 22050, 44100 and 48000 Hz rather than being baked for one rate. The first few entries fall below one output sample at every supported rate and collapse onto the 1-sample floor — an inherent limit of a sample-based LFSR against the NES's ~447 kHz maximum noise clock, documented at the helper. Mirrors M2's `pulseDutyIndex` in both sentinel scheme and lifetime: a per-slot mode that survives new notes and is cleared only by `Voice::reset()`, applied on top of the per-note `noisePeriod`/frequency paths in `initVoiceFromEvent` and re-applied immediately by the setter so a live change is audible without waiting for the next note. Deliberately NOT reset by M17's `initNesSafe`, which resets the NES sub-units (length, envelope, sweep, linear counters) and not the waveform mode selectors — same treatment `pulseDutyIndex` already gets. Default OFF, so the canonical golden PCM is byte-for-byte identical.
-- **Docs**: corrected the NOISE LUT in `docs/nes-apu-comparison.md` §M8. It listed `..., 508, 1014, 2034, 4068, 8136`, which drops 762, mistypes 1016 as 1014 and shifts the tail up one entry. Verified against https://www.nesdev.org/wiki/APU_Noise; the canonical NTSC table is `4, 8, 16, 32, 64, 96, 128, 160, 202, 254, 380, 508, 762, 1016, 2034, 4068`.
+- **Docs**: corrected the NOISE LUT in the `§M8` table of the NES comparison document (that document is no longer versioned in this repository). It listed `..., 508, 1014, 2034, 4068, 8136`, which drops 762, mistypes 1016 as 1014 and shifts the tail up one entry. Verified against https://www.nesdev.org/wiki/APU_Noise; the canonical NTSC table is `4, 8, 16, 32, 64, 96, 128, 160, 202, 254, 380, 508, 762, 1016, 2034, 4068`.
 - **Tests (UNIT_TEST)**: 9 new Hito 3 M8 tests in `test_apu_core.cpp` — the LUT values pinned against the wiki table plus the sample conversion at two rates and its clamping, default-off keeping the legacy period, the setter retuning immediately, the mode surviving a new note, the sentinel restoring legacy behaviour, invalid indices falling back to off, non-NOISE voices left playing untouched, the mode surviving a `nesAccurate` note, and the LFSR clock landing on the same Hz at 22050 and 44100. New test-only accessor `getVoiceNesNoiseLutIndexForTesting`.
 - **API**: `InstrumentPreset::nesAccurate` (Hito 2 M17, default false, appended as the LAST member so the shipped `INSTR_*` presets and the positional test literals stay valid). When true, `initVoiceFromEvent` runs a new internal `initNesSafe(Voice&, WaveType)` helper that resets the voice's NES sub-unit fields to the canonical silent state from the nesdev `APU_basics` `@regs` array — PULSE `$4000=$30 $4001=$08 $4002=$00 $4003=$00`, TRIANGLE `$4008=$80 $400A=$00 $400B=$00`, NOISE `$400C=$30 $400E=$00 $400F=$00`. Decoding the shared `$30` (DDLC VVVV) gives L=1, C=1, VVVV=0, so the length counter is halted and the envelope is constant-volume zero: silent, and nothing counts down on its own. `$08` (EPPP NSSS) gives E=0, P=0, N=1, SSS=0 and is applied to PULSE only (the other channels have no sweep unit). The envelope start flag is raised as the `$4003`/`$400B`/`$400F` side effect, while the linear counter reload flag is explicitly cleared, since `$400B` carries a zero reload value and a sticky flag would reload every quarter-clock instead of once. The helper is a clean slate, NOT an enable: `nesLengthCounter.enabled`, `nesEnvelope.envelopeEnabled`, `nesSweepUnit.unitEnabled` and `nesLinearCounter.linearEnabled` are all cleared, so callers arm what they need afterwards with the `setVoiceNes*` setters or `TRIGGER_NES_LENGTH`. SINE and SAW have no NES counterpart and are left untouched. The call sits at the very end of `initVoiceFromEvent` so no earlier branch can leave stale NES state behind. Default OFF, so the rendered PCM is unchanged for every existing preset and the golden PCM fixture is byte-for-byte identical.
 - **Tests (UNIT_TEST)**: 7 new Hito 2 M17 tests in `test_apu_core.cpp` — canonical state for PULSE, TRIANGLE and NOISE; a dirty voice returning to the canonical values on retrigger; the default path leaving the NES fields alone; SINE/SAW inert; and the safe state being genuinely silent once the envelope is armed on top of it, silenced by constant-volume-zero rather than by the decay path disabling the voice. New test-only accessor `getVoiceNesEnvelopeVolumeForTesting`.
