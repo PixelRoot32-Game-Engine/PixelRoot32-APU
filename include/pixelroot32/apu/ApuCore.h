@@ -296,6 +296,38 @@ namespace pixelroot32::audio {
          */
         VoiceNesOptions getVoiceNesOptions(int slot) const;
 
+        /**
+         * @brief Select the character set applied to every voice.
+         *
+         * S4. The profile is global configuration, not per-voice state: one
+         * selector, one render body for the whole mix. Unknown values are
+         * ignored rather than clamped, so a corrupt command cannot silently
+         * change the sound to a neighbouring profile.
+         *
+         * Thread safety: like `setVoiceNesOptions`, this mutates configuration
+         * the renderer reads and is NOT safe to call concurrently with
+         * rendering — write it from the audio thread. From the game thread use
+         * `AudioCommandType::SET_SOUND_PROFILE`, which `processCommands`
+         * dispatches here, so both entry points produce identical state.
+         *
+         * `init()` deliberately leaves it alone: a stream restart must not
+         * discard the caller's choice.
+         *
+         * @param profile Profile to apply. `Legacy`, `Nes` or `Hybrid`;
+         *                anything else is ignored.
+         */
+        void setSoundProfile(SoundProfile profile);
+
+        /**
+         * @brief Read back the active sound profile.
+         *
+         * S4. A plain read of the stored selector, so it is safe to call from
+         * any thread. Returns `SoundProfile::Legacy` until one is selected.
+         *
+         * @return Profile currently in force.
+         */
+        SoundProfile getSoundProfile() const;
+
         // -- NES frame counter (Hito 2 M3) -----------------------------
         /**
          * @brief Set the NES frame counter mode.
@@ -934,6 +966,15 @@ namespace pixelroot32::audio {
          * pre-fitted to it, so the canonical golden PCM is unchanged.
          */
         SoftClipMode softClipMode_ = SoftClipMode::Rational;
+
+        // -- Sound profile (S4) --------------------------------------------
+        /**
+         * Global character set for every voice. Configuration, not state:
+         * `init()` leaves it alone, so a stream restart keeps the caller's
+         * choice. T4 adds the core dispatch and the hot-switch
+         * synchronisation here.
+         */
+        SoundProfile profile_ = SoundProfile::Legacy;
 
         /**
          * Derive `hpfR_` / `hpfRQ15_` from `hpfCutoffHz_` and the current

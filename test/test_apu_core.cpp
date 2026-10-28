@@ -5505,6 +5505,75 @@ void test_nes_options_reflect_nes_safe_boundary(void) {
 }
 
 // =============================================================================
+// S4: sound profiles
+// =============================================================================
+//
+// The profile is global configuration: one selector per core, applied to every
+// voice. These cases pin the API surface (default, round trip, rejection of
+// unknown values, queued path, survival of `init`) but deliberately say nothing
+// about which render body the profile picks — that dispatch is T4.
+
+void test_sound_profile_defaults_to_legacy(void) {
+    ApuCore apu;
+    TEST_ASSERT_EQUAL_INT((int)SoundProfile::Legacy,
+                          (int)apu.getSoundProfile());
+}
+
+void test_sound_profile_round_trips(void) {
+    ApuCore apu;
+    apu.init(44100);
+    apu.reset();
+
+    apu.setSoundProfile(SoundProfile::Nes);
+    TEST_ASSERT_EQUAL_INT((int)SoundProfile::Nes, (int)apu.getSoundProfile());
+    apu.setSoundProfile(SoundProfile::Hybrid);
+    TEST_ASSERT_EQUAL_INT((int)SoundProfile::Hybrid, (int)apu.getSoundProfile());
+    apu.setSoundProfile(SoundProfile::Legacy);
+    TEST_ASSERT_EQUAL_INT((int)SoundProfile::Legacy, (int)apu.getSoundProfile());
+}
+
+// Garbage must be ignored, not clamped: 7 is not "nearest profile" and must
+// leave whatever was configured untouched.
+void test_sound_profile_ignores_unknown_value(void) {
+    ApuCore apu;
+    apu.init(44100);
+    apu.reset();
+
+    apu.setSoundProfile(SoundProfile::Nes);
+    apu.setSoundProfile(static_cast<SoundProfile>(7));
+
+    TEST_ASSERT_EQUAL_INT((int)SoundProfile::Nes, (int)apu.getSoundProfile());
+}
+
+// Game-thread callers reach the setter through the queue, exactly like
+// SET_NES_OPTIONS; the command must land on the same state.
+void test_sound_profile_command_applies_on_render(void) {
+    ApuCore apu;
+    apu.init(44100);
+    apu.reset();
+
+    AudioCommand cmd{};
+    cmd.type = AudioCommandType::SET_SOUND_PROFILE;
+    cmd.soundProfile = static_cast<uint8_t>(SoundProfile::Nes);
+    TEST_ASSERT_TRUE(apu.submitCommand(cmd));
+
+    int16_t buffer[64] = {0};
+    apu.generateSamples(buffer, 64);
+
+    TEST_ASSERT_EQUAL_INT((int)SoundProfile::Nes, (int)apu.getSoundProfile());
+}
+
+// The profile is configuration, not state: init() restarts the stream but must
+// keep what the caller selected.
+void test_sound_profile_survives_init(void) {
+    ApuCore apu;
+    apu.setSoundProfile(SoundProfile::Hybrid);
+    apu.init(48000);
+
+    TEST_ASSERT_EQUAL_INT((int)SoundProfile::Hybrid, (int)apu.getSoundProfile());
+}
+
+// =============================================================================
 // Unity test runner
 // =============================================================================
 
@@ -5731,6 +5800,13 @@ int main(int argc, char** argv) {
     RUN_TEST(test_nes_options_command_ignores_bad_slot);
     RUN_TEST(test_nes_options_noise_lut_retunes_immediately);
     RUN_TEST(test_nes_options_reflect_nes_safe_boundary);
+
+    // S4: sound profiles
+    RUN_TEST(test_sound_profile_defaults_to_legacy);
+    RUN_TEST(test_sound_profile_round_trips);
+    RUN_TEST(test_sound_profile_ignores_unknown_value);
+    RUN_TEST(test_sound_profile_command_applies_on_render);
+    RUN_TEST(test_sound_profile_survives_init);
 
     // Integration tests
     RUN_TEST(test_apu_core_integration_full_pipeline);

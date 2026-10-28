@@ -685,6 +685,8 @@ namespace pixelroot32::audio {
         // Hito 4 M10: a configured corner is expressed in Hz, so it has to
         // follow the new rate. No-op while the legacy coefficient is in use.
         recomputeHpfCoefficients();
+        // Voices are reset by the constructor and by `reset()`; the sound
+        // profile is configuration and deliberately survives a stream restart.
     }
 
     // Hito 4 M10: master HPF configuration.
@@ -749,6 +751,25 @@ namespace pixelroot32::audio {
         opts.noiseLutIndex = v.nesNoiseLutIndex;
         return opts;
     }
+
+    // S4: sound profile selector.
+    void ApuCore::setSoundProfile(SoundProfile profile) {
+        // Reject unknown values instead of clamping: a clamped value would
+        // silently pick a neighbouring profile, and the caller's intent is
+        // exactly what must not be guessed. T4 adds the core switch and the
+        // envelope-mirror / output-stage synchronisation here.
+        switch (profile) {
+            case SoundProfile::Legacy:
+            case SoundProfile::Nes:
+            case SoundProfile::Hybrid:
+                profile_ = profile;
+                break;
+            default:
+                break;  // unknown value: leave the current profile alone
+        }
+    }
+
+    SoundProfile ApuCore::getSoundProfile() const { return profile_; }
 
     // Hito 4 M11: master output shaping curve.
     void ApuCore::setSoftClipMode(SoftClipMode mode) {
@@ -1778,6 +1799,12 @@ namespace pixelroot32::audio {
                     if (cmd.channelIndex < MAX_VOICES) {
                         setVoiceNesOptions(cmd.channelIndex, cmd.nesOptions);
                     }
+                    break;
+
+                case AudioCommandType::SET_SOUND_PROFILE:
+                    // No channel: the profile is global. The setter ignores
+                    // unknown values, so no clamp is needed here either.
+                    setSoundProfile(static_cast<SoundProfile>(cmd.soundProfile));
                     break;
 
                 case AudioCommandType::TRIGGER_NES_LENGTH:

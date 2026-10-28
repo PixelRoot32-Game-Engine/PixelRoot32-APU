@@ -6,6 +6,12 @@ using namespace pixelroot32::audio;
 void setUp(void) {}
 void tearDown(void) {}
 
+// S4: the profile selector must ride inside the padding that already sits
+// next to `nesLengthHalt`. A silent growth would enlarge every queue slot, so
+// the ABI is pinned here instead of being discovered in the RAM budget.
+static_assert(sizeof(AudioCommand) == 144,
+              "AudioCommand ABI must stay at 144 bytes (host)");
+
 void test_audio_command_queue_initial_state(void) {
     AudioCommandQueue queue;
     TEST_ASSERT_TRUE(queue.isEmpty());
@@ -132,6 +138,29 @@ void test_audio_command_queue_mpsc_drop_counter_accuracy(void) {
     TEST_ASSERT_TRUE(queue2.getDroppedCommands() >= 10);
 }
 
+// S4: the profile travels through the same queue as every other command, and
+// arriving intact is the whole contract — a truncated field would silently
+// select the wrong core.
+void test_audio_command_queue_sound_profile_round_trip(void) {
+    AudioCommandQueue queue;
+    AudioCommand cmd;
+    cmd.type = AudioCommandType::SET_SOUND_PROFILE;
+    cmd.soundProfile = static_cast<uint8_t>(SoundProfile::Hybrid);
+
+    TEST_ASSERT_TRUE(queue.enqueue(cmd));
+    TEST_ASSERT_FALSE(queue.isEmpty());
+
+    AudioCommand outCmd;
+    TEST_ASSERT_TRUE(queue.dequeue(outCmd));
+    TEST_ASSERT_TRUE(queue.isEmpty());
+    TEST_ASSERT_EQUAL(AudioCommandType::SET_SOUND_PROFILE, outCmd.type);
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(SoundProfile::Hybrid),
+                            outCmd.soundProfile);
+    // The neighbours inside the reused padding must survive untouched.
+    TEST_ASSERT_FALSE(outCmd.nesLengthHalt);
+    TEST_ASSERT_EQUAL_UINT8(0, outCmd.nesLengthIndex);
+}
+
 int main(int argc, char **argv) {
     UNITY_BEGIN();
     RUN_TEST(test_audio_command_queue_initial_state);
@@ -142,5 +171,7 @@ int main(int argc, char **argv) {
     RUN_TEST(test_audio_command_queue_mpsc_single_producer_baseline);
     RUN_TEST(test_audio_command_queue_mpsc_full_with_drops);
     RUN_TEST(test_audio_command_queue_mpsc_drop_counter_accuracy);
+    // S4: sound profile command
+    RUN_TEST(test_audio_command_queue_sound_profile_round_trip);
     return UNITY_END();
 }
