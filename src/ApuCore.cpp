@@ -246,12 +246,20 @@ namespace pixelroot32::audio {
     //   DMC      : 0.00335 / 0.00752 = 0.4456  -> 1825  (+0.016 %)
     //
     // Pinning the pulse group is the whole normalisation story: a full-scale
-    // pulse now contributes exactly the amplitude `Legacy` gives it
+    // pulse contributes exactly the amplitude `Legacy` gives it
     // (MIXER_SCALE * level), so two full-scale pulses keep the historical
     // 2 * 0.4 * 32767 = 26213.6 and switching profile rebalances the groups
-    // instead of changing the overall level. Dividing by 2^12 at the end IS
-    // the 1/0.00752 factor applied to the pulse group, so the residual there
+    // instead of changing the overall level. The `>> 12` in the per-block fold
+    // IS the 1/0.00752 factor applied to the pulse group, so the residual there
     // is zero and every other group carries only its own rounding.
+    //
+    // WHERE the weight is applied is a cost question, not a mix question. It is
+    // a constant per voice for a whole block, so `renderIntegerCore` applies it
+    // ONCE per voice per block — inside the same Q15 gain the sample loop
+    // already multiplies by — instead of summing into per-group buckets and
+    // collapsing them once per sample. Distributing one constant over a sum is
+    // exact in the reals; only the truncation moves, and that is worth < 1 LSB
+    // per voice (see the fold in `renderIntegerCore`).
 
     /** Q12 weight of one full-scale PULSE voice: the anchor, exactly 1.0. */
     static constexpr int32_t kNesMixWeightPulse = 4096;
@@ -264,22 +272,21 @@ namespace pixelroot32::audio {
      *
      * RESERVED: E1 has no DMC voice model — `WaveType` has no DMC member and
      * nothing in this library synthesises one — so no group feeds this term
-     * yet. It stays in the table, and in `nesWeightedMix`, so the published
-     * approximation is complete in one place; a future DMC voice only has to
-     * pass its group sum and everything else is already in position.
+     * yet. It stays next to the table so the published approximation is
+     * complete in one place; a future DMC voice only has to add its
+     * `NesMixGroup` and its weight here, and the fold already applies whatever
+     * this table answers.
      */
-    static constexpr int32_t kNesMixWeightDmc = 1825;
+    [[maybe_unused]] static constexpr int32_t kNesMixWeightDmc = 1825;
     /** Fixed-point divisor of the weight table: 2^12 = one full-scale pulse. */
     static constexpr int kNesMixWeightShift = 12;
 
-    /** Accumulation groups of the NES weighting (S4). */
+    /** Weight groups of the NES mixer (S4). */
     enum class NesMixGroup : uint8_t {
         Pulse = 0,     ///< PULSE, plus SINE and SAW (see nesMixGroupOf).
         Triangle = 1,
         Noise = 2
     };
-    /** Number of group buckets the weighted mix accumulates into. */
-    static constexpr int kNesMixGroupCount = 3;
 
     /**
      * @brief NES mixer group a voice feeds (S4).
@@ -305,40 +312,23 @@ namespace pixelroot32::audio {
     }
 
     /**
-     * @brief Collapses the NES mixer groups into the raw mix `sum` (S4).
+     * @brief Q12 weight the NES mixer applies to one accumulation group (S4).
      *
-     * Called ONCE per sample, after the voice loop and before master volume,
-     * the shaping curve and the DC blocker. That placement is the "weighted
-     * before the HPF" contract: the filter and the compressor see the weighted
-     * signal, not a weighted version of their own output.
+     * The table is consulted ONCE per voice per block, from the fold in
+     * `renderIntegerCore`; the per-sample loop only sees the resulting Q15 gain
+     * and never a weight. Any unknown group answers the PULSE weight, the same
+     * fallback `nesMixGroupOf` gives an unknown waveform, so a future group
+     * cannot silently render as a zero.
      *
-     * Integer only: three multiplies by small constants per sample and one
-     * shift, no division. The accumulator is `int64_t` on purpose — each
-     * product already fits in int32 (the largest group sum is
-     * 8 x 32767 x 4635 < 2^31), but the 64-bit accumulator needs no argument
-     * about the sum of four of them and cannot wrap on any mix the voice pool
-     * can produce.
-     *
-     * The result is in the same units as the `Rational` accumulator, i.e. what
-     * the downstream single `MIXER_SCALE` application expects, so the shaping
-     * curve keeps its full input range and `audio_mixer_lut` keeps its indexing
-     * domain.
-     *
-     * @param pulseSum Sum of the PULSE / SINE / SAW voices, in Q15.
-     * @param triangleSum Sum of the TRIANGLE voices, in Q15.
-     * @param noiseSum Sum of the NOISE voices, in Q15.
-     * @param dmcSum Sum of the DMC voices; always 0 in E1, because there is no
-     *               DMC voice model yet and the term is reserved.
-     * @return Weighted mix in the `sum` domain.
+     * @param group Group the voice belongs to.
+     * @return Q12 weight, where one full-scale PULSE voice is 2^12.
      */
-    static inline int32_t nesWeightedMix(int32_t pulseSum, int32_t triangleSum,
-                                         int32_t noiseSum, int32_t dmcSum = 0) {
-        const int64_t weighted =
-            (int64_t)kNesMixWeightPulse    * pulseSum +
-            (int64_t)kNesMixWeightTriangle * triangleSum +
-            (int64_t)kNesMixWeightNoise    * noiseSum +
-            (int64_t)kNesMixWeightDmc      * dmcSum;
-        return (int32_t)(weighted >> kNesMixWeightShift);
+    static inline int32_t nesMixWeightQ12(NesMixGroup group) {
+        switch (group) {
+            case NesMixGroup::Triangle: return kNesMixWeightTriangle;
+            case NesMixGroup::Noise:    return kNesMixWeightNoise;
+            default:                    return kNesMixWeightPulse;
+        }
     }
 
     /** Q15 envelope scale: 1.0. */
@@ -612,9 +602,14 @@ namespace pixelroot32::audio {
      * the amplitude, i.e. -6.02 dB of energy.
      *
      * The compensation is therefore exactly x2 (`1 << 1`), applied once per
-     * sample after the volume and envelope multiplies and never by repeating
-     * them. It is not a taste knob: after it, the unipolar voice's AC RMS is
-     * `A` again, so the profile's MIXER weight
+     * voice per BLOCK: it is a constant of the whole block, so the renderer
+     * folds it into the same Q15 gain that already carries the voice's volume
+     * and its mix weight (see the fold in `renderIntegerCore`) instead of
+     * shifting each sample. Multiplying by 2 and shifting by 1 are the same
+     * operation here — `sv << 1` IS `sv * 2` — so the factor is unchanged; only
+     * its position in the multiply chain moved, and it is still never a repeat
+     * of the volume or envelope multiplies. It is not a taste knob: after it,
+     * the unipolar voice's AC RMS is `A` again, so the profile's MIXER weight
      * (`kNesMixWeightNoise`, 0.00494/0.00752 of the pulse group) is the only
      * thing that decides the noise group's level — which is what keeps S4's
      * published ratio intact. Measured: 0.00 dB between the unipolar and the
@@ -3764,12 +3759,7 @@ namespace pixelroot32::audio {
     // block (not per sample) so volume ramps still work but the 22kHz
     // inner loop stays integer-only.
     void ApuCore::renderIntegerCore(int16_t* stream, int length) {
-        int32_t volQ15[MAX_VOICES];
         // envQ15 is now tracked continuously per-channel via tickEnvelopeQ15
-        for (int c = 0; c < MAX_VOICES; ++c) {
-            volQ15[c] = (int32_t)(voices[c].volume * 32768.0f);
-        }
-
         // Hito 2 M3: APU cycles per render sample (same as FPU path).
         const double apuCyclesPerSample =
             (sampleRate > 0) ? (nes_apu::kNesApuHzNtsc / (double)sampleRate) : 0.0;
@@ -3806,7 +3796,7 @@ namespace pixelroot32::audio {
                 // envelope level, never to -level. Only the SOURCE changes: the
                 // level itself is still the volume x envelope multiply that runs
                 // below for every voice, and the AC-level compensation is the
-                // single shift that follows it.
+                // x2 folded into this voice's per-block gain (`mixGainQ15`).
                 return (ch.lfsrState & 1u) ? 32767 : 0;
             }
             return (ch.lfsrState & 1u) ? 32767 : -32767;
@@ -3816,30 +3806,78 @@ namespace pixelroot32::audio {
         // This eliminates the switch(ch.type) branch misprediction
         //
         // S4: the mixer curve is a property of the mix, so it is resolved from
-        // the profile ONCE per block and never inside the sample loop. A
-        // voice's group depends only on its waveform, and `type` can only
+        // the profile ONCE per block and never inside the sample loop. The
+        // group a voice feeds depends only on its waveform, and `type` can only
         // change in `initVoiceFromEvent` — which runs from `processCommands`
         // and `updateMusicSequencer`, both before this loop — so the group is
-        // resolved per block too and the hot path only indexes the bucket.
+        // resolved per block too.
         const bool nesWeighted =
             (profileMixerCurve(profile_) == MixerCurve::NesWeighted);
-        uint8_t mixGroup[MAX_VOICES] = {0};
-        if (nesWeighted) {
-            for (int c = 0; c < MAX_VOICES; ++c) {
-                mixGroup[c] = (uint8_t)nesMixGroupOf(voices[c].type);
+
+        // S4/S5: everything the mix does to a voice that is CONSTANT for the
+        // whole block is folded into one Q15 gain here, once per voice, instead
+        // of being applied once per voice per sample:
+        //
+        //   - the NES group weight (`>> kNesMixWeightShift`), which used to be
+        //     applied to the summed groups after the voice loop; and
+        //   - the unipolar x2 compensation, which used to be a `sv << 1` on
+        //     every sample of a gated NOISE voice.
+        //
+        // The mix is the same because both factors are scalars distributed over
+        // a sum: sum_c (w * v_c) == w * sum_c v_c. Only the truncation moves —
+        // from after the sum to before each voice's multiply — so the weighted
+        // sum can differ by < 1 LSB per voice from what the old path produced.
+        // That is below the resolution of the mix, but not always below the
+        // resolution of the OUTPUT: the `Rational` curve indexes its LUT in
+        // 256-LSB steps of `sum`, so a sample sitting on a step boundary can
+        // move by that LUT's own step (~100 LSB down where its slope is
+        // steepest) instead of by 1. Measured against the previous tree:
+        // `Legacy` byte-identical, and `Nes`/`Hybrid` peak and RMS within
+        // 0.002 % with a worst single-sample delta of 101 LSB on the two scenes
+        // that mix a TRIANGLE voice (the pulse weight is Q12 unity, so the
+        // committed goldens, a pulse-only track, are byte-identical).
+        //
+        // No new overflow: `volume` is documented 0..1 and the fold keeps every
+        // intermediate inside int32 over that range — the worst case is a gated
+        // NOISE voice at full volume, 32767 * (2691 / 4096) * 2 = 43046, i.e.
+        // 1.41e9 of the 2.1e9 an int32 holds.
+        //
+        // What it buys is the whole group-bucket machinery: three zeroed
+        // accumulators per SAMPLE, a bucket index per voice and three int64
+        // multiplies per sample become one multiply per voice that the loop was
+        // already doing. Those zeroed buckets were paid by every profile,
+        // `Legacy` included, even though its weights are the identity.
+        //
+        // `volQ15` stays the plain Q15 volume: the sync-back at the end of the
+        // block writes it into `voices[c].volume`, so the volume ramp and the
+        // FPU fallback keep seeing a plain volume. `mixGainQ15` is the folded
+        // one and never leaves this function.
+        int32_t volQ15[MAX_VOICES];
+        int32_t mixGainQ15[MAX_VOICES];
+        for (int c = 0; c < MAX_VOICES; ++c) {
+            volQ15[c] = (int32_t)(voices[c].volume * 32768.0f);
+            int32_t gain = volQ15[c];
+            if (nesWeighted) {
+                gain = (gain * nesMixWeightQ12(nesMixGroupOf(voices[c].type)))
+                     >> kNesMixWeightShift;
             }
+            if (voices[c].noiseUnipolar && voices[c].type == WaveType::NOISE) {
+                gain <<= kNoiseUnipolarCompensationShift;
+            }
+            mixGainQ15[c] = gain;
         }
 
         for (int i = 0; i < length; ++i) {
             // Hito 2 M3: tick the NES frame counter before voice mixing.
             tickNesFrameCounter(apuCyclesPerSample);
             // `Rational` keeps the historical accumulator untouched: one raw
-            // sum, with `MIXER_SCALE` applied once by the output stage. The NES
-            // curve accumulates into one bucket per group and collapses them
-            // after the voice loop, which is what "weighted by group" means and
-            // what lets the published ratios be applied without a division.
+            // sum, with `MIXER_SCALE` applied once by the output stage.
+            // `NesWeighted` now accumulates into the SAME sum: the published
+            // weights are already inside each voice's `mixGainQ15`, so "weighted
+            // by group" no longer needs a bucket per group nor a second pass —
+            // and `sum` has one meaning for both curves, which is what the
+            // output stage downstream expects.
             int32_t sum = 0;
-            int32_t groupSum[kNesMixGroupCount] = {0, 0, 0};
 
             for (int c = 0; c < MAX_VOICES; ++c) {
                 Voice& ch = voices[c];
@@ -3896,7 +3934,10 @@ namespace pixelroot32::audio {
                     s = 0;
                 }
 
-                // Apply per-channel Q15 volume × envelope: (s * volQ15 * envQ15) >> 30
+                // Apply per-channel Q15 gain × envelope: (s * gainQ15 * envQ15) >> 30
+                // The gain already carries the voice's Q15 volume plus the two
+                // block-constant mix factors (NES group weight, unipolar x2), so
+                // this is the only per-sample scale left.
                 // Hito 2 M7: when the NES envelope is enabled (PULSE / NOISE),
                 // use the envelope's `output` (0..15) scaled to Q15 as the
                 // multiplier. 32768/15 = 2184, so output=15 → 32760 (≈1.0).
@@ -3907,18 +3948,8 @@ namespace pixelroot32::audio {
                 } else {
                     envQ15 = ch.envelope.currentLevelQ15;
                 }
-                int32_t sv = (s * volQ15[c]) >> 15;
+                int32_t sv = (s * mixGainQ15[c]) >> 15;
                 sv = (sv * envQ15) >> 15;
-
-                // S5/P9: the unipolar gate halves the AC amplitude of a NOISE
-                // voice (its mean is what the DC blocker removes), so the level
-                // is restored HERE — one shift, after the multiplies that are
-                // already there, not a second envelope multiply and not a
-                // division. `kNoiseUnipolarCompensationShift` documents why the
-                // factor is exactly 2 and what it leaves to the mixer weight.
-                if (ch.noiseUnipolar && ch.type == WaveType::NOISE) {
-                    sv <<= kNoiseUnipolarCompensationShift;
-                }
 
                 // Volume LFO (tremolo) — Q15 only, no float conversion.
                 if (ch.lfo.enabled && ch.lfo.target == LfoTarget::VOLUME) {
@@ -3935,15 +3966,7 @@ namespace pixelroot32::audio {
                 // 0.4 into its own mapping, and the computed curves apply it
                 // once explicitly. Scaling here as well applied 0.4 twice and
                 // left the outer 60% of the table unreachable.
-                //
-                // S4: under `NesWeighted` the same raw convention is produced
-                // after the loop from the group buckets (see `nesWeightedMix`),
-                // so `sum` has one meaning for both curves.
-                if (nesWeighted) {
-                    groupSum[mixGroup[c]] += sv;
-                } else {
-                    sum += sv;
-                }
+                sum += sv;
 
                 // Duty stepped + pitch envelope (shared age; integer pitch path).
                 tick_voice_automation(ch, sampleRate, /*q15Path=*/true);
@@ -4041,17 +4064,13 @@ namespace pixelroot32::audio {
                 }
             }
 
-            // S4: collapse the group buckets into the raw mix. Placed exactly
-            // where the `Rational` curve stops accumulating — before master
-            // volume, before the shaping curve, before the DC blocker — so the
-            // whole output chain sees the weighted signal. That is the "before
-            // the HPF" contract, and it is also why the weighting is not a
-            // post-process on the finished int16.
-            if (nesWeighted) {
-                sum = nesWeightedMix(groupSum[(int)NesMixGroup::Pulse],
-                                     groupSum[(int)NesMixGroup::Triangle],
-                                     groupSum[(int)NesMixGroup::Noise]);
-            }
+            // S4: the voice loop has already accumulated the WEIGHTED mix, so
+            // `sum` reaches the output chain in exactly the same domain and at
+            // exactly the same point as the `Rational` curve: before master
+            // volume, before the shaping curve, before the DC blocker. That is
+            // the "weighted before the HPF" contract — the filter and the
+            // compressor see the weighted signal, not a weighted version of
+            // their own output — and it is why no collapse pass is needed here.
 
             // Apply master volume before the compressor curve so the nonlinear
             // stage sees the attenuated mix — same order as the FPU path
