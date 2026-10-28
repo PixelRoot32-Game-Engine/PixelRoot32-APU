@@ -176,8 +176,8 @@ Measured 2026-10-28 on the sound-profile branch (`cmake -S . -B build -G "MinGW 
 | `test_audio_command_queue` | 10 | SPSC queue, capacity and the `AudioCommand` ABI pins |
 | `test_audio_music_types` | 35 | Music types, `InstrumentPreset` layout, shipped presets |
 | `test_apu_mirror` | 37 | Tool Suite parity, byte-for-byte against the float golden |
-| `test_apu_output_filter` | 11 | E2 output chain: measured response, full-scale stability, `setHpfCutoffHz` precedence, `Legacy` one-pole |
-| `test_apu_output_filter_integer` | 11 | The same suite where `Legacy` has no float body (`PR32_APU_ENABLE_LEGACY_FLOAT=0`) |
+| `test_apu_output_filter` | 12 | E2 output chain: measured response, full-scale stability, `setHpfCutoffHz` precedence, `Legacy` one-pole, Q15 product bound |
+| `test_apu_output_filter_integer` | 12 | The same suite where `Legacy` has no float body (`PR32_APU_ENABLE_LEGACY_FLOAT=0`) |
 | `test_apu_wavetable_spectral` | 5 | E2/S4: the generated SAW mipmap — band limit per level, seam-free tables, the S5 alias sweep |
 | `test_apu_hybrid_wavetable` | 5 | E2/T3: `Hybrid` reads the tables (level from the voice's own increment, crossfade), `Nes`/`Legacy` keep the ramp, SINE inert |
 | `test_q15_smoke` | 15 | Integer/Q15 path smoke coverage |
@@ -186,7 +186,7 @@ Measured 2026-10-28 on the sound-profile branch (`cmake -S . -B build -G "MinGW 
 | `test_apu_profile_golden` | 4 | `Nes` and `Hybrid` against their canonical and wavetable goldens (FPU build with the float body off) |
 | `test_apu_profile_golden_no_fpu` | 4 | The same four goldens from a build with no FPU at all |
 | `test_library_link` | 4 | Public symbols exist in the shipped artifact (links, no `UNIT_TEST`) |
-| **Total** | **563** | 0 failures, 0 ignored, exit code 0 in all fifteen |
+| **Total** | **565** | 0 failures, 0 ignored, exit code 0 in all fifteen |
 
 The five continuous-duty cases added by the full-scale fix (`test_pulse_duty_full_scale_*`, `test_pulse_duty_zero_never_goes_positive`, `test_pulse_duty_interior_value_unchanged`) live in `test/test_apu_core.cpp`, so both core targets run them; that is the 205 → 210 step on the two rows above.
 
@@ -208,6 +208,8 @@ One golden per affected profile, and no more (S7): E1 is the change that makes `
 The wavetable pair exists because the canonical track is PULSE-only and cannot observe E2's band-limited SAW (S4): `apu_hybrid_canonical_s16le_44100.pcm` is byte-identical before and after the mipmap landed. `apu_golden_gen_nofpu --scene wavetable --profile <nes|hybrid>` renders four SAW notes — 55 Hz, 220 Hz gliding through a mipmap level boundary, 880 Hz and 1 760 Hz — and the same three builds reproduce both files byte for byte. `Nes` keeps the ideal ramp, so its wavetable file is the reference the `Hybrid` one is read against; the two differ on 18 139 of 22 050 samples (max 13 181 LSB, −17.81 dBFS RMS difference), which is the evidence that the scene reaches the table read instead of describing a ramp twice.
 
 The integer fixture is written by `python tools/golden_gen/run.py --write`, which builds three generator binaries and refuses to proceed unless the default build still reproduces the float fixture byte-for-byte and the two integer builds agree with each other. Regenerate a fixture **only** when the output changes intentionally and the change is documented in the CHANGELOG.
+
+The E2 cost pass that followed the flash gate is bit-exact, so none of the six rows above moved. It replaced the output chain's int64 products and `/32768` divisions with int32 products and truncating shifts, and moved the coefficient derivation to `float`; `apu_golden_gen` reproduces all four profile fixtures byte for byte (0 differing samples, max |Δ| 0, RMS unchanged) and `apu_mirror_canonical` / `apu_integer_core_canonical` were not touched. The hashes above are therefore still current, verified on 2026-10-28.
 
 ### 9.3 CPU baseline, host
 
@@ -239,7 +241,7 @@ sizeof(InstrumentPreset) =    72 B
 queue budget             = 64 x 144 B = 9216 B
 ```
 
-The host figures were re-measured on 2026-10-28 after E2. E1's per-voice character state took `AudioChannel` from 328 to 336 B (+64 B on `ApuCore` over the pre-E1 13 200 / 13 224 B), and E2/S1 added the `Nes`/`Hybrid` output filter chain state: **+80 B** on both builds (two high-pass poles, five Butterworth coefficients in Q15 `int32_t` because the LPF's `b1` does not fit `int16`, eight recursion registers, the resolved corners and three flags), landing at 13 344 / 13 368 B. `AudioCommand` stayed at 144 B (see §5). The two host figures are pinned by `static_assert(sizeof(ApuCore) <= 13376, ...)` in `test_apu_core`: the test compiles with `UNIT_TEST=1`, so it asserts the 13 368 B test-build size rounded up to the next multiple of 16, and the production figure is recorded in the message next to it. The 32-bit target figure recorded before E1 was **9 800 B** (`gCoreStorage`, 0x2648, in the firmware maps of `tools/apu_bench_firmware` for `esp32dev`, `esp32-c3-devkitm-1` and `esp32-s3-devkitc-1`, identical on the three because the ABI is the same width); E1's channel growth changes it by the same 8 B per channel and E2 adds the same 80 B, so it is **not restated as current here** — the firmware bench run prints it and it is recorded with §9.5's numbers.
+The host figures were re-measured on 2026-10-28 after E2. E1's per-voice character state took `AudioChannel` from 328 to 336 B (+64 B on `ApuCore` over the pre-E1 13 200 / 13 224 B), and E2/S1 added the `Nes`/`Hybrid` output filter chain state: **+80 B** on both builds (two high-pass poles, five Butterworth coefficients in Q15 `int32_t` because the LPF's `b1` does not fit `int16`, eight recursion registers, the resolved corners and three flags), landing at 13 344 / 13 368 B. `AudioCommand` stayed at 144 B (see §5). The E2 cost pass (int32 products, truncating shifts, `float` coefficient derivation) changed no member, so these figures and the pin below are unchanged. The two host figures are pinned by `static_assert(sizeof(ApuCore) <= 13376, ...)` in `test_apu_core`: the test compiles with `UNIT_TEST=1`, so it asserts the 13 368 B test-build size rounded up to the next multiple of 16, and the production figure is recorded in the message next to it. The 32-bit target figure recorded before E1 was **9 800 B** (`gCoreStorage`, 0x2648, in the firmware maps of `tools/apu_bench_firmware` for `esp32dev`, `esp32-c3-devkitm-1` and `esp32-s3-devkitc-1`, identical on the three because the ABI is the same width); E1's channel growth changes it by the same 8 B per channel and E2 adds the same 80 B, so it is **not restated as current here** — the firmware bench run prints it and it is recorded with §9.5's numbers.
 
 ### 9.5 CPU and underrun baseline, firmware
 

@@ -1236,17 +1236,19 @@ namespace pixelroot32::audio {
         }
         // R = exp(-2*pi*fc/fs). Computed here rather than per sample: this
         // runs on configuration changes only, so the transcendental is fine
-        // even on soft-float targets.
-        const double r = std::exp(-6.283185307179586
-                                  * (double)hpfCutoffHz_ / (double)sampleRate);
+        // even on soft-float targets. `float`, not `double`: the pole is
+        // quantised to Q15 on the next line, so the extra precision of the
+        // double libm only costs flash (the E2 regression).
+        const float r = std::exp(-6.283185307179586f * hpfCutoffHz_ /
+                                 (float)sampleRate);
         // Clamp strictly inside (0, 1): R >= 1 makes the recursion unstable,
         // and R <= 0 is not a meaningful single-pole coefficient. A corner
         // above Nyquist lands near 0 and is effectively "block everything".
-        double clamped = r;
-        if (!(clamped > 0.0)) clamped = 0.0;          // also catches NaN
-        if (clamped > 0.99999) clamped = 0.99999;
-        hpfR_ = (float)clamped;
-        hpfRQ15_ = (int32_t)(clamped * 32768.0 + 0.5);
+        float clamped = r;
+        if (!(clamped > 0.0f)) clamped = 0.0f;        // also catches NaN
+        if (clamped > 0.99999f) clamped = 0.99999f;
+        hpfR_ = clamped;
+        hpfRQ15_ = (int32_t)(clamped * 32768.0f + 0.5f);
         if (hpfRQ15_ > 32767) hpfRQ15_ = 32767;
         if (hpfRQ15_ < 0) hpfRQ15_ = 0;
     }
@@ -1267,14 +1269,19 @@ namespace pixelroot32::audio {
         // instead of approximating the NES's 14 kHz roof. Below the 6 kHz
         // floor the LPF is skipped by definition; the chain is then the two
         // high-passes only.
-        const double nyquist45 = 0.45 * (double)sampleRate;
+        //
+        // Everything below is `float`. The coefficients are quantised to Q15
+        // immediately, so double precision changes no bit of them; it only
+        // pulls the double libm transcendants (exp/cos/sin/round) into a
+        // soft-float image, which is exactly the E2 flash regression.
+        const float nyquist45 = 0.45f * (float)sampleRate;
         outputLpfActive_ = outputFilterActive_ && (sampleRate > 0) &&
                            (nyquist45 >= kOutputLpfMin45FsHz);
 
         outHpf1CutoffHz_ = kOutputHpf1Hz;
         outHpf2CutoffHz_ = kOutputHpf2Hz;
         outLpfCutoffHz_ = outputLpfActive_
-            ? (float)std::min((double)kOutputLpfMaxHz, nyquist45)
+            ? std::min(kOutputLpfMaxHz, nyquist45)
             : 0.0f;
 
         // First-order high-pass pole, the same definition as the historical
@@ -1282,16 +1289,19 @@ namespace pixelroot32::audio {
         // bad corner can never make the recursion unstable. The transcendental
         // lives here, on configuration only, so it never reaches a sample loop
         // even on a soft-float target.
-        auto highPassPoleQ15 = [this](double fcHz) -> int32_t {
-            const double r =
-                std::exp(-6.283185307179586 * fcHz / (double)sampleRate);
-            double clamped = r;
-            if (!(clamped > 0.0)) clamped = 0.0;  // also catches NaN
-            if (clamped > 0.99999) clamped = 0.99999;
-            return (int32_t)(clamped * 32768.0 + 0.5);
+        auto highPassPoleQ15 = [this](float fcHz) -> int32_t {
+            const float r =
+                std::exp(-6.283185307179586f * fcHz / (float)sampleRate);
+            float clamped = r;
+            if (!(clamped > 0.0f)) clamped = 0.0f;  // also catches NaN
+            if (clamped > 0.99999f) clamped = 0.99999f;
+            int32_t q = (int32_t)(clamped * 32768.0f + 0.5f);
+            if (q > kOutputCoeffQ15Max) q = kOutputCoeffQ15Max;
+            if (q < 0) q = 0;
+            return q;
         };
-        outHpf1RQ15_ = highPassPoleQ15((double)kOutputHpf1Hz);
-        outHpf2RQ15_ = highPassPoleQ15((double)kOutputHpf2Hz);
+        outHpf1RQ15_ = highPassPoleQ15(kOutputHpf1Hz);
+        outHpf2RQ15_ = highPassPoleQ15(kOutputHpf2Hz);
 
         outLpfB0Q15_ = 0;
         outLpfB1Q15_ = 0;
@@ -1305,25 +1315,31 @@ namespace pixelroot32::audio {
         // RBJ low-pass at Q = 1/sqrt(2) (Butterworth): monotonic, -3 dB at the
         // corner, no peaking. The corner is `min(14 kHz, 0.45 * fs)`, i.e. it
         // tracks the rate until it hits the NES roof.
-        const double fc = std::min((double)kOutputLpfMaxHz, nyquist45);
-        const double w0 = 6.283185307179586 * fc / (double)sampleRate;
-        const double cw = std::cos(w0);
-        const double alpha = std::sin(w0) / 1.4142135623730951;  // 2Q with Q=1/sqrt(2)
-        const double a0 = 1.0 + alpha;
-        const double b0 = (1.0 - cw) * 0.5 / a0;
-        const double b1 = (1.0 - cw) / a0;
-        const double b2 = b0;
-        const double a1 = -2.0 * cw / a0;
-        const double a2 = (1.0 - alpha) / a0;
+        const float fc = std::min(kOutputLpfMaxHz, nyquist45);
+        const float w0 = 6.283185307179586f * fc / (float)sampleRate;
+        const float cw = std::cos(w0);
+        const float alpha = std::sin(w0) / 1.4142135623730951f;  // 2Q with Q=1/sqrt(2)
+        const float a0 = 1.0f + alpha;
+        const float b0 = (1.0f - cw) * 0.5f / a0;
+        const float b1 = (1.0f - cw) / a0;
+        const float b2 = b0;
+        const float a1 = -2.0f * cw / a0;
+        const float a2 = (1.0f - alpha) / a0;
 
         // Q15 in int32_t, not int16: `b1` can reach ~2 near 0.45 * fs (that is
-        // ~52 000 in Q15) and must keep its resolution, which is exactly why
-        // the products below are accumulated in int64.
-        auto toQ15 = [](double v) -> int32_t {
-            const double scaled = std::round(v * 32768.0);
-            if (scaled > 2147483647.0) return 2147483647;
-            if (scaled < -2147483648.0) return -2147483647 - 1;
-            return (int32_t)scaled;
+        // ~52 000 in Q15) and must keep its resolution. The clamp to
+        // `kOutputCoeffQ15Max` is what keeps every product inside int32_t.
+        auto toQ15 = [](float v) -> int32_t {
+            const float scaled = v * 32768.0f;
+            if (!(scaled == scaled)) return 0;  // NaN guard
+            const float rounded = scaled >= 0.0f ? scaled + 0.5f : scaled - 0.5f;
+            if (rounded > (float)kOutputCoeffQ15Max) {
+                return kOutputCoeffQ15Max;
+            }
+            if (rounded < -(float)kOutputCoeffQ15Max) {
+                return -kOutputCoeffQ15Max;
+            }
+            return (int32_t)rounded;  // truncation == round after the +-0.5
         };
         outLpfB0Q15_ = toQ15(b0);
         outLpfB1Q15_ = toQ15(b1);
@@ -1347,6 +1363,25 @@ namespace pixelroot32::audio {
         }
     }
 
+    /**
+     * Q15 rescale of an int32 feedback product, truncated toward zero.
+     *
+     * C++ integer division truncates toward zero; an arithmetic `>> 15` floors
+     * instead, which has a fixed point for negative values and freezes the DC
+     * decay on a permanent offset (the defect documented on the historical
+     * one-pole). Negating, shifting and negating back is exact because
+     * |v| < 2^31 here, and it costs no division: on a soft-div target the
+     * int64 divide this replaces is a library call of dozens of cycles.
+     */
+    static inline int32_t q15_truncate_from_int32(int32_t v) {
+        return v >= 0 ? (v >> 15) : -((-v) >> 15);
+    }
+
+    /** @brief Q15 rescale of an int64 accumulator, truncated toward zero. */
+    static inline int32_t q15_truncate_from_int64(int64_t v) {
+        return (int32_t)(v >= 0 ? (v >> 15) : -((-v) >> 15));
+    }
+
     void ApuCore::resetOutputFilterState() {
         outHpf1PrevInQ15_ = 0;
         outHpf1PrevOutQ15_ = 0;
@@ -1359,24 +1394,31 @@ namespace pixelroot32::audio {
     }
 
     int32_t ApuCore::processOutputFilterChain(int32_t inputQ15) {
-        // HPF 90 Hz, then HPF 440 Hz: the same difference equation as the
-        // historical one-pole, `y[n] = x[n] - x[n-1] + R*y[n-1]`. The Q30
-        // feedback is divided by 32768 rather than shifted: the shift
-        // truncates toward minus infinity, which freezes the decay on a
-        // permanent DC offset for every negative y (see the historical
-        // comment this replaces). Division truncates toward zero and
-        // guarantees |y| drops by at least one LSB per silent sample.
+        // HPF 90 Hz, then HPF 440 Hz: `y[n] = x[n] - x[n-1] + R*y[n-1]`.
+        //
+        // Two first-order sections rather than one merged second-order
+        // section on purpose. The merge (`b = [1, -2, 1]`) is exact in real
+        // arithmetic but differentiates the int16 input twice, and at 20 Hz
+        // that second difference (~0.5 LSB at half scale) is smaller than the
+        // quantisation noise it differentiates; measured, the merged form
+        // turned a -0.35 dB point into -45 dB. The cascade keeps the
+        // intermediate at full scale, which is where the low-band resolution
+        // comes from.
+        //
+        // The cost is paid back by the arithmetic: every product is int32_t
+        // (|coefficient| < 2^16, |state| < 2^15, see the header's
+        // static_asserts) and the /32768 is a truncating shift instead of an
+        // int64 division, so |y| still drops by at least one LSB per silent
+        // sample.
         int32_t hpf1 = inputQ15 - outHpf1PrevInQ15_ +
-                       (int32_t)(((int64_t)outHpf1RQ15_ *
-                                  (int64_t)outHpf1PrevOutQ15_) / 32768);
+                       q15_truncate_from_int32(outHpf1RQ15_ * outHpf1PrevOutQ15_);
         if (hpf1 > 32767) hpf1 = 32767;
         if (hpf1 < -32768) hpf1 = -32768;
         outHpf1PrevInQ15_ = inputQ15;
         outHpf1PrevOutQ15_ = hpf1;
 
         int32_t hpf2 = hpf1 - outHpf2PrevInQ15_ +
-                       (int32_t)(((int64_t)outHpf2RQ15_ *
-                                  (int64_t)outHpf2PrevOutQ15_) / 32768);
+                       q15_truncate_from_int32(outHpf2RQ15_ * outHpf2PrevOutQ15_);
         if (hpf2 > 32767) hpf2 = 32767;
         if (hpf2 < -32768) hpf2 = -32768;
         outHpf2PrevInQ15_ = hpf1;
@@ -1388,15 +1430,17 @@ namespace pixelroot32::audio {
 
         // Butterworth biquad:
         //   y = b0*x + b1*x1 + b2*x2 - a1*y1 - a2*y2, all Q15, then /32768.
-        // int64 is required: five Q15 terms at full scale overflow int32
-        // (`b1` alone reaches ~52 000). The state is saturated so a corrupt
-        // coefficient can never wrap the recursion.
-        const int64_t acc = (int64_t)outLpfB0Q15_ * (int64_t)hpf2 +
-                            (int64_t)outLpfB1Q15_ * (int64_t)outLpfX1Q15_ +
-                            (int64_t)outLpfB2Q15_ * (int64_t)outLpfX2Q15_ -
-                            (int64_t)outLpfA1Q15_ * (int64_t)outLpfY1Q15_ -
-                            (int64_t)outLpfA2Q15_ * (int64_t)outLpfY2Q15_;
-        int32_t y = (int32_t)(acc / 32768);
+        // Each product fits int32_t (same bound as above); the five-term sum
+        // needs int64_t. The state is saturated so a corrupt coefficient can
+        // never wrap the recursion.
+        const int32_t b0x = outLpfB0Q15_ * hpf2;
+        const int32_t b1x1 = outLpfB1Q15_ * outLpfX1Q15_;
+        const int32_t b2x2 = outLpfB2Q15_ * outLpfX2Q15_;
+        const int32_t a1y1 = outLpfA1Q15_ * outLpfY1Q15_;
+        const int32_t a2y2 = outLpfA2Q15_ * outLpfY2Q15_;
+        const int64_t acc = (int64_t)b0x + (int64_t)b1x1 + (int64_t)b2x2
+                            - (int64_t)a1y1 - (int64_t)a2y2;
+        int32_t y = q15_truncate_from_int64(acc);
         if (y > 32767) y = 32767;
         if (y < -32768) y = -32768;
 

@@ -1263,15 +1263,51 @@ namespace pixelroot32::audio {
         // running unchanged when the chain is inactive; the render loop picks
         // one or the other per sample through `applyOutputStage`.
         //
+        // The two first-order high-passes are DELIBERATELY kept as two
+        // sections instead of being merged into one second-order section with
+        // `b = [1, -2, 1]`. The merge is exact in real arithmetic, but the
+        // chain input is already quantised to int16: the second difference of
+        // a 20 Hz tone at half scale is ~0.5 LSB, below the ~2 LSB of
+        // quantisation noise it differentiates, so the merged form loses the
+        // bottom of the band (measured -45 dB instead of -0.35 dB at 20 Hz).
+        // The cascade's intermediate state is what keeps that resolution, and
+        // the cost is recovered below by replacing the 64-bit divisions with
+        // truncating shifts and the 64-bit products with int32 ones.
+        //
         // All coefficients are Q15 in `int32_t`: the LPF's `b1` can exceed 1
         // (up to ~2 near 0.45 * fs), so it does not fit the 16-bit range the
-        // one-pole uses. Products are accumulated in `int64_t` because five
-        // Q15 terms at full scale overflow `int32_t`.
+        // one-pole uses. Products are int32_t because |coefficient| < 2^16 and
+        // |state| < 2^15; only the SUM of the LPF's five products needs
+        // `int64_t`.
         static constexpr float kOutputHpf1Hz = 90.0f;
         static constexpr float kOutputHpf2Hz = 440.0f;
         static constexpr float kOutputLpfMaxHz = 14000.0f;
         /** 0.45 * fs floor below which the LPF would gut the passband. */
-        static constexpr double kOutputLpfMin45FsHz = 6000.0;
+        static constexpr float kOutputLpfMin45FsHz = 6000.0f;
+
+        /**
+         * Bounds that make the fixed-point arithmetic provably safe.
+         *
+         * `kOutputCoeffQ15Max` is below 2^16 and every coefficient is clamped
+         * to it, and `kOutputStateQ15Max` is 2^15 and every recursion state is
+         * saturated to the int16 rail before it is stored. A product is
+         * therefore below 2^31 and fits `int32_t`; a five-term sum does not,
+         * which is why the LPF accumulator is `int64_t`.
+         */
+        static constexpr int32_t kOutputCoeffQ15Max = 65535;
+        static constexpr int32_t kOutputStateQ15Max = 32768;
+        static_assert(kOutputCoeffQ15Max < 65536,
+                      "output chain coefficient must stay below 2^16");
+        static_assert(kOutputStateQ15Max <= 32768,
+                      "output chain state must stay inside the int16 rail");
+        static_assert(
+            static_cast<int64_t>(kOutputCoeffQ15Max) * kOutputStateQ15Max <=
+                2147483647LL,
+            "one coefficient*state product must fit int32_t");
+        static_assert(
+            5 * static_cast<int64_t>(kOutputCoeffQ15Max) * kOutputStateQ15Max <=
+                9223372036854775807LL,
+            "the five-term accumulator must fit int64_t");
 
         /** True when the profile owns the stage and no caller override exists. */
         bool outputFilterActive_ = false;
@@ -1335,7 +1371,10 @@ namespace pixelroot32::audio {
          * corner is `min(14000 Hz, 0.45 * fs)`, engaged only when
          * `0.45 * fs >= 6000 Hz`. The transcendentals are confined here, on a
          * configuration change, so no `exp`/`sin`/`cos` reaches the render
-         * path even on a soft-float target.
+         * path even on a soft-float target. They are evaluated in `float`,
+         * not `double`: the coefficients are quantised to Q15 immediately, so
+         * double precision buys nothing and pulls the soft-float libm
+         * transcendants into the image (the E2 flash regression).
          */
         void recomputeOutputFilterCoefficients();
 
@@ -1364,10 +1403,11 @@ namespace pixelroot32::audio {
          * @brief HPF 90 Hz -> HPF 440 Hz -> LPF, one Q15 sample.
          *
          * Each stage saturates its own state to [-32768, 32767], so a corrupt
-         * coefficient can never wrap the recursion, and every divide by 32768
-         * truncates toward zero (not an arithmetic shift) for the reason
-         * documented on the historical one-pole: a shift freezes the DC decay
-         * on a permanent offset instead of reaching zero.
+         * coefficient can never wrap the recursion. Every Q15 feedback product
+         * is `int32_t` (see the bounds above) and is rescaled by a truncating
+         * shift, not a division and not an arithmetic shift: a floor shift
+         * freezes the DC decay on a permanent offset, while division truncates
+         * toward zero (see the historical one-pole comment).
          *
          * @param inputQ15 Chain input in Q15.
          * @return Chain output, saturated to the int16 range.

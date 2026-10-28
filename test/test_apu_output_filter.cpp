@@ -19,6 +19,8 @@
  *     clears the override.
  *   - Legacy inertness: the inactive stage is the historical one-pole, byte
  *     for byte, on the path a no-float build renders `Legacy` with.
+ *   - Fixed-point bounds: every derived Q15 coefficient stays below 2^16, the
+ *     precondition that makes the int32 products safe.
  */
 
 #include <unity.h>
@@ -64,6 +66,11 @@ constexpr int kStabilityBlock = 1024;
 // Every stage saturates its state to int16, so no state variable can exceed
 // this bound no matter what a corrupt coefficient would do.
 constexpr int32_t kStateBound = 32768;
+// The fixed-point sections multiply an int32 Q15 coefficient by an int16
+// state, so every |coefficient| must stay below 2^16 for the product to fit
+// int32_t. Stated here independently of the library constant so a future
+// coefficient change has to disagree with the test instead of with itself.
+constexpr int32_t kProductBoundQ15 = 65535;
 
 /// @brief The theoretical cascade for one sample rate, in double.
 struct Theory {
@@ -490,6 +497,35 @@ void test_output_filter_activation_and_lpf_policy(void) {
                              apu.getOutputFilterLpfCutoffHzForTesting());
 }
 
+// =============================================================================
+// S1 - fixed-point bounds
+// =============================================================================
+
+void test_output_filter_coefficients_stay_inside_the_product_bound(void) {
+    // Every product is an int32 Q15 coefficient times an int16 state. The
+    // int32 product only holds while |coefficient| < 2^16, so the bound is
+    // asserted over the whole supported rate range rather than assumed.
+    for (int fs : {8000, 11025, 22050, 32000, 44100, 48000}) {
+        ApuCore apu;
+        apu.init(fs);
+        apu.setSoundProfile(SoundProfile::Nes);
+
+        const int32_t coefficients[] = {
+            apu.getOutputFilterHpf1RQ15ForTesting(),
+            apu.getOutputFilterHpf2RQ15ForTesting(),
+            apu.getOutputFilterLpfB0Q15ForTesting(),
+            apu.getOutputFilterLpfB1Q15ForTesting(),
+            apu.getOutputFilterLpfB2Q15ForTesting(),
+            apu.getOutputFilterLpfA1Q15ForTesting(),
+            apu.getOutputFilterLpfA2Q15ForTesting(),
+        };
+        for (int32_t c : coefficients) {
+            TEST_ASSERT_TRUE_MESSAGE(c <= kProductBoundQ15 && c >= -kProductBoundQ15,
+                                     "Q15 coefficient exceeded the int32 product bound");
+        }
+    }
+}
+
 int main(void) {
     UNITY_BEGIN();
     RUN_TEST(test_output_filter_response_8000);
@@ -503,5 +539,6 @@ int main(void) {
     RUN_TEST(test_output_filter_override_precedes_profile);
     RUN_TEST(test_output_filter_legacy_stage_is_historical_one_pole);
     RUN_TEST(test_output_filter_activation_and_lpf_policy);
+    RUN_TEST(test_output_filter_coefficients_stay_inside_the_product_bound);
     return UNITY_END();
 }
