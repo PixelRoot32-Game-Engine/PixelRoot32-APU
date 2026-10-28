@@ -1,4 +1,4 @@
-# ABI and Library Contracts — PixelRoot32-APU
+# ABI and Library Contracts â€” PixelRoot32-APU
 
 Reference version: **v1.0.0** (derived from Game Engine `a3ac998`, branch `refac/extract-apu`, after Phase 0 convergence with the Tool Suite `fc763b8`).
 
@@ -19,14 +19,14 @@ Consumers with dynamic presets must guarantee address stability (the Tool Suite 
 
 ## 2. Voice Partitioning and Stealing
 
-- `MAX_VOICES = 8`: slots **0–3** reserved for the sequencer (track ↔ slot 1:1); slots **4–7** for `PLAY_EVENT`/SFX and sequencer percussion.
-- Voice stealing is confined to 4–7; **never** steals music slots.
+- `MAX_VOICES = 8`: slots **0â€“3** reserved for the sequencer (track â†” slot 1:1); slots **4â€“7** for `PLAY_EVENT`/SFX and sequencer percussion.
+- Voice stealing is confined to 4â€“7; **never** steals music slots.
 - Stealing ranking: lowest `remainingSamples` first; voices in loop score **0** (anti-starvation) and are the first candidates.
 
 ## 3. Automation and Precedences
 
-- **Duty stepped** (`dutySteps`, count 1–4): *hold* without interpolation; while active, `InstrumentPreset::dutySweep` is ignored.
-- **Pitch envelope** (`pitchEnvelope`, count 2–4): multi-segment; with ≥ 2 points it **replaces** the single-segment sweep.
+- **Duty stepped** (`dutySteps`, count 1â€“4): *hold* without interpolation; while active, `InstrumentPreset::dutySweep` is ignored.
+- **Pitch envelope** (`pitchEnvelope`, count 2â€“4): multi-segment; with â‰¥ 2 points it **replaces** the single-segment sweep.
 - `SfxBreakpoint.timeSec` must be non-decreasing; `value` = duty [0,1] or Hz > 0 according to the table.
 - `SweepCurve::Exponential` degrades to `Linear` if both initial/final Hz are not > 0.
 - In NOISE, the sweep interpolates the LFSR clock/period, not melodic pitch.
@@ -37,47 +37,47 @@ Consumers with dynamic presets must guarantee address stability (the Tool Suite 
 
 | Level | Owner | Owns | Beats |
 |---|---|---|---|
-| 1. **Profile** | `setSoundProfile` / `AudioCommandType::SET_SOUND_PROFILE` | Character: default envelope curve, mix curve, output filters, default duty, noise LUT, unipolar noise, pan/echo enablement | — |
+| 1. **Profile** | `setSoundProfile` / `AudioCommandType::SET_SOUND_PROFILE` | Character: default envelope curve, mix curve, output filters, default duty, noise LUT, unipolar noise, pan/echo enablement | â€” |
 | 2. **Voice** | `setVoiceNesOptions`, `setVoicePulseDutyMode`, `setVoiceNesNoiseLutMode`, `setVoiceNesSweepUnitEnabled` | A character override on that slot (including `VoiceNesOptions::noiseUnipolar`) | Profile |
 | 3. **Note** | `InstrumentPreset` / `AudioEvent` | ADSR (times and levels), envelope curve, LFO, `duty`, sweep, pitch envelope, `noisePeriod`, `noiseLfsrShort` | Voice and profile, **only inside its own domain** |
 
 - The profile is **configuration, not state**: `init(int sampleRate)` does not reset it (voices are reset). `setSoundProfile` is an audio-thread call; from the game thread use `submitCommand()` with `SET_SOUND_PROFILE`, the same shape as `SET_NES_OPTIONS`. An unknown value is ignored, never clamped to a neighbouring profile.
-- `applyProfileCharacter(int slot)` is the **only** function through which the profile writes character, and it is invoked **last** in `initVoiceFromEvent`, after the `nesAccurate` / `initNesSafe` block. `nesAccurate` still means "start from a clean canonical state"; it does not erase the character the profile chose. Since E1 it resolves the default envelope curve and its exponential clock, the unipolar NOISE gate, the NES period LUT selector and the stepped PULSE duty. The mix curve is not voice state: it is resolved once per render block from the same profile (§6).
+- `applyProfileCharacter(int slot)` is the **only** function through which the profile writes character, and it is invoked **last** in `initVoiceFromEvent`, after the `nesAccurate` / `initNesSafe` block. `nesAccurate` still means "start from a clean canonical state"; it does not erase the character the profile chose. Since E1 it resolves the default envelope curve and its exponential clock, the unipolar NOISE gate, the NES period LUT selector and the stepped PULSE duty. The mix curve is not voice state: it is resolved once per render block from the same profile (Â§6).
 - Ordering is asserted structurally, not visually: `getProfileApplyCountForTesting()` (`UNIT_TEST`) is incremented by `applyProfileCharacter`, so one `PLAY_EVENT` with `nesAccurate = true` must advance it exactly once.
 
-**Hot switch (`setSoundProfile`)** — applies immediately to the core and does **not** cut sounding voices. Executed in this order:
+**Hot switch (`setSoundProfile`)** â€” applies immediately to the core and does **not** cut sounding voices. Executed in this order:
 
 1. The **destination core is computed from the argument**, never from the current `profile_`.
 2. The envelope mirror of every voice is synced **only when the core actually changes** (`currentLevelQ15 = currentLevel * 32768` or the inverse, towards the destination core). Each core advances a single mirror, so the idle one still holds its note-on value; copying from it when the core does not change would move a live level backwards and produce the very click this step prevents.
 3. The output stage is reset (`hpfPrevIn`, `hpfPrevOut`, `hpfPrevInQ15`, `hpfPrevOutQ15`): one core's HPF recursion carries no meaning for the other.
-4. `profile_` is committed. Voices keep playing — no `reset()`, no `enabled = false`.
+4. `profile_` is committed. Voices keep playing â€” no `reset()`, no `enabled = false`.
 
 - The **character** applies to the following notes, not to voices already sounding: `setSoundProfile` never rewrites the character of an active voice.
-- The phase is **not** mirrored in both directions: the float body advances `phase` and `phaseQ32`, the integer body only `phaseQ32`. The seamless direction is **float → integer** (`Legacy` → `Nes`/`Hybrid` on an FPU build), which is the one a game performs when it loads content. `integer → float` re-frames phase and duty to their note-on values, so it is documented as a **note-boundary change**, not a mid-note one; the same applies to a continuous `dutySweep` crossing the switch. Switch between notes, or with the voices silent.
-- Measurable no-click criterion (float → integer): in a 0.5 s render with the switch at sample 11 025, no consecutive-sample difference in the eight samples after the switch may exceed `0.25 × 32767`, and the render may contain no samples on the rail (`±32767`).
+- The phase is **not** mirrored in both directions: the float body advances `phase` and `phaseQ32`, the integer body only `phaseQ32`. The seamless direction is **float â†’ integer** (`Legacy` â†’ `Nes`/`Hybrid` on an FPU build), which is the one a game performs when it loads content. `integer â†’ float` re-frames phase and duty to their note-on values, so it is documented as a **note-boundary change**, not a mid-note one; the same applies to a continuous `dutySweep` crossing the switch. Switch between notes, or with the voices silent.
+- Measurable no-click criterion (float â†’ integer): in a 0.5 s render with the switch at sample 11 025, no consecutive-sample difference in the eight samples after the switch may exceed `0.25 Ã— 32767`, and the render may contain no samples on the rail (`Â±32767`).
 
 ## 4. Loop and Duration
 
-- `loop == true` ⇒ `remainingSamples = UINT64_MAX` (sentinel); only terminates via `STOP_CHANNEL` or stealing.
-- `loop == false && duration <= 0` ⇒ the voice is deactivated immediately (anti-stall guarantee).
+- `loop == true` â‡’ `remainingSamples = UINT64_MAX` (sentinel); only terminates via `STOP_CHANNEL` or stealing.
+- `loop == false && duration <= 0` â‡’ the voice is deactivated immediately (anti-stall guarantee).
 - Sequencer: `MusicNote.duration == 0` = stacked trigger with no time advance (drums on the same step). Preset fallback duration: `max(duration, 0.05) / tempoFactor`.
 
 ## 5. Command Queue
 
-`AudioCommandQueue` is **SPSC**: one producer (UI/game thread) and one consumer (audio thread). Does not support multiple concurrent producers. Full queue ⇒ newest command is dropped and `droppedCommands` is incremented.
+`AudioCommandQueue` is **SPSC**: one producer (UI/game thread) and one consumer (audio thread). Does not support multiple concurrent producers. Full queue â‡’ newest command is dropped and `droppedCommands` is incremented.
 
 | Property | Contract |
 |---|---|
 | Default capacity | `AUDIO_COMMAND_QUEUE_CAPACITY` = **64** (was 128 before the sound-profile release) |
-| Accepted range | **32–64** |
+| Accepted range | **32â€“64** |
 | Slot cost | `sizeof(AudioCommand)` = **144 B** (host ABI) |
 | Ring cost at the default | `CAPACITY * 144` = **9 216 B** |
-| Effective depth | `CAPACITY - 1` = **63** commands — one slot stays free to distinguish full from empty |
+| Effective depth | `CAPACITY - 1` = **63** commands â€” one slot stays free to distinguish full from empty |
 | Drop policy | Unchanged: the **newest** command is discarded and `droppedCommands` is incremented |
 
-The ceiling is a **RAM** decision, not a throughput one: the real command rate is tens per second, so the former 128 slots only doubled the dominant cost of `ApuCore`. Raising the ceiling means raising the 9 KB budget in the same commit, after measuring the new slot size — a capacity the budget cannot pay for is not a capacity.
+The ceiling is a **RAM** decision, not a throughput one: the real command rate is tens per second, so the former 128 slots only doubled the dominant cost of `ApuCore`. Raising the ceiling means raising the 9 KB budget in the same commit, after measuring the new slot size â€” a capacity the budget cannot pay for is not a capacity.
 
-**`sizeof(AudioCommand)` is still 144 B after E1.** S5 needed a seventh `VoiceNesOptions` byte (`noiseUnipolar`); `nesLengthIndex`, `nesLengthHalt` and the options used to fill exactly eight bytes before `subTracks`, so the seventh option byte would have spilled into the next 8-byte boundary and grown every slot to **152 B** — 9 728 B for the 64-slot queue, over the 9 KB assert. `AudioCommand::nesLengthHalt` therefore moved into the padding before `seekOffsetTicks`: one byte out of the group puts it back at eight, the budget stays `64 × 144 B = 9 216 B`, and nothing that names the member observes the move — the name and the type are unchanged, only its offset inside bytes that were already padding. The move is documented at the field, in `AudioTypes.h`.
+**`sizeof(AudioCommand)` is still 144 B after E1.** S5 needed a seventh `VoiceNesOptions` byte (`noiseUnipolar`); `nesLengthIndex`, `nesLengthHalt` and the options used to fill exactly eight bytes before `subTracks`, so the seventh option byte would have spilled into the next 8-byte boundary and grown every slot to **152 B** â€” 9 728 B for the 64-slot queue, over the 9 KB assert. `AudioCommand::nesLengthHalt` therefore moved into the padding before `seekOffsetTicks`: one byte out of the group puts it back at eight, the budget stays `64 Ã— 144 B = 9 216 B`, and nothing that names the member observes the move â€” the name and the type are unchanged, only its offset inside bytes that were already padding. The move is documented at the field, in `AudioTypes.h`.
 
 Two `static_assert`s guard the contract in `AudioCommandQueue.h`, verbatim:
 
@@ -96,11 +96,11 @@ The range guard sits on the user-configured branch (`#ifdef AUDIO_COMMAND_QUEUE_
 | Path | Guard | Targets |
 |---|---|---|
 | Float | `PR32_APU_ENABLE_LEGACY_FLOAT == 1` (defaults to `PR32_APU_HAS_FPU`) | Desktop, classic ESP32, ESP32-S3 |
-| Integer Q15 + `audio_mixer_lut` | No guard — always compiled | ESP32-C3, RISC-V without FPU (and forced native tests) |
+| Integer Q15 + `audio_mixer_lut` | No guard â€” always compiled | ESP32-C3, RISC-V without FPU (and forced native tests) |
 
 **Both bodies coexist in the same binary.** The float body of `generateSamples` is compiled under `PR32_APU_ENABLE_LEGACY_FLOAT`, defined in `ApuConfig.h` with the default value `PR32_APU_HAS_FPU`; the integer body carries **no guard**. With the default value every build compiles exactly the body it compiled before, so nothing changes for a consumer that defines nothing. `-DPR32_APU_ENABLE_LEGACY_FLOAT=0` removes the float body from an FPU build (the supported flash lever) and `Legacy` then renders through the integer core; a build without FPU always renders integer. Neither setting can produce a binary that fails to link: the float reference is a compile-time guard, not a dynamic lookup.
 
-**The profile selects the body**, once per render block — never per voice:
+**The profile selects the body**, once per render block â€” never per voice:
 
 | `SoundProfile` | `PR32_APU_HAS_FPU=1` | `PR32_APU_HAS_FPU=0` | `PR32_APU_ENABLE_LEGACY_FLOAT=0` |
 |---|---|---|---|
@@ -115,7 +115,7 @@ The range guard sits on the user-configured branch (`#ifdef AUDIO_COMMAND_QUEUE_
 | Float (`PR32_APU_HAS_FPU=1`) | `test/golden/fixtures/apu_mirror_canonical_s16le_44100.pcm` | `7FF568A5A163A5E11E7A86DFCC0DAFEBCE9C3EE7088C88C6DE9C82293CC15DE9` |
 | Integer (`PR32_APU_HAS_FPU=0`) | `test/golden/fixtures/apu_integer_core_canonical_s16le_44100.pcm` | `F59501D66B522CC26D7F1D48432FAF0FEF9C8ABDACA1B68A09C67D574EF3902D` |
 
-`Legacy` receives **no new features and no optimisations, only defect fixes**. One landed with the integer golden: the Q15 DC blocker truncated `R·y[n-1]` towards −∞ and parked the output at −199 forever once a voice was silenced; it now truncates towards zero like the float conversion does, so the offset decays. That is the only deliberate deviation of the integer fixture from 2.0.0 and it is announced in the CHANGELOG.
+`Legacy` receives **no new features and no optimisations, only defect fixes**. One landed with the integer golden: the Q15 DC blocker truncated `RÂ·y[n-1]` towards âˆ’âˆž and parked the output at âˆ’199 forever once a voice was silenced; it now truncates towards zero like the float conversion does, so the offset decays. That is the only deliberate deviation of the integer fixture from 2.0.0 and it is announced in the CHANGELOG.
 
 **`Nes` and `Hybrid` own a character since E1**; they are no longer aliases of `Legacy` or of each other. Both render the integer core and share the published NES balance and the hardware-shaped noise; `Hybrid` adds the exponential envelope.
 
@@ -125,26 +125,26 @@ The range guard sits on the user-configured branch (`#ifdef AUDIO_COMMAND_QUEUE_
 | Mix curve | `Rational` (equal weight) | `NesWeighted` | `NesWeighted` | profile only, resolved once per block |
 | NOISE output | bipolar | unipolar `(lfsr & 1) ? level : 0` | unipolar | profile; `VoiceNesOptions::noiseUnipolar` pins it per voice |
 | NOISE period | derived from the note's Hz | NES period LUT index 0 (`$400E = $00`) | index 0 | profile; `setVoiceNesNoiseLutMode` pins it per voice |
-| PULSE duty | continuous (`255`) | NES step 0–3 | NES step 0–3 | profile; `setVoicePulseDutyMode` pins it, an animated duty keeps the continuous generator |
+| PULSE duty | continuous (`255`) | NES step 0â€“3 | NES step 0â€“3 | profile; `setVoicePulseDutyMode` pins it, an animated duty keeps the continuous generator |
 
 The four are contracts, not implementation notes:
 
-- **Envelope curve.** `EnvelopeCurve` is the last member of `InstrumentPreset` and defaults to `ProfileDefault`, which means "the profile decides": `Legacy` and `Nes` answer `Linear`, `Hybrid` `Exponential`. DECAY and RELEASE follow `level -= ((level - 1) >> 8) + 1` (floor at 0) and reach −60 dB in the stage's own time ±5 %; ATTACK stays linear because a predictable attack is worth more than a matching curve. A stage **shorter than the shape's own −60 dB span keeps the linear ramp**: stepping once per sample there would leave the level far above its target and snap at the stage boundary (~7 dB on the default 5 ms release), and those are exactly the stages where the two ramps are indistinguishable.
-- **Mix curve.** `MixerCurve::NesWeighted`, orthogonal to `SoftClipMode` and applied **before** the HPF, is the published linear approximation of the NES mixer by group: pulses `0.00752 × (p1 + p2)`, triangle `0.00851`, noise `0.00494`, DMC `0.00335`. Every weight is divided by the pulse weight and rounded to Q12 — **4096 / 4635 / 2691 / 1825**, with the pulse group pinned at unity — so a full-scale pulse keeps exactly the amplitude `Legacy` gives it and the change is balance, not loudness. `SINE` and `SAW` join the pulse group: they are the only other melodic voices and the published approximation has no counterpart for them. The DMC term is **reserved** (`kNesMixWeightDmc`): E1 has no DMC voice model, so it is documented rather than driven. The `Legacy` curve stays the historical rational one.
-- **Noise.** The unipolar gate switches between `0` and the envelope level instead of `±level`. Unipolarisation halves the AC amplitude, so one exact ×2 shift follows the volume × envelope multiplies — measured −0.001 dB against bipolar **at the same weighting**. The remaining −3.649 dB against `Legacy` is deliberate: it *is* the published noise weight (`0.00494 / 0.00752 = −3.650 dB`). Making it as loud as `Legacy` would need ×3.044 and would double the noise group against the pulse anchor. `Legacy` keeps its bipolar noise and its Hz-derived period.
-- **Duty.** `Nes` and `Hybrid` snap the note's `duty` to the nearest of the four NES patterns, round-half-up: `[0, 0.1875) → 12.5 %`, `[0.1875, 0.375) → 25 %`, `[0.375, 0.625) → 50 %`, `[0.625, 1] → 75 %`. PULSE only, and only when the slot is not pinned. A note that **animates** duty (`dutySteps` or `dutySweep`) keeps the continuous generator, because one static 2-bit index cannot express animation — that is the note winning inside its own domain (§3), not an exception. `setVoicePulseDutyMode(slot, 255)` is the documented way to keep continuous duty under a NES profile.
+- **Envelope curve.** `EnvelopeCurve` is the last member of `InstrumentPreset` and defaults to `ProfileDefault`, which means "the profile decides": `Legacy` and `Nes` answer `Linear`, `Hybrid` `Exponential`. DECAY and RELEASE follow `level -= ((level - 1) >> 8) + 1` (floor at 0) and reach âˆ’60 dB in the stage's own time Â±5 %; ATTACK stays linear because a predictable attack is worth more than a matching curve. A stage **shorter than the shape's own âˆ’60 dB span keeps the linear ramp**: stepping once per sample there would leave the level far above its target and snap at the stage boundary (~7 dB on the default 5 ms release), and those are exactly the stages where the two ramps are indistinguishable.
+- **Mix curve.** `MixerCurve::NesWeighted`, orthogonal to `SoftClipMode` and applied **before** the HPF, is the published linear approximation of the NES mixer by group: pulses `0.00752 Ã— (p1 + p2)`, triangle `0.00851`, noise `0.00494`, DMC `0.00335`. Every weight is divided by the pulse weight and rounded to Q12 â€” **4096 / 4635 / 2691 / 1825**, with the pulse group pinned at unity â€” so a full-scale pulse keeps exactly the amplitude `Legacy` gives it and the change is balance, not loudness. `SINE` and `SAW` join the pulse group: they are the only other melodic voices and the published approximation has no counterpart for them. The DMC term is **reserved** (`kNesMixWeightDmc`): E1 has no DMC voice model, so it is documented rather than driven. The `Legacy` curve stays the historical rational one.
+- **Noise.** The unipolar gate switches between `0` and the envelope level instead of `Â±level`. Unipolarisation halves the AC amplitude, so one exact Ã—2 shift follows the volume Ã— envelope multiplies â€” measured âˆ’0.001 dB against bipolar **at the same weighting**. The remaining âˆ’3.649 dB against `Legacy` is deliberate: it *is* the published noise weight (`0.00494 / 0.00752 = âˆ’3.650 dB`). Making it as loud as `Legacy` would need Ã—3.044 and would double the noise group against the pulse anchor. `Legacy` keeps its bipolar noise and its Hz-derived period.
+- **Duty.** `Nes` and `Hybrid` snap the note's `duty` to the nearest of the four NES patterns, round-half-up: `[0, 0.1875) â†’ 12.5 %`, `[0.1875, 0.375) â†’ 25 %`, `[0.375, 0.625) â†’ 50 %`, `[0.625, 1] â†’ 75 %`. PULSE only, and only when the slot is not pinned. A note that **animates** duty (`dutySteps` or `dutySweep`) keeps the continuous generator, because one static 2-bit index cannot express animation â€” that is the note winning inside its own domain (Â§3), not an exception. `setVoicePulseDutyMode(slot, 255)` is the documented way to keep continuous duty under a NES profile.
 
-What a **later phase** completes, not this one: DMC (the term is reserved), pan/echo enablement, and the S10 collapse — if the blind A/B of `tools/profiles_ab` shows that `Nes` and `Hybrid` cannot be told apart, the two profiles merge into `Hybrid` and this table loses a column.
+What a **later phase** completes, not this one: DMC (the term is reserved), pan/echo enablement, and the S10 collapse â€” if the blind A/B of `tools/profiles_ab` shows that `Nes` and `Hybrid` cannot be told apart, the two profiles merge into `Hybrid` and this table loses a column.
 
-Float chain: `Σ(voice · MIXER_SCALE=0.4) · masterVolume → soft-clip 1/(1+|x|·0.5) → HPF R=0.995 → ±32767 → bitcrush`. The Q15 path replicates the same chain with the pre-adjusted LUT and master volume applied **before** the compressor (order parity since v1.0.0).
+Float chain: `Î£(voice Â· MIXER_SCALE=0.4) Â· masterVolume â†’ soft-clip 1/(1+|x|Â·0.5) â†’ HPF R=0.995 â†’ Â±32767 â†’ bitcrush`. The Q15 path replicates the same chain with the pre-adjusted LUT and master volume applied **before** the compressor (order parity since v1.0.0).
 
-**Loudness parity** (since 2.0.0): both paths render at the same level. The Q15 accumulator carries the **raw** channel sum and `MIXER_SCALE` is applied exactly once downstream — by `audio_mixer_lut`, whose curve is defined over `x = sum · 1.6 / 131072` and therefore bakes the 0.4 in, or explicitly as `(sum · 13107) >> 15` for the computed soft-clip modes. Do **not** pre-scale channels before summation: that applies 0.4 twice and puts the compressor knee in the wrong place.
+**Loudness parity** (since 2.0.0): both paths render at the same level. The Q15 accumulator carries the **raw** channel sum and `MIXER_SCALE` is applied exactly once downstream â€” by `audio_mixer_lut`, whose curve is defined over `x = sum Â· 1.6 / 131072` and therefore bakes the 0.4 in, or explicitly as `(sum Â· 13107) >> 15` for the computed soft-clip modes. Do **not** pre-scale channels before summation: that applies 0.4 twice and puts the compressor knee in the wrong place.
 
-Previously the Q15 path was ~0.225× the float level — the double `MIXER_SCALE` plus a fixed −6 dB pad (`>>1`, Q15→Q14) with no float equivalent. Both are gone; consumers on FPU-less targets should re-check their master volume. See the CHANGELOG entry for Hito 5 M12.
+Previously the Q15 path was ~0.225Ã— the float level â€” the double `MIXER_SCALE` plus a fixed âˆ’6 dB pad (`>>1`, Q15â†’Q14) with no float equivalent. Both are gone; consumers on FPU-less targets should re-check their master volume. See the CHANGELOG entry for Hito 5 M12.
 
 ## 7. Canonical Percussion Presets
 
-`noisePeriod` is the **LFSR period in samples**: larger period ⇒ slower clock ⇒ deeper sound.
+`noisePeriod` is the **LFSR period in samples**: larger period â‡’ slower clock â‡’ deeper sound.
 
 These presets are **note-level** (`noisePeriod` travels in `InstrumentPreset`), so inside their own domain they beat a profile default and a per-voice override. The NOISE **period** is the documented exception, because the profile owns it through the LUT: `Nes` and `Hybrid` arm LUT index 0 by default, arming the LUT **retunes** the period, and a preset's own `noisePeriod` (60 for `INSTR_KICK`, 15 for `INSTR_SNARE`, 12 for `INSTR_HIHAT`) is therefore replaced under those profiles. `Legacy` keeps the preset's period, because it never arms the LUT. `setVoiceNesNoiseLutMode(slot, 255)` opts out of the LUT, but it opts out to the **frequency-derived** clock, not back to the preset's `noisePeriod`: the note's period is gone once a LUT index was applied.
 
@@ -163,11 +163,11 @@ These presets are **note-level** (`noisePeriod` travels in `InstrumentPreset`), 
 
 ## 9. Verification
 
-The suite (`ctest`) includes `test_apu_mirror` with a **golden PCM** (`test/golden/fixtures/apu_mirror_canonical_s16le_44100.pcm`), the two `Legacy` integer references, and one golden per audible profile (§9.2): the canonical rendered track must match byte-for-byte. Regenerate a fixture **only** when the output changes intentionally and is documented in the CHANGELOG.
+The suite (`ctest`) includes `test_apu_mirror` with a **golden PCM** (`test/golden/fixtures/apu_mirror_canonical_s16le_44100.pcm`), the two `Legacy` integer references, and one golden per audible profile (Â§9.2): the canonical rendered track must match byte-for-byte. Regenerate a fixture **only** when the output changes intentionally and is documented in the CHANGELOG.
 
 ### 9.1 Targets and case counts
 
-Measured 2026-10-28 on the sound-profile branch (`cmake -S . -B build -G "MinGW Makefiles" -DPR32_APU_BUILD_TESTS=ON`, `cmake --build build`, `cd build && ctest --output-on-failure` → `100% tests passed out of 15`). The case counts are Unity's summary line, each binary run from `test/`:
+Measured 2026-10-28 on the sound-profile branch (`cmake -S . -B build -G "MinGW Makefiles" -DPR32_APU_BUILD_TESTS=ON`, `cmake --build build`, `cd build && ctest --output-on-failure` â†’ `100% tests passed out of 15`). The case counts are Unity's summary line, each binary run from `test/`:
 
 | Target | Cases | What it covers |
 |---|---|---|
@@ -178,7 +178,7 @@ Measured 2026-10-28 on the sound-profile branch (`cmake -S . -B build -G "MinGW 
 | `test_apu_mirror` | 37 | Tool Suite parity, byte-for-byte against the float golden |
 | `test_apu_output_filter` | 12 | E2 output chain: measured response, full-scale stability, `setHpfCutoffHz` precedence, `Legacy` one-pole, Q15 product bound |
 | `test_apu_output_filter_integer` | 12 | The same suite where `Legacy` has no float body (`PR32_APU_ENABLE_LEGACY_FLOAT=0`) |
-| `test_apu_wavetable_spectral` | 5 | E2/S4: the generated SAW mipmap — band limit per level, seam-free tables, the S5 alias sweep |
+| `test_apu_wavetable_spectral` | 5 | E2/S4: the generated SAW mipmap â€” band limit per level, seam-free tables, the S5 alias sweep |
 | `test_apu_hybrid_wavetable` | 8 | E2/T3+T4: `Hybrid` reads the tables (level and crossfade window resolved per block, one table read outside the window), `Nes`/`Legacy` keep the ramp, SINE inert, block render bit-identical to the per-sample one |
 | `test_q15_smoke` | 15 | Integer/Q15 path smoke coverage |
 | `test_apu_integer_golden` | 1 | The integer core against the `Legacy` integer golden (FPU build with the float body off) |
@@ -188,11 +188,11 @@ Measured 2026-10-28 on the sound-profile branch (`cmake -S . -B build -G "MinGW 
 | `test_library_link` | 4 | Public symbols exist in the shipped artifact (links, no `UNIT_TEST`) |
 | **Total** | **568** | 0 failures, 0 ignored, exit code 0 in all fifteen |
 
-The five continuous-duty cases added by the full-scale fix (`test_pulse_duty_full_scale_*`, `test_pulse_duty_zero_never_goes_positive`, `test_pulse_duty_interior_value_unchanged`) live in `test/test_apu_core.cpp`, so both core targets run them; that is the 205 → 210 step on the two rows above.
+The five continuous-duty cases added by the full-scale fix (`test_pulse_duty_full_scale_*`, `test_pulse_duty_zero_never_goes_positive`, `test_pulse_duty_interior_value_unchanged`) live in `test/test_apu_core.cpp`, so both core targets run them; that is the 205 â†’ 210 step on the two rows above.
 
 ### 9.2 Golden PCM
 
-Six immutable references: two for `Legacy` — one per render route, never regenerated — and two per audible profile, one for each committed scene. All are raw S16LE, no header, 22 050 samples at 44 100 Hz, rendered from `test/golden/apu_mirror_canonical_track.h` (canonical scene) or `test/golden/apu_wavetable_track.h` (wavetable scene).
+Six immutable references: two for `Legacy` â€” one per render route, never regenerated â€” and two per audible profile, one for each committed scene. All are raw S16LE, no header, 22 050 samples at 44 100 Hz, rendered from `test/golden/apu_mirror_canonical_track.h` (canonical scene) or `test/golden/apu_wavetable_track.h` (wavetable scene).
 
 | Reference | Consumed by | SHA-256 |
 |---|---|---|
@@ -205,38 +205,38 @@ Six immutable references: two for `Legacy` — one per render route, never regen
 
 One golden per affected profile, and no more (S7): E1 is the change that makes `Nes` and `Hybrid` audible, so each needs its own reference and neither may keep sharing `Legacy`'s. The two canonical profile files were rendered by `apu_golden_gen_nofpu --profile <nes|hybrid>` and independently reproduced byte for byte by `apu_golden_gen` (FPU build) and `apu_golden_gen_integer` (FPU build with the float body off): both profiles run the integer core, so the build cannot be allowed to matter.
 
-The wavetable pair exists because the canonical track is PULSE-only and cannot observe E2's band-limited SAW (S4): `apu_hybrid_canonical_s16le_44100.pcm` is byte-identical before and after the mipmap landed. `apu_golden_gen_nofpu --scene wavetable --profile <nes|hybrid>` renders four SAW notes — 55 Hz, 220 Hz gliding through a mipmap level boundary, 880 Hz and 1 760 Hz — and the same three builds reproduce both files byte for byte. `Nes` keeps the ideal ramp, so its wavetable file is the reference the `Hybrid` one is read against; the two differ on 18 141 of 22 050 samples (max 13 185 LSB, −17.84 dBFS RMS difference), which is the evidence that the scene reaches the table read instead of describing a ramp twice.
+The wavetable pair exists because the canonical track is PULSE-only and cannot observe E2's band-limited SAW (S4): `apu_hybrid_canonical_s16le_44100.pcm` is byte-identical before and after the mipmap landed. `apu_golden_gen_nofpu --scene wavetable --profile <nes|hybrid>` renders four SAW notes â€” 55 Hz, 220 Hz gliding through a mipmap level boundary, 880 Hz and 1 760 Hz â€” and the same three builds reproduce both files byte for byte. `Nes` keeps the ideal ramp, so its wavetable file is the reference the `Hybrid` one is read against; the two differ on 18 141 of 22 050 samples (max 13 185 LSB, âˆ’17.84 dBFS RMS difference), which is the evidence that the scene reaches the table read instead of describing a ramp twice.
 
 The integer fixture is written by `python tools/golden_gen/run.py --write`, which builds three generator binaries and refuses to proceed unless the default build still reproduces the float fixture byte-for-byte and the two integer builds agree with each other. Regenerate a fixture **only** when the output changes intentionally and the change is documented in the CHANGELOG.
 
-The E2 cost pass that followed the flash gate is bit-exact, so none of the six rows above moved. It replaced the output chain's int64 products and `/32768` divisions with int32 products and truncating shifts, and moved the coefficient derivation to `float`; `apu_golden_gen` reproduces all four profile fixtures byte for byte (0 differing samples, max |Δ| 0, RMS unchanged) and `apu_mirror_canonical` / `apu_integer_core_canonical` were not touched.
+The E2 cost pass that followed the flash gate is bit-exact, so none of the six rows above moved. It replaced the output chain's int64 products and `/32768` divisions with int32 products and truncating shifts, and moved the coefficient derivation to `float`; `apu_golden_gen` reproduces all four profile fixtures byte for byte (0 differing samples, max |Î”| 0, RMS unchanged) and `apu_mirror_canonical` / `apu_integer_core_canonical` were not touched.
 
-The cost pass that followed it is **not** bit-exact, and only one row moved. `Hybrid`'s SAW crossfade was narrowed from the whole octave to the top 1/8 of each mipmap band (the neighbour table only removes the step at the boundary, and table `L` is alias-free everywhere in its band), and the level plus the window are now resolved once per voice per block instead of once per sample. Measured against the previous tree with the same generator: `apu_hybrid_wavetable` moved on 16 917 of 22 050 samples (max |Δ| 1 088 LSB, peak 9 965 → 10 351, RMS −0.060 dB) and was regenerated, which is the hash above. The other five rows are unchanged — `apu_mirror_canonical` (`7FF568A5…5DE9`), `apu_integer_core_canonical` (`F59501D6…3902D`), `apu_nes_canonical` (`645DE5C7…AA76`), `apu_hybrid_canonical` (`163F65E2…7708`) and `apu_nes_wavetable` (`A4012158…90CC`) were reproduced byte for byte by all three generator builds, and `Legacy`/`Nes` do not reach the changed path at all. Verified on 2026-10-28.
+The cost pass that followed it is **not** bit-exact, and only one row moved. `Hybrid`'s SAW crossfade was narrowed from the whole octave to the top 1/8 of each mipmap band (the neighbour table only removes the step at the boundary, and table `L` is alias-free everywhere in its band), and the level plus the window are now resolved once per voice per block instead of once per sample. Measured against the previous tree with the same generator: `apu_hybrid_wavetable` moved on 16 917 of 22 050 samples (max |Î”| 1 088 LSB, peak 9 965 â†’ 10 351, RMS âˆ’0.060 dB) and was regenerated, which is the hash above. The other five rows are unchanged â€” `apu_mirror_canonical` (`7FF568A5â€¦5DE9`), `apu_integer_core_canonical` (`F59501D6â€¦3902D`), `apu_nes_canonical` (`645DE5C7â€¦AA76`), `apu_hybrid_canonical` (`163F65E2â€¦7708`) and `apu_nes_wavetable` (`A4012158â€¦90CC`) were reproduced byte for byte by all three generator builds, and `Legacy`/`Nes` do not reach the changed path at all. Verified on 2026-10-28.
 
 **The level trim: two attempts, and the metric was the bug.** `Nes` and `Hybrid` carry a fixed Q15 gain applied after the chain and before the master bitcrush, so a profile switch is a change of character and not of loudness. Getting the amount right took a listening check, and the first answer was wrong in a way worth keeping in the record.
 
-*The rule, stated so it can be argued with:* **crest-weighted loudness `W = 0.75 × RMS dBFS + 0.25 × peak dBFS`, matched to the integer `Legacy` anchor.** It is a documented heuristic, not a standard. It exists because equal RMS is only a proxy for equal loudness when the crest factors are comparable, and here they are not: `Legacy`'s crest factor on the canonical track is **4.6 dB** against **13.3 dB** (`Nes`) and **14.3 dB** (`Hybrid`). Matching RMS therefore lifts every transient by 3–4 dB, which the ear reads as more power.
+*The rule, stated so it can be argued with:* **crest-weighted loudness `W = 0.75 Ã— RMS dBFS + 0.25 Ã— peak dBFS`, matched to the integer `Legacy` anchor.** It is a documented heuristic, not a standard. It exists because equal RMS is only a proxy for equal loudness when the crest factors are comparable, and here they are not: `Legacy`'s crest factor on the canonical track is **4.6 dB** against **13.3 dB** (`Nes`) and **14.3 dB** (`Hybrid`). Matching RMS therefore lifts every transient by 3â€“4 dB, which the ear reads as more power.
 
-*The first attempt, and why it was walked back.* The trim initially matched raw RMS: **+3.28 dB** (`Nes`) and **+4.31 dB** (`Hybrid`), landing both at −19.70 dBFS against `Legacy`'s −19.70. It measured perfect and it was wrong: on hardware the user reported the two profiles as **louder and clearer than `Legacy` in every sample**. The predicted crest-factor problem is what the ear heard. A trim that matches RMS can only be rejected by listening, because the metric itself says it passed — which is exactly why the metric was changed to `W` and why `test_apu_profile_level` now asserts the weighted figure, prints RMS/peak/crest beside it, and separately forbids RMS from rising above `Legacy`'s (the property the ear rejected).
+*The first attempt, and why it was walked back.* The trim initially matched raw RMS: **+3.28 dB** (`Nes`) and **+4.31 dB** (`Hybrid`), landing both at âˆ’19.70 dBFS against `Legacy`'s âˆ’19.70. It measured perfect and it was wrong: on hardware the user reported the two profiles as **louder and clearer than `Legacy` in every sample**. The predicted crest-factor problem is what the ear heard. A trim that matches RMS can only be rejected by listening, because the metric itself says it passed â€” which is exactly why the metric was changed to `W` and why `test_apu_profile_level` now asserts the weighted figure, prints RMS/peak/crest beside it, and separately forbids RMS from rising above `Legacy`'s (the property the ear rejected).
 
-*What ships.* **+1.10 dB** (`Nes`, 37192/32768) and **+1.90 dB** (`Hybrid`, 40780/32768), resolved on configuration change with the chain's activation. Measured on the canonical track: `Nes` `W` −18.554 against `Legacy` −18.549 (**−0.005 dB**), `Hybrid` −18.528 (**+0.021 dB**), with RMS deliberately **2.18 / 2.41 dB below** `Legacy` — between the un-trimmed state (−3.28 / −4.31 below) and the rejected equal-RMS state, which is the intended landing zone. Regenerated with `apu_golden_gen`, then reproduced byte for byte by all three generator builds:
+*What ships.* **+1.10 dB** (`Nes`, 37192/32768) and **+1.90 dB** (`Hybrid`, 40780/32768), resolved on configuration change with the chain's activation. Measured on the canonical track: `Nes` `W` âˆ’18.554 against `Legacy` âˆ’18.549 (**âˆ’0.005 dB**), `Hybrid` âˆ’18.528 (**+0.021 dB**), with RMS deliberately **2.18 / 2.41 dB below** `Legacy` â€” between the un-trimmed state (âˆ’3.28 / âˆ’4.31 below) and the rejected equal-RMS state, which is the intended landing zone. Regenerated with `apu_golden_gen`, then reproduced byte for byte by all three generator builds:
 
 | Fixture | un-trimmed RMS / peak | first attempt (RMS-matched, rejected) | **final (crest-weighted)** |
 |---|---|---|---|
-| `apu_nes_canonical` | −22.980 / 10 758 | −19.704 / 15 688 | **−21.881 / 12 210** |
-| `apu_hybrid_canonical` | −24.008 / 10 744 | −19.693 / 17 657 | **−22.109 / 13 370** |
-| `apu_nes_wavetable` | −22.106 / 12 373 | −18.830 / 18 043 | **−21.007 / 14 043** |
-| `apu_hybrid_wavetable` | −22.994 / 10 351 | −18.679 / 17 011 | **−21.095 / 12 881** |
+| `apu_nes_canonical` | âˆ’22.980 / 10 758 | âˆ’19.704 / 15 688 | **âˆ’21.881 / 12 210** |
+| `apu_hybrid_canonical` | âˆ’24.008 / 10 744 | âˆ’19.693 / 17 657 | **âˆ’22.109 / 13 370** |
+| `apu_nes_wavetable` | âˆ’22.106 / 12 373 | âˆ’18.830 / 18 043 | **âˆ’21.007 / 14 043** |
+| `apu_hybrid_wavetable` | âˆ’22.994 / 10 351 | âˆ’18.679 / 17 011 | **âˆ’21.095 / 12 881** |
 
-Both `Legacy` rows are untouched through both attempts — `apu_mirror_canonical` stays `7FF568A5…5DE9` and `apu_integer_core_canonical` stays `F59501D6…3902D` — which is the byte-level proof that the multiply is unreachable from the frozen path: the trim is applied on the chain branch of the render path only, and `Legacy` never takes it. `test_apu_profile_level` pins the relationship instead of the bytes: it renders the canonical track under all three profiles and requires each profile's crest-weighted loudness within **±0.5 dB** of `Legacy`, plus RMS not above `Legacy` by more than 0.5 dB, with every peak strictly below the int16 rail. Verified on 2026-10-28.
+Both `Legacy` rows are untouched through both attempts â€” `apu_mirror_canonical` stays `7FF568A5â€¦5DE9` and `apu_integer_core_canonical` stays `F59501D6â€¦3902D` â€” which is the byte-level proof that the multiply is unreachable from the frozen path: the trim is applied on the chain branch of the render path only, and `Legacy` never takes it. `test_apu_profile_level` pins the relationship instead of the bytes: it renders the canonical track under all three profiles and requires each profile's crest-weighted loudness within **Â±0.5 dB** of `Legacy`, plus RMS not above `Legacy` by more than 0.5 dB, with every peak strictly below the int16 rail. Verified on 2026-10-28.
 
-**Headroom consequence.** On the canonical track the final peaks are **12 210** (`Nes`, 37 % of full scale) and **13 370** (`Hybrid`, 41 %), against `Legacy`'s 5 758 (18 %). On the listening demo's `complex` piece the un-trimmed peaks were 11 763 / 14 946 / 13 356 (`Legacy` / `Nes` / `Hybrid`), so with the final trims `Nes` and `Hybrid` land near **16 960** and **16 620** — about half full scale, against `Legacy`'s 11 763 (36 %). Nothing clips, and the equal-RMS attempt's ~21 800 / ~21 950 (two thirds of full scale) is gone. There is still less room than `Legacy` leaves, so a dense mix has to be checked at the master level rather than assumed safe.
+**Headroom consequence.** On the canonical track the final peaks are **12 210** (`Nes`, 37 % of full scale) and **13 370** (`Hybrid`, 41 %), against `Legacy`'s 5 758 (18 %). On the listening demo's `complex` piece the un-trimmed peaks were 11 763 / 14 946 / 13 356 (`Legacy` / `Nes` / `Hybrid`), so with the final trims `Nes` and `Hybrid` land near **16 960** and **16 620** â€” about half full scale, against `Legacy`'s 11 763 (36 %). Nothing clips, and the equal-RMS attempt's ~21 800 / ~21 950 (two thirds of full scale) is gone. There is still less room than `Legacy` leaves, so a dense mix has to be checked at the master level rather than assumed safe.
 
 ### 9.3 CPU baseline, host
 
-8 cells of `{Legacy, Nes} × {22 050, 32 000} × {1, 8 voices}`, 100 discarded blocks of 512 samples followed by 1 000 measured ones per cell. `python tools/apu_bench/run.py`, g++ 16.2.0 (MSYS2, `x86_64-w64-mingw32`), `-std=c++17 -Os -I include`, `Windows-10-10.0.19044-SP0`.
+8 cells of `{Legacy, Nes} Ã— {22 050, 32 000} Ã— {1, 8 voices}`, 100 discarded blocks of 512 samples followed by 1 000 measured ones per cell. `python tools/apu_bench/run.py`, g++ 16.2.0 (MSYS2, `x86_64-w64-mingw32`), `-std=c++17 -Os -I include`, `Windows-10-10.0.19044-SP0`.
 
-| Profile | Rate (Hz) | Voices | p50 (µs) | p99 (µs) | µs / sample |
+| Profile | Rate (Hz) | Voices | p50 (Âµs) | p99 (Âµs) | Âµs / sample |
 |---|---|---|---|---|---|
 | Legacy | 22050 | 1 | 16.400 | 29.500 | 0.032 |
 | Legacy | 22050 | 8 | 108.100 | 142.500 | 0.211 |
@@ -247,9 +247,9 @@ Both `Legacy` rows are untouched through both attempts — `apu_mirror_canonical
 | Nes | 32000 | 1 | 23.000 | 37.300 | 0.045 |
 | Nes | 32000 | 8 | 74.600 | 103.600 | 0.146 |
 
-**The comparable statistic is the p50. The p99 is host scheduling noise**, not a property of the core: over consecutive runs the p50 stayed within ±8.7 % in all eight cells, while the p99 moved by more than 10 % in three of them (up to +28.9 %) with no correlation to profile or rate — it is the block that lost the CPU to another process, and this host has no prioritised audio thread. Read the table for order of magnitude per core and per voice count; on a board the verdict is the underrun counter, not the p99.
+**The comparable statistic is the p50. The p99 is host scheduling noise**, not a property of the core: over consecutive runs the p50 stayed within Â±8.7 % in all eight cells, while the p99 moved by more than 10 % in three of them (up to +28.9 %) with no correlation to profile or rate â€” it is the block that lost the CPU to another process, and this host has no prioritised audio thread. Read the table for order of magnitude per core and per voice count; on a board the verdict is the underrun counter, not the p99.
 
-Two consequences worth knowing: at 8 voices the integer core is **cheaper** than the float one (1.445× at 22 050 Hz, 1.563× at 32 000 Hz), and at 1 voice it is **more expensive** (23.100 vs 16.400 µs at 22 050 Hz) because it pays a fixed per-sample cost that only amortises with voices. That is consistent with `Legacy` remaining the default profile: the integer core buys aggregate CPU, not single-voice CPU.
+Two consequences worth knowing: at 8 voices the integer core is **cheaper** than the float one (1.445Ã— at 22 050 Hz, 1.563Ã— at 32 000 Hz), and at 1 voice it is **more expensive** (23.100 vs 16.400 Âµs at 22 050 Hz) because it pays a fixed per-sample cost that only amortises with voices. That is consistent with `Legacy` remaining the default profile: the integer core buys aggregate CPU, not single-voice CPU.
 
 ### 9.4 `sizeof` (measured)
 
@@ -262,13 +262,13 @@ sizeof(InstrumentPreset) =    72 B
 queue budget             = 64 x 144 B = 9216 B
 ```
 
-The host figures were re-measured on 2026-10-28 after E2. E1's per-voice character state took `AudioChannel` from 328 to 336 B (+64 B on `ApuCore` over the pre-E1 13 200 / 13 224 B), and E2/S1 added the `Nes`/`Hybrid` output filter chain state: **+80 B** on both builds (two high-pass poles, five Butterworth coefficients in Q15 `int32_t` because the LPF's `b1` does not fit `int16`, eight recursion registers, the resolved corners and three flags), landing at 13 344 / 13 368 B. `AudioCommand` stayed at 144 B (see §5). The E2 cost pass (int32 products, truncating shifts, `float` coefficient derivation) changed no member, so these figures and the pin below are unchanged. The two host figures are pinned by `static_assert(sizeof(ApuCore) <= 13376, ...)` in `test_apu_core`: the test compiles with `UNIT_TEST=1`, so it asserts the 13 368 B test-build size rounded up to the next multiple of 16, and the production figure is recorded in the message next to it. The 32-bit target figure recorded before E1 was **9 800 B** (`gCoreStorage`, 0x2648, in the firmware maps of `tools/apu_bench_firmware` for `esp32dev`, `esp32-c3-devkitm-1` and `esp32-s3-devkitc-1`, identical on the three because the ABI is the same width); E1's channel growth changes it by the same 8 B per channel and E2 adds the same 80 B, so it is **not restated as current here** — the firmware bench run prints it and it is recorded with §9.5's numbers.
+The host figures were re-measured on 2026-10-28 after E2. E1's per-voice character state took `AudioChannel` from 328 to 336 B (+64 B on `ApuCore` over the pre-E1 13 200 / 13 224 B), and E2/S1 added the `Nes`/`Hybrid` output filter chain state: **+80 B** on both builds (two high-pass poles, five Butterworth coefficients in Q15 `int32_t` because the LPF's `b1` does not fit `int16`, eight recursion registers, the resolved corners and three flags), landing at 13 344 / 13 368 B. `AudioCommand` stayed at 144 B (see Â§5). The E2 cost pass (int32 products, truncating shifts, `float` coefficient derivation) changed no member, so these figures and the pin below are unchanged. The two host figures are pinned by `static_assert(sizeof(ApuCore) <= 13376, ...)` in `test_apu_core`: the test compiles with `UNIT_TEST=1`, so it asserts the 13 368 B test-build size rounded up to the next multiple of 16, and the production figure is recorded in the message next to it. The 32-bit target figure recorded before E1 was **9 800 B** (`gCoreStorage`, 0x2648, in the firmware maps of `tools/apu_bench_firmware` for `esp32dev`, `esp32-c3-devkitm-1` and `esp32-s3-devkitc-1`, identical on the three because the ABI is the same width); E1's channel growth changes it by the same 8 B per channel and E2 adds the same 80 B, so it is **not restated as current here** â€” the firmware bench run prints it and it is recorded with Â§9.5's numbers.
 
 ### 9.5 CPU and underrun baseline, firmware
 
 Measured on 2026-10-28 with `tools/apu_bench_firmware`: `ESP32-D0WD-V3` rev 3 over `COM4` (240 MHz, `fpu=1 legacy_float=1`, 512-sample block) and `ESP32-C3` rev 4 over `COM5` (160 MHz, `fpu=0 legacy_float=0`, 512-sample block); 100 warm-up + 1000 measured blocks per cell. An unmeasured cell stays `pendiente`; it is never filled with an estimate.
 
-| Board | Profile | 22 050 Hz, 1 / 8 voices (p50 µs) | 32 000 Hz, 1 / 8 voices (p50 µs) | Headroom at 8 voices | Underruns, 10 min |
+| Board | Profile | 22 050 Hz, 1 / 8 voices (p50 Âµs) | 32 000 Hz, 1 / 8 voices (p50 Âµs) | Headroom at 8 voices | Underruns, 10 min |
 |---|---|---|---|---|---|
 | `esp32dev` | `Legacy` | 1 540 / 6 618 | 1 541 / 6 617 | 3.5x / 2.4x | **0** |
 | `esp32dev` | `Nes` | 1 451 / 5 589 | 1 452 / 5 590 | 4.1x / 2.8x | **0** |
@@ -279,7 +279,7 @@ What the table says:
 
 - The per-block cost is rate-invariant (6.6 ms for 512 samples at either rate), as it must be: what changes with the rate is the budget (23.2 ms vs 16 ms) and therefore the headroom.
 - On silicon the integer core is **1.18x faster** than the float body at 8 voices and **1.06x faster** at 1 voice. The host ratio (1.44-1.56x at 8 voices, and the integer path *slower* at 1 voice) does not transfer: the ESP32's single-precision FPU is not the bottleneck people assume.
-- 32 000 Hz with 8 voices leaves **2.4x** (`Legacy`) / **2.8x** (`Nes`): viable, and the tightest configuration in the matrix — which is why 22 050 Hz stayed the default.
+- 32 000 Hz with 8 voices leaves **2.4x** (`Legacy`) / **2.8x** (`Nes`): viable, and the tightest configuration in the matrix â€” which is why 22 050 Hz stayed the default.
 - **Underruns: 0 in ten minutes at both rates, on both boards.** Measured with `tools/apu_underrun_probe` (engine repository), which drives the real I2S backend with the same eight-voice recipe and each board's own block size: `esp32dev` on BCLK 26 / LRCK 25 / DOUT 22 with 512-sample blocks, `esp32-c3-devkitm-1` on BCLK 4 / LRCK 5 / DOUT 6 with 1024 (the no-FPU default). Worst whole iteration: 23 221 us at 22 050 Hz (budget 23 220) and 15 995 us at 32 000 (budget 16 000) on the ESP32; 46 438 and 31 996 us on the C3 (budgets 46 440 and 32 000). The write wait is the figure that decides an underrun: with a one-block ring a healthy write blocks for most of the period, so a starving producer shows up as a write that barely waits, not as a slow iteration. Measured write waits: 17 269 / 13 586 us on the ESP32 and 44 013 / 29 643 us on the C3.
 - **The render cost is measured, not inferred.** `getWorstRenderUs()` times `generateSamples()` per iteration and keeps its own maximum. `worstBlockUs - worstWriteUs` is *not* a render cost: those are two independent maxima and need not come from the same block, so their difference can be off by multiples. Measured inside the gate: 7 195 us per 512 samples at 22 050 Hz and 6 813 at 32 000 on the ESP32 (14.1 / 13.3 us per sample); 13 969 per 1024 and 13 972 on the C3 (13.6 us per sample). Render alone leaves 3.2x / 2.3x headroom on the ESP32 and 3.3x / 2.3x on the C3, inside the same run that counted the underruns.
 - **A gate over silence is not a gate.** The harness reports `peak=` (the largest absolute sample the mix produced), a `# core` line with the transport state and the dropped-command count, and aborts when the backend never iterated. All four runs reported `music=1`, `dropped=0` and a non-zero `peak`: 17 655 / 17 997 (ESP32) and 17 614 / 17 849 (C3). The counters alone cannot tell a healthy gate from a dead backend, and an earlier version of this harness reported `underruns=0` over digital silence because of exactly that.
@@ -287,7 +287,7 @@ What the table says:
 - **The tightest cell in the matrix is the C3 at 32 000 Hz with eight voices: 2.1x headroom, p99 at 48.3 % of the block** (7 724 of 16 000 us). It passes the rule in S12 (p99 must stay under half the block for a target to keep 32 kHz), which is exactly why 22 050 Hz stayed the default.
 - The I2S gate is a separate harness on purpose: this bench renders into RAM and never touches a peripheral, so it cannot count underruns. It now runs on both boards at their own block size and both rates; `esp32-s3-devkitc-1` remains `pendiente` for both the CPU table and the gate. An S3 board was attached on 2026-10-28 and could not be read: its UART bridge does not enumerate on this machine (`Device Descriptor Request Failed`) and the application prints nothing on the native USB port, so the measurements were not taken. `tools/apu_bench_firmware/platformio.ini` records the attempts.
 
-The target `sizeof` printed by that bench is not `pendiente`: `sizeof_apu_core=9864`, `sizeof_audio_command=96`, `sizeof_audio_channel=304`, `sizeof_instrument_preset=72`, `queue_bytes=6144` on the 32-bit ABI, all consistent with §9.4. The C3 prints both render macros so the body it runs is visible rather than assumed.
+The target `sizeof` printed by that bench is not `pendiente`: `sizeof_apu_core=9864`, `sizeof_audio_command=96`, `sizeof_audio_channel=304`, `sizeof_instrument_preset=72`, `queue_bytes=6144` on the 32-bit ABI, all consistent with Â§9.4. The C3 prints both render macros so the body it runs is visible rather than assumed.
 
 ### 9.6 CPU cost of the E1 character
 
@@ -295,9 +295,9 @@ E1 gives `Nes` and `Hybrid` their audible character (exponential envelope curve,
 
 | Board | Profile | E0 | E1 | Delta | Budget |
 |---|---|---|---|---|---|
-| `esp32dev` (240 MHz) | `Legacy` | 6 618 | 6 620 | +0.03 % | — (float body, untouched) |
+| `esp32dev` (240 MHz) | `Legacy` | 6 618 | 6 620 | +0.03 % | â€” (float body, untouched) |
 | `esp32dev` | `Nes` | 5 589 | 5 631 | **+0.75 %** | <= +4 % |
-| `esp32-c3-devkitm-1` (160 MHz) | `Legacy` | 7 546 | 7 682 | +1.80 % | — |
+| `esp32-c3-devkitm-1` (160 MHz) | `Legacy` | 7 546 | 7 682 | +1.80 % | â€” |
 | `esp32-c3-devkitm-1` | `Nes` | 7 546 | 7 693 | **+1.95 %** | <= +6 % |
 
 The first version of this table **failed the budget**: +12.5 % on the ESP32 and +9.5 % on the C3, with `Legacy` itself +5.6 % on the C3 although its waveform had not changed. The cause was the weighted mixer's three per-sample group buckets, which ran for every profile; folding the per-block-constant weight into the per-voice Q15 gain removed them. The failed figure is kept here because it is the one that shows the budget is a gate and not a formality.
@@ -306,20 +306,20 @@ The tightest cell is still the C3 at 32 000 Hz with eight voices: p99 7 723 us =
 
 ### 9.7 CPU and flash cost of E2
 
-E2 gives `Nes` and `Hybrid` the NES output stage and gives `Hybrid` a band-limited SAW. Measured on the classic ESP32 with `tools/apu_bench_firmware`, p99 per 512-sample block, against a baseline tree rendered from the pre-E2 commit and flashed with the same instrument. The C3 rows are **not measured** — see the note at the end.
+E2 gives `Nes` and `Hybrid` the NES output stage and gives `Hybrid` a band-limited SAW. Measured on the classic ESP32 with `tools/apu_bench_firmware`, p99 per 512-sample block, against a baseline tree rendered from the pre-E2 commit and flashed with the same instrument. The C3 rows are **not measured** â€” see the note at the end.
 
 | Case (22 050 Hz) | before E2 | E2 | delta | Criterion |
 |---|---|---|---|---|
-| `Legacy` 8 voices | 6 668 | 6 662 | −0.1 % | must be flat |
+| `Legacy` 8 voices | 6 668 | 6 662 | âˆ’0.1 % | must be flat |
 | `Legacy` 1 voice | 1 555 | 1 562 | +0.5 % | must be flat |
-| `Nes` 8 voices | 5 687 | 5 977 | **+5.10 %** | <= +6 % → **passes** |
+| `Nes` 8 voices | 5 687 | 5 977 | **+5.10 %** | <= +6 % â†’ **passes** |
 | `Nes` 1 voice | 1 471 | 1 692 | +15.0 % | no criterion |
-| `Hybrid` 8 voices | 5 686 | 6 083 | **+6.98 %** | <= +6 % → **fails** |
+| `Hybrid` 8 voices | 5 686 | 6 083 | **+6.98 %** | <= +6 % â†’ **fails** |
 | `Hybrid` 1 voice | 1 471 | 1 692 | +15.0 % | no criterion |
 
 `Legacy` is flat, which is the independent confirmation of its byte-identical fixtures: the frozen path did not change. The eight-voice figures are the ones that matter for a game; the single-voice penalty is the output chain's fixed per-sample cost, which a single voice does not amortise, and it is 7.2 % of the block in absolute terms.
 
-**The level trim costs one multiply and the clamp the loop already performs.** The Q15 profile gain (`kProfileTrimNesQ15` = 37192 for +1.10 dB, `kProfileTrimHybridQ15` = 40780 for +1.90 dB) is resolved with the chain's activation — on `init`, `setSoundProfile` and `setHpfCutoffHz`, never per sample and never per block — and applied on the chain-active branch only, as `int32_t trim * sample` rescaled by the same truncating shift as the rest of the stage and saturated by the clamp the loop already performs (`32767 × 40780 = 1 336 238 260`, inside `int32_t`). It costs no RAM: the four-byte member fitted existing padding, so `sizeof(ApuCore)` stays at §9.4's **13 344 B** (13 368 B with `UNIT_TEST`). `Legacy` never enters the chain branch, so its per-sample work is unchanged and both of its fixtures stayed byte-identical (§9.2). **No CPU number is claimed for the trim**: it must be re-measured on the board like every row above, and §9.3's host baseline predates the change. The level it produces — and the rejected first attempt, which matched raw RMS and sounded louder than `Legacy` — is recorded in §9.2. Measured flash on `esp32dev`: **301 237 B**, the same as the walked-back equal-RMS trim because the constants are the same width.
+**The level trim costs one multiply and the clamp the loop already performs.** The Q15 profile gain (`kProfileTrimNesQ15` = 37192 for +1.10 dB, `kProfileTrimHybridQ15` = 40780 for +1.90 dB) is resolved with the chain's activation â€” on `init`, `setSoundProfile` and `setHpfCutoffHz`, never per sample and never per block â€” and applied on the chain-active branch only, as `int32_t trim * sample` rescaled by the same truncating shift as the rest of the stage and saturated by the clamp the loop already performs (`32767 Ã— 40780 = 1 336 238 260`, inside `int32_t`). It costs no RAM: the four-byte member fitted existing padding, so `sizeof(ApuCore)` stays at Â§9.4's **13 344 B** (13 368 B with `UNIT_TEST`). `Legacy` never enters the chain branch, so its per-sample work is unchanged and both of its fixtures stayed byte-identical (Â§9.2). **No CPU number is claimed for the trim**: it must be re-measured on the board like every row above, and Â§9.3's host baseline predates the change. The level it produces â€” and the rejected first attempt, which matched raw RMS and sounded louder than `Legacy` â€” is recorded in Â§9.2. Measured flash on `esp32dev`: **301 237 B**, the same as the walked-back equal-RMS trim because the constants are the same width.
 
 `Hybrid` is the only profile that pays for both changes, and it misses the budget by 0.98 points: 6 083 us against a 6 027 us target. The series that got it there is worth recording, because each step was measured rather than estimated:
 
@@ -333,7 +333,7 @@ E2 gives `Nes` and `Hybrid` the NES output stage and gives `Hybrid` a band-limit
 
 Two optimisations were attempted and rejected on measurement, and both would have looked fine on paper:
 
-- **Merging the two first-order high-passes into one second-order section** (`b = [1, -2, 1]`) is exact in real arithmetic and removes a whole section. On an int16 input the direct form differentiates the quantisation noise itself: **−1.736 dB at 20 Hz / 8 kHz and −45.1 / −65.1 / −65.9 dB** at the other rates. The cascade's intermediate state is what preserves the low band.
+- **Merging the two first-order high-passes into one second-order section** (`b = [1, -2, 1]`) is exact in real arithmetic and removes a whole section. On an int16 input the direct form differentiates the quantisation noise itself: **âˆ’1.736 dB at 20 Hz / 8 kHz and âˆ’45.1 / âˆ’65.1 / âˆ’65.9 dB** at the other rates. The cascade's intermediate state is what preserves the low band.
 - **Freezing the mipmap crossfade weight per block** is cheaper and would step the timbre once per block; because `apu_golden_gen` renders in 4410/5292-sample blocks, the committed wavetable scene would have carried a hard-switch seam at every band crossing.
 
 Quality cost of the last optimisation, stated because it is real: the S5 alias margin falls from **18.52 dB to 13.71 dB** worst case (at 64.60 Hz / 22 050 Hz) when the crossfade window narrows from the whole octave to its top eighth. It still clears the 10 dB criterion at all 22 measured points, and the seam residue at a boundary is 569 Q15 against the 7 279 a hard switch would produce.
@@ -342,12 +342,34 @@ Flash, same firmware, `firmware.bin`/`Flash:` on `esp32dev`:
 
 | Tree | flash used | delta over pre-E2 |
 |---|---|---|
-| pre-E2 baseline | 292 545 B | — |
+| pre-E2 baseline | 292 545 B | â€” |
 | first implementation | 303 681 B | +11 136 B |
 | float derivation, int32 products | 300 713 B | +8 168 B |
 | after the two remaining passes | 301 169 B | +8 624 B (budget 8 704 B) |
 | per-profile level trim | **301 237 B** | **+8 692 B** (budget 8 704 B) |
 
-The budget is met **with 12 B to spare**, which is a warning rather than an achievement, and the audit's ~150 B estimate for the filter stage was wrong by more than an order of magnitude — the table data is 4 096 B of that and the mipmap code ~192 B, so the filter and its coefficient derivation are ~4.3 KB.
+The budget is met **with 12 B to spare**, which is a warning rather than an achievement, and the audit's ~150 B estimate for the filter stage was wrong by more than an order of magnitude â€” the table data is 4 096 B of that and the mipmap code ~192 B, so the filter and its coefficient derivation are ~4.3 KB.
 
-**The C3 rows are pending, and not because of E2.** After a verified flash and a hard reset, the application prints nothing on that board's native USB port (`303A:1001`), with `ARDUINO_USB_MODE=1` and with `=0`. A five-line probe sketch that only calls `Serial.printf` in `loop()` is equally silent, so the channel is the defect, not this library. The C3 has no second console on this unit. This is the same class of failure already recorded for `esp32-s3-devkitc-1` in §9.5, and it means the E2 cost is measured on one board only — a Tier A target, which is the one the audit's S12 rule is tightest on, was not confirmed.
+### 9.8 CPU cost of E2 on the C3, and the 32 kHz rule
+
+The C3 rows were blocked, and the block was procedural rather than a channel defect. Its DevKitM-1 reaches the chip through two USB ports: the **UART** port carries the auto-reset bridge (`RTS` to `EN`, `DTR` to `IO0`), and the **native** port goes straight to the chip with no reset line. A flash over the native port therefore leaves the board in the ROM bootloader, the application never runs, and every capture sees silence. The procedure is: flash, then `esptool --port COM5 --before no_reset --after watchdog_reset read_mac` to boot the application without an `EN` line, then attach. Windows asserts `DTR` on enumeration, so a capture that opens late loses the first cell; the matrix was measured with that cell duplicated at the end, so every row came from a capture that saw it.
+
+Same instrument, same matrix, p99 per 512-sample block, against the pre-E2 tree:
+
+| Case | before E2 | E2 | delta |
+|---|---|---|---|
+| `Legacy` 22 050 / 1 | 2 342 | 2 372 | +1.28 % |
+| `Legacy` 22 050 / 8 | 7 620 | 7 790 | **+2.23 %** |
+| `Legacy` 32 000 / 1 | 2 342 | 2 372 | +1.28 % |
+| `Legacy` 32 000 / 8 | 7 619 | 7 790 | **+2.24 %** |
+| `Nes` 22 050 / 1 | 2 346 | 2 580 | +9.97 % |
+| `Nes` 22 050 / 8 | 7 623 | 8 020 | **+5.21 %** |
+| `Nes` 32 000 / 8 | 7 626 | 8 020 | **+5.17 %** |
+| `Hybrid` 22 050 / 8 | 7 623 | 8 145 | **+6.85 %** |
+| `Hybrid` 32 000 / 8 | 7 625 | 8 145 | **+6.82 %** |
+
+The C3 confirms the ESP32 on the two numbers that matter: `Nes` inside the budget at **+5.21 %**, `Hybrid` outside it at **+6.85 %** — the same ~0.85-point miss, from a different instruction set, clock and libm. A criterion that lands within 0.15 points of itself on two architectures is measuring the design, not the compiler.
+
+**`Legacy` is not flat here, and the reason matters.** On a target without an FPU, `Legacy` renders through the integer core — the one E2 rewrote. Its output is still byte-identical (`F59501D6…3902D`), but the shared loop grew by the inlined output stage and pays **+2.2 %**. That is the cost of keeping one core on every platform, recorded rather than excused: the `Legacy` row in §9.7 is flat only because that board has an FPU and never enters this code.
+
+**The 32 kHz rule now fails on this board.** §9.5 and S12 require p99 to stay under half the block for a target to keep 32 000 Hz. At 32 000 Hz with eight voices the C3 measures **8 145 us of 16 000 = 50.9 %** for `Hybrid` and **8 020 = 50.1 %** for `Nes`, against 48.3 % before E2. So at this rate the profiles cross the line the rule draws, while the default 22 050 Hz stays at 42.0 % / 42.9 %. The rule is what decides which rate a target may offer, so the honest consequence is: **on the C3, 32 000 Hz carries `Nes`/`Hybrid` at the edge of its own rule and should be treated as 22 050-Hz-only for those profiles**, or the rate dropped on that target. That is a release decision, not something to round down to 48 %.

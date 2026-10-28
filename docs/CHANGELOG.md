@@ -150,15 +150,22 @@ first.
     (`apu_{nes,hybrid}_wavetable_s16le_44100.pcm`) pin the `Hybrid` SAW end to
     end, because the canonical track is PULSE-only and would not have seen it:
     a 220 → 900 Hz glide crosses two band edges inside a single note.
-  - **Measured cost, classic ESP32, p99 per 512-sample block at 22 050 Hz.**
-    `Legacy` flat (−0.1 %), `Nes` 8 voices **+5.10 %**, `Hybrid` 8 voices
-    **+6.98 %** — the profile that carries both changes misses the +6 % budget by
-    one point at 26 % of the block, and the level trim is what pushed it there. Flash **+8 692 B** of the 8 704 B allowance: 12 B of margin, which is a warning rather than an achievement.
-    The C3 was not measurable: its native USB port delivers no application
-    output with either core USB mode, and a five-line probe sketch is equally
-    silent, so this is a tooling limit and not this change. `docs/ABI.md` §9.7
-    carries the full table, the two optimisations that were measured and
-    rejected, and what the last one cost in alias margin (18.52 → 13.71 dB).
+  - **Measured cost, both boards, p99 per 512-sample block at 22 050 Hz.**
+    Classic ESP32: `Legacy` flat (−0.1 %), `Nes` 8 voices **+5.10 %**, `Hybrid`
+    8 voices **+6.98 %** — the profile that carries both changes misses the
+    +6 % budget by one point at 26 % of the block, and the level trim is what
+    pushed it there. Flash **+8 692 B** of the 8 704 B allowance: 12 B of
+    margin, which is a warning rather than an achievement. C3: `Nes`
+    **+5.21 %**, `Hybrid` **+6.85 %** — the same miss within 0.15 points, from a
+    different instruction set and clock — and `Legacy` is **+2.2 %** there,
+    because a board without an FPU renders `Legacy` through the integer core
+    this phase rewrote. On the C3 at 32 000 Hz with eight voices the profiles
+    now measure 50.1 % (`Nes`) and 50.9 % (`Hybrid`) of the block against the
+    half-block rule that decides whether a target keeps 32 kHz: that rate should
+    be treated as 22 050-Hz-only for those profiles on that board.
+    `docs/ABI.md` §9.7 and §9.8 carry the tables, the procedure needed to reach
+    the C3 at all, the two optimisations that were measured and rejected, and
+    what the last one cost in alias margin (18.52 → 13.71 dB).
 - **Tools**: `tools/mipmap_gen` generates and verifies the SAW tables
   (`python tools/mipmap_gen/generate.py --write|--check`); `tools/golden_gen`
   gained `--scene <canonical|wavetable>`, defaulting to `canonical`, so every
