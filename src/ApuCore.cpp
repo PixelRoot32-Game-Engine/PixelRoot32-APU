@@ -3614,12 +3614,20 @@ namespace pixelroot32::audio {
             // mode this is a per-slot setting, so it survives new notes.
             //
             // E3/A1: unless THIS note asked for its own period
-            // (`NoisePeriodMode::Note`). The note's request is resolved below
-            // by `applyProfileCharacter`, but the period has to be chosen here,
+            // (`NoisePeriodMode::Note`). The request is resolved below by
+            // `applyProfileCharacter`, but the period has to be chosen here,
             // before the selector can win, or the opt-in would arrive too late
             // to change what the note sounds like.
-            if (ch->nesNoiseLutIndex < 16u &&
-                note_noise_mode != NoisePeriodMode::Note) {
+            //
+            // A voice that pinned the selector (`setVoiceNesNoiseLutMode`,
+            // `nesNoiseLutOverridden`) outranks the note, exactly as that pin
+            // already outranks an animated duty. Both readers must agree on
+            // that, or the voice would render the note's period while
+            // `getVoiceNesOptions` kept reporting the pinned index.
+            const bool notePinsPeriod =
+                (note_noise_mode == NoisePeriodMode::Note) &&
+                !ch->nesNoiseLutOverridden;
+            if (ch->nesNoiseLutIndex < 16u && !notePinsPeriod) {
                 period = nes_apu::nesNoisePeriodToSamples(ch->nesNoiseLutIndex,
                                                           sampleRate);
             }
