@@ -7204,7 +7204,8 @@ struct DutyProbe {
  * @param out Probe result.
  */
 static void probeDutyVoice(SoundProfile profile, WaveType type, float duty,
-                           int pinIndex, DutyProbe& out) {
+                           int pinIndex, DutyProbe& out,
+                           PulseDutyMode noteMode = PulseDutyMode::ProfileDefault) {
     ApuCore apu;
     configureMixerProbe(apu, profile);
     const int slot = ApuCore::SFX_VOICE_BASE;
@@ -7214,6 +7215,7 @@ static void probeDutyVoice(SoundProfile profile, WaveType type, float duty,
 
     InstrumentPreset preset = mixerProbePreset();
     preset.duty = duty;
+    preset.pulseDutyMode = noteMode;
 
     AudioCommand cmd{};
     cmd.type = AudioCommandType::PLAY_EVENT;
@@ -7549,6 +7551,190 @@ void duty_legacy_profile_keeps_continuous_duty(void) {
 }
 
 // =============================================================================
+// A1 / A2 (S1-S4): the note pins its own NOISE period and continuous PULSE duty
+// =============================================================================
+
+// S1 / S5: both requests are appended AFTER `envelopeCurve`, and their zero
+// value means "the profile decides". The literal below is the same 17-value
+// positional one the published ABI case uses, so a regression in the append
+// order shows up here as a rebound field instead of a silent timbre change.
+void note_character_modes_are_appended_and_zero(void) {
+    TEST_ASSERT_EQUAL_UINT8(0, (uint8_t)NoisePeriodMode::ProfileDefault);
+    TEST_ASSERT_EQUAL_UINT8(0, (uint8_t)PulseDutyMode::ProfileDefault);
+
+    constexpr InstrumentPreset positional{
+        0.8f, 0.5f, 4, 0.25f, 7,
+        0.01f, 0.02f, 0.75f, 0.03f,
+        LfoTarget::VOLUME, 6.0f, 0.4f, 0.05f,
+        true, 0.125f, 880.0f, 1.5f
+    };
+    TEST_ASSERT_EQUAL_INT((int)NoisePeriodMode::ProfileDefault,
+                          (int)positional.noisePeriodMode);
+    TEST_ASSERT_EQUAL_INT((int)PulseDutyMode::ProfileDefault,
+                          (int)positional.pulseDutyMode);
+    TEST_ASSERT_EQUAL_INT((int)NoisePeriodMode::ProfileDefault,
+                          (int)INSTR_KICK.noisePeriodMode);
+    TEST_ASSERT_EQUAL_INT((int)PulseDutyMode::ProfileDefault,
+                          (int)INSTR_PULSE_LEAD.pulseDutyMode);
+}
+
+// Dispatches one looping NOISE note from `preset`, with an explicit
+// `AudioEvent::noisePeriod` so the note's own period is unambiguous.
+static int playNoiseNoteWithPreset(ApuCore& apu, int16_t* scratch,
+                                   const InstrumentPreset& preset,
+                                   uint8_t noisePeriod) {
+    AudioCommand cmd{};
+    cmd.type = AudioCommandType::PLAY_EVENT;
+    cmd.event.type = WaveType::NOISE;
+    cmd.event.frequency = 1000.0f;
+    cmd.event.noisePeriod = noisePeriod;
+    cmd.event.duration = 0.0f;
+    cmd.event.volume = 0.5f;
+    cmd.event.loop = true;
+    cmd.event.preset = &preset;
+    TEST_ASSERT_TRUE(apu.submitCommand(cmd));
+
+    apu.generateSamples(scratch, 64);
+
+    for (int s = ApuCore::SFX_VOICE_BASE; s < ApuCore::MAX_VOICES; ++s) {
+        if (apu.isVoiceEnabledForTesting(s)) {
+            return s;
+        }
+    }
+    TEST_FAIL_MESSAGE("preset NOISE note did not land on an SFX slot");
+    return -1;
+}
+
+// S2: under a profile that arms the NES period LUT, a note that names its own
+// period keeps it. `INSTR_KICK` carries 60 samples — the "body" of the drum —
+// and the LUT would collapse it to 1 sample, i.e. white hiss.
+void noise_period_mode_note_keeps_the_authored_period_under_nes(void) {
+    ApuCore apu;
+    apu.init(44100);
+    apu.reset();
+    apu.setSoundProfile(SoundProfile::Nes);
+
+    InstrumentPreset preset = INSTR_KICK;
+    preset.noisePeriodMode = NoisePeriodMode::Note;
+
+    int16_t buffer[64] = {0};
+    const int slot = playNoiseNoteWithPreset(apu, buffer, preset, preset.noisePeriod);
+
+    TEST_ASSERT_EQUAL_UINT8_MESSAGE(255, apu.getVoiceNesNoiseLutIndexForTesting(slot),
+        "a note-pinned period must leave the selector off the LUT");
+    TEST_ASSERT_EQUAL_UINT32_MESSAGE(60u, apu.getVoiceNoisePeriodForTesting(slot),
+        "the kick's authored 60-sample period must survive the Nes profile");
+
+    // Guard the contrast: the LUT entry the profile would have armed is 1
+    // sample, so this assertion cannot pass by accident.
+    TEST_ASSERT_EQUAL_UINT32(1u, nes_apu::nesNoisePeriodToSamples(0, 44100));
+}
+
+// S2: the default keeps 2.1.0's behaviour exactly — the profile arms the LUT and
+// retunes the period away from the note's own value.
+void noise_period_mode_default_still_arms_the_nes_lut(void) {
+    ApuCore apu;
+    apu.init(44100);
+    apu.reset();
+    apu.setSoundProfile(SoundProfile::Nes);
+
+    InstrumentPreset preset = INSTR_KICK;  // noisePeriodMode left at the default
+
+    int16_t buffer[64] = {0};
+    const int slot = playNoiseNoteWithPreset(apu, buffer, preset, preset.noisePeriod);
+
+    TEST_ASSERT_EQUAL_UINT8(0, apu.getVoiceNesNoiseLutIndexForTesting(slot));
+    TEST_ASSERT_EQUAL_UINT32(nes_apu::nesNoisePeriodToSamples(0, 44100),
+                             apu.getVoiceNoisePeriodForTesting(slot));
+}
+
+// S2: the request belongs to the NOTE, not to the slot. The next note on the
+// same slot without the mode must go back to the profile's LUT.
+void noise_period_mode_note_does_not_leak_to_the_next_note(void) {
+    ApuCore apu;
+    apu.init(44100);
+    apu.reset();
+    apu.setSoundProfile(SoundProfile::Nes);
+
+    InstrumentPreset pinned = INSTR_KICK;
+    pinned.noisePeriodMode = NoisePeriodMode::Note;
+
+    int16_t buffer[64] = {0};
+    const int slot = playNoiseNoteWithPreset(apu, buffer, pinned, pinned.noisePeriod);
+    TEST_ASSERT_EQUAL_UINT8(255, apu.getVoiceNesNoiseLutIndexForTesting(slot));
+
+    AudioCommand stop{};
+    stop.type = AudioCommandType::STOP_CHANNEL;
+    stop.channelIndex = (uint8_t)slot;
+    TEST_ASSERT_TRUE(apu.submitCommand(stop));
+    apu.generateSamples(buffer, 64);
+
+    InstrumentPreset plain = INSTR_SNARE;  // profile default again
+    const int slot2 = playNoiseNoteWithPreset(apu, buffer, plain, plain.noisePeriod);
+
+    TEST_ASSERT_EQUAL_UINT8_MESSAGE(0, apu.getVoiceNesNoiseLutIndexForTesting(slot2),
+        "the note-level request must not survive into the next note");
+    TEST_ASSERT_EQUAL_UINT32(nes_apu::nesNoisePeriodToSamples(0, 44100),
+                             apu.getVoiceNoisePeriodForTesting(slot2));
+}
+
+// S3: under a NES-derived profile, a note that asks for continuous duty keeps
+// the `phaseQ32 < dutyCycleQ32` generator instead of a 4-step pattern.
+void pulse_duty_mode_continuous_keeps_the_generator_under_hybrid(void) {
+    DutyProbe continuous;
+    probeDutyVoice(SoundProfile::Hybrid, WaveType::PULSE, 0.3f, -1, continuous,
+                   PulseDutyMode::Continuous);
+    TEST_ASSERT_EQUAL_UINT8_MESSAGE(255, continuous.index,
+        "a continuous-duty note must resolve the 255 sentinel");
+
+    DutyProbe snapped;
+    probeDutyVoice(SoundProfile::Hybrid, WaveType::PULSE, 0.3f, -1, snapped);
+    TEST_ASSERT_EQUAL_UINT8_MESSAGE(1, snapped.index,
+        "the same note without the mode must snap to the 25 % step");
+    TEST_ASSERT_TRUE_MESSAGE(
+        std::memcmp(continuous.pcm, snapped.pcm, sizeof(continuous.pcm)) != 0,
+        "keeping the continuous 30 % duty must change the rendered bytes");
+}
+
+// S3: the default keeps 2.1.0's behaviour — the note is snapped to the nearest
+// NES step.
+void pulse_duty_mode_default_snaps_the_continuous_away(void) {
+    DutyProbe probe;
+    probeDutyVoice(SoundProfile::Nes, WaveType::PULSE, 0.2f, -1, probe);
+    TEST_ASSERT_EQUAL_UINT8(1, probe.index);  // 0.2 -> 25 % (past the 12.5/25 midpoint)
+}
+
+// S1: under `Legacy` both requests are inert — the profile already asks for the
+// continuous generator and the frequency-derived period, so the bytes cannot
+// move. This is the no-regression claim the frozen goldens rest on.
+void note_character_modes_are_inert_under_legacy(void) {
+    DutyProbe plain;
+    probeDutyVoice(SoundProfile::Legacy, WaveType::PULSE, 0.3f, -1, plain);
+    DutyProbe requested;
+    probeDutyVoice(SoundProfile::Legacy, WaveType::PULSE, 0.3f, -1, requested,
+                   PulseDutyMode::Continuous);
+
+    TEST_ASSERT_EQUAL_UINT8(255, plain.index);
+    TEST_ASSERT_EQUAL_UINT8(255, requested.index);
+    TEST_ASSERT_EQUAL_INT_MESSAGE(0, std::memcmp(plain.pcm, requested.pcm,
+                                                 sizeof(plain.pcm)),
+        "Legacy must render the same bytes with and without the duty request");
+
+    ApuCore apu;
+    apu.init(44100);
+    apu.reset();
+    apu.setSoundProfile(SoundProfile::Legacy);
+
+    InstrumentPreset preset = INSTR_KICK;
+    preset.noisePeriodMode = NoisePeriodMode::Note;
+
+    int16_t buffer[64] = {0};
+    const int slot = playNoiseNoteWithPreset(apu, buffer, preset, preset.noisePeriod);
+    TEST_ASSERT_EQUAL_UINT8(255, apu.getVoiceNesNoiseLutIndexForTesting(slot));
+    TEST_ASSERT_EQUAL_UINT32(60u, apu.getVoiceNoisePeriodForTesting(slot));
+}
+
+// =============================================================================
 // Unity test runner
 // =============================================================================
 
@@ -7826,6 +8012,15 @@ int main(int argc, char** argv) {
     RUN_TEST(duty_voice_override_survives_the_next_note);
     RUN_TEST(duty_profile_default_leaves_non_pulse_voices_untouched);
     RUN_TEST(duty_legacy_profile_keeps_continuous_duty);
+
+    // S1-S4 / A1-A2: the note pins its own NOISE period and continuous duty
+    RUN_TEST(note_character_modes_are_appended_and_zero);
+    RUN_TEST(noise_period_mode_note_keeps_the_authored_period_under_nes);
+    RUN_TEST(noise_period_mode_default_still_arms_the_nes_lut);
+    RUN_TEST(noise_period_mode_note_does_not_leak_to_the_next_note);
+    RUN_TEST(pulse_duty_mode_continuous_keeps_the_generator_under_hybrid);
+    RUN_TEST(pulse_duty_mode_default_snaps_the_continuous_away);
+    RUN_TEST(note_character_modes_are_inert_under_legacy);
 
     // Integration tests
     RUN_TEST(test_apu_core_integration_full_pipeline);

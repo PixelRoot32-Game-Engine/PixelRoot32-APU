@@ -141,6 +141,65 @@ namespace pixelroot32::audio {
     };
 
     /**
+     * @enum NoisePeriodMode
+     * @brief Whether a note keeps the NOISE period it authored (E3/A1).
+     *
+     * `Nes` and `Hybrid` arm the NES period LUT (index 0, `$400E = $00`), which
+     * retunes the LFSR clock and therefore discards the note's own
+     * `noisePeriod`. That is the right default for a chip-style lead, and the
+     * wrong one for a curated drum kit: a kick authored with a 60-sample period
+     * becomes one-sample white hiss.
+     *
+     * `Note` is the third tier of the D-3 table winning inside its own domain:
+     * the note keeps the period it declared for that note, while the slot is
+     * left free so the next note gets the profile's LUT again. It says nothing
+     * about polarity — `noiseUnipolar` stays profile character, and
+     * `VoiceNesOptions::noiseUnipolar` remains the per-voice opt-out.
+     *
+     * `Legacy` already answers "derive the period from the note", so `Note` is
+     * inert there and no frozen fixture moves.
+     *
+     * Declared here, next to `EnvelopeCurve`, because the character hook and
+     * the preset both need it. Unlike `EnvelopeCurve` it is deliberately NOT
+     * stored on `AudioChannel`: the request is resolved in `initVoiceFromEvent`
+     * and passed to `applyProfileCharacter`, so no byte of the pinned channel
+     * or core size changes.
+     */
+    enum class NoisePeriodMode : uint8_t {
+        /** The profile decides. The value the renderer must never see. */
+        ProfileDefault = 0,
+        /** This note keeps its own `noisePeriod`; no LUT for this note. */
+        Note = 1
+    };
+
+    /**
+     * @enum PulseDutyMode
+     * @brief Whether a PULSE note keeps the continuous duty generator (E3/A2).
+     *
+     * `Nes` and `Hybrid` snap a static duty to the nearest of the four NES
+     * patterns (12.5 / 25 / 50 / 75 %). Rounding 30 % to 25 % is what the
+     * hardware can express, but it makes a value the tool can already author
+     * unsayable under a profile.
+     *
+     * `Continuous` is the note winning inside the duty domain, exactly like an
+     * animated duty (`dutySteps` / `dutySweep`) already does: both resolve to
+     * the same `255` sentinel and neither pins the slot, so the next note on
+     * that slot gets the profile's step again.
+     *
+     * PULSE only. `Legacy` answers the continuous generator for every duty, so
+     * `Continuous` is inert there.
+     *
+     * Declared here for the same reason as `NoisePeriodMode`, and likewise not
+     * stored on `AudioChannel`.
+     */
+    enum class PulseDutyMode : uint8_t {
+        /** The profile decides. The value the renderer must never see. */
+        ProfileDefault = 0,
+        /** This note keeps `phaseQ32 < dutyCycleQ32`; no NES step. */
+        Continuous = 1
+    };
+
+    /**
      * @brief Master output shaping curve applied to the summed mix.
      *
      * Runs on the accumulated mix `S` BEFORE the DC blocker, so the filter

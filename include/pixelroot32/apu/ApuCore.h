@@ -1246,10 +1246,20 @@ namespace pixelroot32::audio {
          * the envelope curve (S2), the noise character (S5) and the stepped
          * PULSE duty (S6), each as a DEFAULT the note or the voice may pin.
          *
+         * E3/A1-A2 pass the note's two requests in instead of storing them on
+         * the voice: `NoisePeriodMode::Note` and `PulseDutyMode::Continuous`
+         * are per-note wins inside their own domain, and keeping them as
+         * parameters is what leaves `sizeof(AudioChannel)` — and therefore the
+         * pinned `sizeof(ApuCore)` — unchanged.
+         *
          * @param slot Voice index [0, MAX_VOICES); the caller guarantees it is
          *             a valid voice of the pool.
+         * @param noteNoisePeriodMode The note's own NOISE-period request.
+         * @param notePulseDutyMode The note's own PULSE-duty request.
          */
-        void applyProfileCharacter(int slot);
+        void applyProfileCharacter(int slot,
+                                   NoisePeriodMode noteNoisePeriodMode,
+                                   PulseDutyMode notePulseDutyMode);
 
         // -- Channels and I/O ---------------------------------------------
         Voice voices[MAX_VOICES];

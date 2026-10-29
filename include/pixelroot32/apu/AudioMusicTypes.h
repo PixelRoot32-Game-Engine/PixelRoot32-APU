@@ -227,6 +227,38 @@ struct InstrumentPreset {
      * may only be appended, and its zero value must mean "nothing changed".
      */
     EnvelopeCurve envelopeCurve = EnvelopeCurve::ProfileDefault;
+
+    /**
+     * @brief Whether this note keeps the NOISE period it authored (E3/A1).
+     *
+     * `ProfileDefault` (= 0) means "the profile decides": under `Nes`/`Hybrid`
+     * the profile arms the NES period LUT and retunes the voice, which is what
+     * a chip-style lead wants. `Note` keeps the note's own `noisePeriod` (or
+     * its frequency-derived clock when that is 0) for that note only, without
+     * pinning the slot.
+     *
+     * Resolved by `applyProfileCharacter` on every note-on, so the renderer
+     * never sees `ProfileDefault`. `Legacy` ignores it.
+     *
+     * Deliberately after `envelopeCurve` and therefore the 18th member: the
+     * shipped `INSTR_*` presets and every consumer literal are positional
+     * aggregate initializers, so a new field may only be appended and its zero
+     * value must mean "nothing changed".
+     */
+    NoisePeriodMode noisePeriodMode = NoisePeriodMode::ProfileDefault;
+
+    /**
+     * @brief Whether this PULSE note keeps the continuous duty generator (E3/A2).
+     *
+     * `ProfileDefault` (= 0) means "the profile decides": `Nes`/`Hybrid` snap
+     * the note's `duty` to the nearest NES pattern. `Continuous` keeps
+     * `phaseQ32 < dutyCycleQ32` for that note, the same outcome an animated
+     * duty already produces, without pinning the slot. PULSE only, and
+     * `Legacy` ignores it.
+     *
+     * Appended for the same reason as `noisePeriodMode`.
+     */
+    PulseDutyMode pulseDutyMode = PulseDutyMode::ProfileDefault;
 };
 
 constexpr InstrumentPreset INSTR_PULSE_LEAD{
