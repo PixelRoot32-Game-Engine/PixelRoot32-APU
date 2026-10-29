@@ -2,7 +2,7 @@
 
 Format: [semver](https://semver.org/). Changes that alter rendered PCM or struct ABI require a major or minor bump with an explicit note.
 
-## [Unreleased]
+## [2.2.0] - 2026-10-28
 
 ### Added
 
