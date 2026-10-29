@@ -32,6 +32,11 @@ Consumers with dynamic presets must guarantee address stability (the Tool Suite 
 - In NOISE, the sweep interpolates the LFSR clock/period, not melodic pitch.
 - Shared clock `automationAgeSamples`: one increment per sample feeds both duty and pitch.
 - **Duty mirror at full scale**: `AudioEvent::duty` is clamped to [0, 1] and `AudioChannel::dutyCycleQ32` mirrors it for the integer core as `duty * 2^32`, **saturating at `0xFFFFFFFF` for `duty == 1.0`**. The natural product is exactly 2^32 there, which does not fit in `uint32_t`; the wrapped 0 made `phaseQ32 < dutyCycleQ32` false for every phase, so a full-scale pulse rendered flat while the float body rendered a constant high. No other value changes, so the integer golden is untouched.
+- **Note-pinned character (E3, A1/A2)**: two note-level requests sit beside `envelopeCurve` and are the third tier winning inside its own domain:
+  - `InstrumentPreset::noisePeriodMode` — `ProfileDefault` (0) lets `Nes`/`Hybrid` arm the period LUT; `Note` (1) keeps the period the note authored (`AudioEvent::noisePeriod`, or its frequency-derived clock when 0) **for that note only**. The slot returns to the 255 sentinel, so the next note without the request gets the profile's LUT again. It says nothing about polarity: `noiseUnipolar` stays profile character and `VoiceNesOptions::noiseUnipolar` remains the per-voice opt-out.
+  - `InstrumentPreset::pulseDutyMode` — `ProfileDefault` (0) lets `Nes`/`Hybrid` snap the static duty to a NES step; `Continuous` (1) keeps `phaseQ32 < dutyCycleQ32`. It resolves to the same `255` sentinel an animated duty produces, pins nothing, and is PULSE-only.
+  - Both are inert under `Legacy` (which already answers "derive from the note" and "continuous"), both are defaulted in the 17-value positional literals, and neither is stored on `AudioChannel`: `initVoiceFromEvent` reads the request and passes it to `applyProfileCharacter`. `sizeof(AudioChannel)`, `sizeof(ApuCore)`, `sizeof(AudioCommand)` and `sizeof(AudioEvent)` are therefore unchanged.
+  - **A voice pin outranks the note**, as it already does for an animated duty: `setVoiceNesNoiseLutMode` / `setVoicePulseDutyMode` mark the slot as explicitly configured, and both readers (`initVoiceFromEvent` for the period, `applyProfileCharacter` for the selector) honour that, so the voice never renders one thing while `getVoiceNesOptions` reports another.
 
 ### Three-level precedence, profile < voice < note
 
@@ -39,10 +44,10 @@ Consumers with dynamic presets must guarantee address stability (the Tool Suite 
 |---|---|---|---|
 | 1. **Profile** | `setSoundProfile` / `AudioCommandType::SET_SOUND_PROFILE` | Character: default envelope curve, mix curve, output filters, default duty, noise LUT, unipolar noise, pan/echo enablement | — |
 | 2. **Voice** | `setVoiceNesOptions`, `setVoicePulseDutyMode`, `setVoiceNesNoiseLutMode`, `setVoiceNesSweepUnitEnabled` | A character override on that slot (including `VoiceNesOptions::noiseUnipolar`) | Profile |
-| 3. **Note** | `InstrumentPreset` / `AudioEvent` | ADSR (times and levels), envelope curve, LFO, `duty`, sweep, pitch envelope, `noisePeriod`, `noiseLfsrShort` | Voice and profile, **only inside its own domain** |
+| 3. **Note** | `InstrumentPreset` / `AudioEvent` | ADSR (times and levels), envelope curve, LFO, `duty`, sweep, pitch envelope, `noisePeriod`, `noiseLfsrShort`, and — since E3 — whether the note keeps its own `noisePeriod` (`noisePeriodMode`) or continuous duty (`pulseDutyMode`) | Voice and profile, **only inside its own domain** |
 
 - The profile is **configuration, not state**: `init(int sampleRate)` does not reset it (voices are reset). `setSoundProfile` is an audio-thread call; from the game thread use `submitCommand()` with `SET_SOUND_PROFILE`, the same shape as `SET_NES_OPTIONS`. An unknown value is ignored, never clamped to a neighbouring profile.
-- `applyProfileCharacter(int slot)` is the **only** function through which the profile writes character, and it is invoked **last** in `initVoiceFromEvent`, after the `nesAccurate` / `initNesSafe` block. `nesAccurate` still means "start from a clean canonical state"; it does not erase the character the profile chose. Since E1 it resolves the default envelope curve and its exponential clock, the unipolar NOISE gate, the NES period LUT selector and the stepped PULSE duty. The mix curve is not voice state: it is resolved once per render block from the same profile (§6).
+- `applyProfileCharacter(int slot, NoisePeriodMode, PulseDutyMode)` is the **only** function through which the profile writes character, and it is invoked **last** in `initVoiceFromEvent`, after the `nesAccurate` / `initNesSafe` block. `nesAccurate` still means "start from a clean canonical state"; it does not erase the character the profile chose. Since E1 it resolves the default envelope curve and its exponential clock, the unipolar NOISE gate, the NES period LUT selector and the stepped PULSE duty; since E3 it also resolves the note's two requests (`noisePeriodMode`, `pulseDutyMode`), which arrive as parameters because they are per-note and must not become voice state. The mix curve is not voice state either: it is resolved once per render block from the same profile (§6).
 - Ordering is asserted structurally, not visually: `getProfileApplyCountForTesting()` (`UNIT_TEST`) is incremented by `applyProfileCharacter`, so one `PLAY_EVENT` with `nesAccurate = true` must advance it exactly once.
 
 **Hot switch (`setSoundProfile`)** — applies immediately to the core and does **not** cut sounding voices. Executed in this order:
@@ -124,8 +129,8 @@ The range guard sits on the user-configured branch (`#ifdef AUDIO_COMMAND_QUEUE_
 | Envelope curve | linear (frozen) | linear, plus the 4-bit `nesEnvelope` at 240 Hz | exponential DECAY and RELEASE, linear ATTACK | profile; a note may name `InstrumentPreset::envelopeCurve` |
 | Mix curve | `Rational` (equal weight) | `NesWeighted` | `NesWeighted` | profile only, resolved once per block |
 | NOISE output | bipolar | unipolar `(lfsr & 1) ? level : 0` | unipolar | profile; `VoiceNesOptions::noiseUnipolar` pins it per voice |
-| NOISE period | derived from the note's Hz | NES period LUT index 0 (`$400E = $00`) | index 0 | profile; `setVoiceNesNoiseLutMode` pins it per voice |
-| PULSE duty | continuous (`255`) | NES step 0–3 | NES step 0–3 | profile; `setVoicePulseDutyMode` pins it, an animated duty keeps the continuous generator |
+| NOISE period | derived from the note's Hz | NES period LUT index 0 (`$400E = $00`) | index 0 | profile; `setVoiceNesNoiseLutMode` pins it per voice, and `InstrumentPreset::noisePeriodMode = Note` keeps it per note |
+| PULSE duty | continuous (`255`) | NES step 0–3 | NES step 0–3 | profile; `setVoicePulseDutyMode` pins it, an animated duty keeps the continuous generator, and `InstrumentPreset::pulseDutyMode = Continuous` does the same per note |
 
 The four are contracts, not implementation notes:
 
@@ -146,7 +151,11 @@ Previously the Q15 path was ~0.225× the float level — the double `MIXER_SCALE
 
 `noisePeriod` is the **LFSR period in samples**: larger period ⇒ slower clock ⇒ deeper sound.
 
-These presets are **note-level** (`noisePeriod` travels in `InstrumentPreset`), so inside their own domain they beat a profile default and a per-voice override. The NOISE **period** is the documented exception, because the profile owns it through the LUT: `Nes` and `Hybrid` arm LUT index 0 by default, arming the LUT **retunes** the period, and a preset's own `noisePeriod` (60 for `INSTR_KICK`, 15 for `INSTR_SNARE`, 12 for `INSTR_HIHAT`) is therefore replaced under those profiles. `Legacy` keeps the preset's period, because it never arms the LUT. `setVoiceNesNoiseLutMode(slot, 255)` opts out of the LUT, but it opts out to the **frequency-derived** clock, not back to the preset's `noisePeriod`: the note's period is gone once a LUT index was applied.
+These presets are **note-level** (`noisePeriod` travels in `InstrumentPreset`), so inside their own domain they beat a profile default and a per-voice override. The NOISE **period** used to be the documented exception, because the profile owns it through the LUT: `Nes` and `Hybrid` arm LUT index 0 by default, arming the LUT **retunes** the period, and a preset's own `noisePeriod` (60 for `INSTR_KICK`, 15 for `INSTR_SNARE`, 12 for `INSTR_HIHAT`) was therefore replaced under those profiles.
+
+Since E3 the note can keep its own period: `InstrumentPreset::noisePeriodMode = NoisePeriodMode::Note` holds the authored `noisePeriod` for that note and leaves the slot on the 255 sentinel, so the next note without the request gets the profile's LUT again. `Legacy` keeps the preset's period either way, because it never arms the LUT. `setVoiceNesNoiseLutMode(slot, 255)` remains the **per-voice** opt-out, and it still opts out to the **frequency-derived** clock rather than to the preset's `noisePeriod`; for a curated percussion bank the note-level request is the one that means what it says.
+
+`noisePeriodMode = Note` does not change polarity: the `Nes`/`Hybrid` unipolar gate stays profile character (and its −3.649 dB against `Legacy` is the published noise weight, not a lost level). Pin `VoiceNesOptions::noiseUnipolar` on the voice to keep bipolar noise.
 
 | Preset | noisePeriod | Character |
 |---|---|---|
