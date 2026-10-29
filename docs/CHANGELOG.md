@@ -2,6 +2,21 @@
 
 Format: [semver](https://semver.org/). Changes that alter rendered PCM or struct ABI require a major or minor bump with an explicit note.
 
+## [2.2.0] - 2026-10-28
+
+### Added
+
+- **Note-pinned character (A1/A2)**: a note can now keep two values the `Nes`/`Hybrid` profiles used to overwrite.
+  - `InstrumentPreset::noisePeriodMode` with `NoisePeriodMode { ProfileDefault = 0, Note = 1 }`. Under a profile that arms the NES period LUT (index 0, `$400E = $00`), `Note` keeps the period the note authored instead of collapsing it to the LUT's one-sample clock. This is what makes a curated drum kit survive a profile: `INSTR_KICK`'s 60-sample body was becoming white hiss. The request is per note — the slot returns to the 255 sentinel, so the next note without it gets the profile's LUT again — and it does not change polarity; the unipolar gate stays profile character.
+  - `InstrumentPreset::pulseDutyMode` with `PulseDutyMode { ProfileDefault = 0, Continuous = 1 }`. Under `Nes`/`Hybrid`, `Continuous` keeps `phaseQ32 < dutyCycleQ32` for that note instead of snapping a static duty to the nearest NES pattern, so a value the caller can already author (30 %, 20 %, …) stays expressible. It resolves to the same `255` sentinel an animated duty produces and pins nothing.
+  - Both are appended after `envelopeCurve` (18th and 19th members) and default to `ProfileDefault`, which means **nothing changes by default**: `Legacy`, `Nes` and `Hybrid` render byte-identical PCM and none of the four committed profile goldens is regenerated.
+  - Both requests are read in `initVoiceFromEvent` and passed to `applyProfileCharacter` as parameters rather than stored on the voice, so `sizeof(AudioChannel)` (336 B), `sizeof(ApuCore)`, `sizeof(AudioCommand)` (144 B) and `sizeof(AudioEvent)` are unchanged and the 9 KB command-queue budget is untouched.
+  - Inert under `Legacy`, which already answers "derive the period from the note" and "continuous duty".
+
+### Changed
+
+- **ABI (size)**: `sizeof(InstrumentPreset)` grows from **72 to 76 bytes** (two more `uint8_t` enums after `envelopeCurve`, which pushes the trailing padding from 1 to 3 bytes; measured, not assumed). No `static_assert` pins it, and every shipped `INSTR_*` preset and consumer literal is positional through `pitchSweepDurationSec`, so a 17-value literal keeps its meaning; the two new fields are read only when a note opts in.
+
 ## [2.1.0] - 2026-10-28
 
 Sound profiles, one integer render core on every platform, a smaller command

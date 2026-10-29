@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(pixelroot32-apu VERSION 2.1.0 LANGUAGES C CXX)
+project(pixelroot32-apu VERSION 2.2.0 LANGUAGES C CXX)
 
 # The test files have pre-existing narrowing conversions in brace-init
 # (committed before M7). Suppress this warning so the test build doesn't

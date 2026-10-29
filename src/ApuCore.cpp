@@ -3528,6 +3528,17 @@ namespace pixelroot32::audio {
         ch->envelopeCurve = event.preset ? event.preset->envelopeCurve
                                          : EnvelopeCurve::ProfileDefault;
 
+        // E3/A1-A2 / D-3 tier 3: the other two note-level requests, read here
+        // and passed to `applyProfileCharacter` so neither `AudioChannel` nor
+        // the pinned `sizeof(ApuCore)` grows a field. They are requests, not
+        // resolved values: `ProfileDefault` still means "the profile decides".
+        const NoisePeriodMode note_noise_mode =
+            event.preset ? event.preset->noisePeriodMode
+                         : NoisePeriodMode::ProfileDefault;
+        const PulseDutyMode note_duty_mode =
+            event.preset ? event.preset->pulseDutyMode
+                         : PulseDutyMode::ProfileDefault;
+
         // LFO initialization
         ch->lfo.enabled = false;
         if (event.preset && event.preset->lfoTarget != LfoTarget::NONE && event.preset->lfoFrequency > 0.0f) {
@@ -3601,7 +3612,22 @@ namespace pixelroot32::audio {
             // Hito 3 M8: an armed NOISE LUT index wins over both the direct
             // `noisePeriod` and the frequency-derived period. Like M2's duty
             // mode this is a per-slot setting, so it survives new notes.
-            if (ch->nesNoiseLutIndex < 16u) {
+            //
+            // E3/A1: unless THIS note asked for its own period
+            // (`NoisePeriodMode::Note`). The request is resolved below by
+            // `applyProfileCharacter`, but the period has to be chosen here,
+            // before the selector can win, or the opt-in would arrive too late
+            // to change what the note sounds like.
+            //
+            // A voice that pinned the selector (`setVoiceNesNoiseLutMode`,
+            // `nesNoiseLutOverridden`) outranks the note, exactly as that pin
+            // already outranks an animated duty. Both readers must agree on
+            // that, or the voice would render the note's period while
+            // `getVoiceNesOptions` kept reporting the pinned index.
+            const bool notePinsPeriod =
+                (note_noise_mode == NoisePeriodMode::Note) &&
+                !ch->nesNoiseLutOverridden;
+            if (ch->nesNoiseLutIndex < 16u && !notePinsPeriod) {
                 period = nes_apu::nesNoisePeriodToSamples(ch->nesNoiseLutIndex,
                                                           sampleRate);
             }
@@ -3737,7 +3763,8 @@ namespace pixelroot32::audio {
         // so `nesAccurate` keeps meaning "start from a canonical clean state"
         // without erasing the profile's choice. This is the only call site —
         // one application per note-on.
-        applyProfileCharacter(static_cast<int>(ch - voices));
+        applyProfileCharacter(static_cast<int>(ch - voices),
+                              note_noise_mode, note_duty_mode);
     }
 
     // S5: the ONLY place a profile writes voice character.
@@ -3755,7 +3782,9 @@ namespace pixelroot32::audio {
     // E0 left this body empty because `Nes` and `Hybrid` were exact aliases.
     // E1 gives it its real assignments: the envelope curve (S2), the noise
     // character (S5) and the stepped PULSE duty (S6).
-    void ApuCore::applyProfileCharacter(int slot) {
+    void ApuCore::applyProfileCharacter(int slot,
+                                        NoisePeriodMode noteNoisePeriodMode,
+                                        PulseDutyMode notePulseDutyMode) {
         Voice& ch = voices[slot];
 
         // S2 / D-3: the profile supplies the DEFAULT curve only. A note that
@@ -3813,13 +3842,25 @@ namespace pixelroot32::audio {
             ch.noiseUnipolar = profileDefaultNoiseUnipolar(profile_);
         }
         if (!ch.nesNoiseLutOverridden) {
-            const uint8_t lutIndex = profileDefaultNoiseLutIndex(profile_);
+            // E3/A1 / D-3 tier 3: a NOISE note that named its own period wins
+            // over the profile's LUT for THIS note only. The slot goes back to
+            // the 255 sentinel so nothing leaks into the next note, and no
+            // retune is owed here: `initVoiceFromEvent` already took the period
+            // from the note because it saw the same request before arming.
+            const bool notePinsPeriod =
+                (ch.type == WaveType::NOISE) &&
+                (noteNoisePeriodMode == NoisePeriodMode::Note);
+            const uint8_t lutIndex = notePinsPeriod
+                ? 255u
+                : profileDefaultNoiseLutIndex(profile_);
             if (ch.nesNoiseLutIndex != lutIndex) {
                 ch.nesNoiseLutIndex = lutIndex;
                 // The note computed its own period before this point, so the
                 // selector has to be applied now: otherwise the first note
                 // after a profile change would render the previous period.
-                retuneNoisePeriodFromSelector(ch, sampleRate);
+                if (!notePinsPeriod) {
+                    retuneNoisePeriodFromSelector(ch, sampleRate);
+                }
             }
         }
 
@@ -3841,7 +3882,14 @@ namespace pixelroot32::audio {
             const bool animatedDuty = (ch.dutyStepCount > 0) ||
                                       (ch.dutySweep != 0.0f) ||
                                       (ch.dutySweepQ32 != 0);
-            ch.pulseDutyIndex = animatedDuty
+            // E3/A2 / D-3 tier 3: a note may also ask for the continuous
+            // generator explicitly (`PulseDutyMode::Continuous`), which is the
+            // same outcome as animating the duty and carries the same
+            // consequence: `255` for this note, no pin on the slot, so the
+            // profile arms its step again on the next note.
+            const bool continuousDuty =
+                (notePulseDutyMode == PulseDutyMode::Continuous);
+            ch.pulseDutyIndex = (animatedDuty || continuousDuty)
                 ? 255u
                 : profileDefaultPulseDutyIndex(profile_, ch.dutyCycle);
         }
