@@ -5,11 +5,12 @@
 /// at 44 100 Hz).
 ///
 /// Why a second scene exists. The canonical track is PULSE-only, so it cannot
-/// observe the E2 band-limited SAW (S4): `Hybrid`'s canonical fixture is
-/// byte-identical before and after the mipmap landed, and the only thing that
-/// pinned the mipmap was a unit test whose reference re-derived the ramp. This
-/// scene is the end-to-end pin instead — a committed render that only stays
-/// stable while the level selection, the crossfade and the table read do.
+/// observe the E2 band-limited SAW (S4): the profile-2 canonical fixture (then
+/// named `Hybrid`, now `Famicom`) was byte-identical before and after the
+/// mipmap landed, and the only thing that pinned the mipmap was a unit test
+/// whose reference re-derived the ramp. This scene is the end-to-end pin
+/// instead — a committed render that only stays stable while the level
+/// selection, the crossfade and the table read do.
 ///
 /// It shares the fixture CONTRACT with `apu_mirror_canonical_track.h` — the
 /// sample rate and the sample count, so both scenes fit the same file size —
@@ -38,12 +39,14 @@ using pixelroot32::audio::WaveType;
  * The envelope is deliberately flat: one-sample attack (the core clamps a 0 s
  * attack to one sample), no decay, sustain 1.0 and no release. The missing
  * release is what keeps the two profile fixtures comparable sample for sample:
- * `Nes` and `Hybrid` resolve different ADSR curves, so a release tail would
- * write a second, unrelated difference into the same file. With a constant
- * envelope and silence between notes, the only thing that can differ between
- * the two renders of this scene is the SAW generator itself — both profiles
- * weigh SAW as the PULSE group (Q12 unity) and share the output filter chain,
- * so neither the mix nor the output stage introduces one.
+ * a release tail would write a second, unrelated difference into the same
+ * file whenever the two profiles resolve different ADSR curves. `Nes` and
+ * `Famicom` both default to the linear curve (only an explicit
+ * `EnvelopeCurve::Exponential` gives the exponential one), but the scene must
+ * not depend on that. With a constant envelope and silence between notes, the
+ * two renders of this scene differ only in what the profiles themselves
+ * define — both weigh SAW as the PULSE group (Q12 unity), so the mix adds no
+ * difference.
  *
  * @return The static preset; the returned reference outlives every command.
  */

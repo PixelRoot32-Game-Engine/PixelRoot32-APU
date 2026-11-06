@@ -65,15 +65,22 @@ namespace pixelroot32::audio {
     };
 
     // ========================================================================
-    // Hybrid SAW: the band-limited mipmap read (E2/T3, S4 + S6)
+    // Band-limited SAW: the mipmap read (E2/T3, S4 + S6) -- DORMANT
     // ========================================================================
-    // `Legacy` and `Nes` keep `generateSawSampleQ15` above, the ideal ramp with
-    // its audible aliasing. Only `Hybrid` gets the tables. The level and the
+    // DORMANT since the `Famicom` profile replaced `Hybrid` (value 2): every
+    // profile renders `generateSawSampleQ15` above, the ideal ramp with its
+    // audible aliasing, and no profile selects this read (`kBandLimitedSaw`
+    // below is false). The code, the tables of `AudioOscMipLUT.h` and their
+    // spectral test are kept on purpose, pending a decision: remove them (and
+    // save the flash) or expose the read as a per-voice opt-in. The level and the
     // crossfade window are derived from the voice's OWN `phaseIncQ32`, never
     // from `frequency`, so a sweep, LFO or pitch envelope is tracked -- and they
     // are derived once per voice per block, then re-derived only when that
     // increment leaves the band it described. No per-voice state is added
     // (`AudioChannel` is size-pinned); the cache lives on the render stack.
+
+    /** @brief Dormant switch of the band-limited SAW read: no profile uses it. */
+    static constexpr bool kBandLimitedSaw = false;
 
     /**
      * @brief Leading-zero count of a non-zero 32-bit value.
@@ -142,7 +149,7 @@ namespace pixelroot32::audio {
      *
      * `-Os` (what the ESP32 presets build with) treats `inline` as a hint and
      * leaves a short helper out of line: the table read became a call, so every
-     * `Hybrid` SAW sample paid two call/return pairs on top of the loads it
+     * band-limited SAW sample paid two call/return pairs on top of the loads it
      * cannot avoid. This attribute is what removes them; `inline` alone is not
      * enough at `-Os`.
      */
@@ -193,7 +200,7 @@ namespace pixelroot32::audio {
     static constexpr int kSawMipCrossfadeWidthQ8 = 256 - kSawMipCrossfadeStartQ8;
 
     /**
-     * @brief Everything the `Hybrid` SAW read needs that is constant in a band.
+     * @brief Everything the band-limited SAW read needs that is constant in a band.
      *
      * The level, the window edges and the shift all come from `phaseIncQ32`,
      * which only moves while pitch automation is active. Resolving them once
@@ -264,7 +271,7 @@ namespace pixelroot32::audio {
     }
 
     /**
-     * @brief One `Hybrid` SAW sample: the band's table, blended only near the edge.
+     * @brief One band-limited SAW sample: the band's table, blended only near the edge.
      *
      * Continuity at a boundary is exact in both directions, which is why this
      * is a crossfade and not a switch: the last increment inside band `L`
@@ -333,25 +340,27 @@ namespace pixelroot32::audio {
      * the single place that mapping lives, so `applyProfileCharacter` cannot
      * drift from what the profiles are documented to sound like.
      *
-     * `Nes` deliberately answers `Linear`: its character is the 4-bit
-     * `nesEnvelope` clocked at 240 Hz, which is a different mechanism and not
-     * the exponential ramp. `Legacy` answers `Linear` because its curve is
-     * frozen (S1), and any unknown value is treated as `Legacy` rather than
-     * guessed.
+     * Every profile answers `Linear`. `Nes` and `Famicom` do so deliberately:
+     * their character is the 4-bit `nesEnvelope` clocked at 240 Hz, which is a
+     * different mechanism and not the exponential ramp (2.2.x's `Hybrid`, value
+     * 2, answered `Exponential`; `Famicom` replaced it with the `Nes`
+     * character). `Legacy` answers `Linear` because its curve is frozen (S1),
+     * and any unknown value is treated as `Legacy` rather than guessed. The
+     * exponential curve stays available as a note-level override.
      *
      * @param profile Profile in force.
      * @return Curve the profile supplies when the note asks for none.
      */
     static inline EnvelopeCurve profileDefaultEnvelopeCurve(SoundProfile profile) {
-        return (profile == SoundProfile::Hybrid) ? EnvelopeCurve::Exponential
-                                                 : EnvelopeCurve::Linear;
+        (void)profile;
+        return EnvelopeCurve::Linear;
     }
 
     /**
      * @brief The unipolar NOISE gate a sound profile arms by default (S5/D-3).
      *
      * Tier 1 of the D-3 table owns the default and the voice may pin it. `Nes`
-     * and `Hybrid` gate the noise between 0 and the envelope level, which is
+     * and `Famicom` gate the noise between 0 and the envelope level, which is
      * what the hardware does and what makes the noise sit "on top of" the mix
      * instead of subtracting as much energy as it adds; `Legacy` keeps the
      * bipolar output frozen (S1), and any unknown value answers `Legacy`
@@ -365,7 +374,7 @@ namespace pixelroot32::audio {
     }
 
     /**
-     * @brief NOISE period LUT index the `Nes`/`Hybrid` profiles arm (S5).
+     * @brief NOISE period LUT index the `Nes`/`Famicom` profiles arm (S5).
      *
      * `$400E = $00`: the write the canonical NES init performs (see
      * `initNesSafe`), i.e. the fastest of the sixteen published periods. The
@@ -387,7 +396,7 @@ namespace pixelroot32::audio {
     /**
      * @brief PULSE duty step a NES-derived profile arms for a note (S6).
      *
-     * `Nes` and `Hybrid` render the four discrete NES duty patterns instead of
+     * `Nes` and `Famicom` render the four discrete NES duty patterns instead of
      * the continuous `phaseQ32 < dutyCycleQ32` comparison, because that is what
      * the hardware does: the pulse channel has no duty register, only a 2-bit
      * selector. The selector is chosen by NEAREST STEP from the note's own
@@ -1365,14 +1374,14 @@ namespace pixelroot32::audio {
         if (hpfRQ15_ < 0) hpfRQ15_ = 0;
     }
 
-    // E2/S1: the output stage owned by the `Nes` / `Hybrid` profiles.
+    // E2/S1: the output stage owned by the `Nes` / `Famicom` profiles.
     void ApuCore::recomputeOutputFilterCoefficients() {
         // The profile owns the stage (D-3 tier 1), but an explicit
         // `setHpfCutoffHz` is a tier-2 caller override and wins (S8). Resolve
         // that here, once per configuration change, so the sample loop only
         // tests a bool.
         const bool profileWantsChain = (profile_ == SoundProfile::Nes) ||
-                                       (profile_ == SoundProfile::Hybrid);
+                                       (profile_ == SoundProfile::Famicom);
         outputFilterActive_ = profileWantsChain && !hpfCutoffOverridden_ &&
                               sampleRate > 0;
 
@@ -1386,8 +1395,8 @@ namespace pixelroot32::audio {
             case SoundProfile::Nes:
                 outTrimQ15_ = kProfileTrimNesQ15;
                 break;
-            case SoundProfile::Hybrid:
-                outTrimQ15_ = kProfileTrimHybridQ15;
+            case SoundProfile::Famicom:
+                outTrimQ15_ = kProfileTrimFamicomQ15;
                 break;
             case SoundProfile::Legacy:
             default:
@@ -1400,8 +1409,8 @@ namespace pixelroot32::audio {
         // LPF policy (audit P3 risk iii): at 8 000 Hz `0.45 * fs` is 3 600 Hz,
         // which would cut most of the passband and "switch off" the sound
         // instead of approximating the NES's 14 kHz roof. Below the 6 kHz
-        // floor the LPF is skipped by definition; the chain is then the two
-        // high-passes only.
+        // floor the LPF is skipped by definition; the chain is then the
+        // high-pass section(s) only.
         //
         // Everything below is `float`. The coefficients are quantised to Q15
         // immediately, so double precision changes no bit of them; it only
@@ -1411,8 +1420,12 @@ namespace pixelroot32::audio {
         outputLpfActive_ = outputFilterActive_ && (sampleRate > 0) &&
                            (nyquist45 >= kOutputLpfMin45FsHz);
 
-        outHpf1CutoffHz_ = kOutputHpf1Hz;
-        outHpf2CutoffHz_ = kOutputHpf2Hz;
+        // `Nes`: HPF 90 Hz -> HPF 440 Hz. `Famicom`: one HPF at 37 Hz, its
+        // second section bypassed (corner reported as 0 Hz, pole set to unity
+        // below).
+        const bool famicomStage = (profile_ == SoundProfile::Famicom);
+        outHpf1CutoffHz_ = famicomStage ? kOutputFamicomHpfHz : kOutputHpf1Hz;
+        outHpf2CutoffHz_ = famicomStage ? 0.0f : kOutputHpf2Hz;
         outLpfCutoffHz_ = outputLpfActive_
             ? std::min(kOutputLpfMaxHz, nyquist45)
             : 0.0f;
@@ -1433,8 +1446,17 @@ namespace pixelroot32::audio {
             if (q < 0) q = 0;
             return q;
         };
-        outHpf1RQ15_ = highPassPoleQ15(kOutputHpf1Hz);
-        outHpf2RQ15_ = highPassPoleQ15(kOutputHpf2Hz);
+        outHpf1RQ15_ = highPassPoleQ15(outHpf1CutoffHz_);
+        // The `Famicom` bypass is a unity pole, not a branch: with R = 1.0
+        // (32768 in Q15) the section computes `y = x - x[n-1] + y[n-1]`, and
+        // since its state starts cleared (`resetOutputFilterState` runs on
+        // every profile, rate and reset change) `y[n-1] == x[n-1]` holds on
+        // every sample, so `y = x` exactly — the truncating shift of
+        // `32768 * y` is exact and no clamp can fire on an int16 input. The
+        // sample loop is therefore untouched: `Nes` pays nothing for the
+        // option, `Famicom` pays one dead section.
+        outHpf2RQ15_ = famicomStage ? kOutputHpfBypassRQ15
+                                    : highPassPoleQ15(kOutputHpf2Hz);
 
         outLpfB0Q15_ = 0;
         outLpfB1Q15_ = 0;
@@ -1728,7 +1750,7 @@ namespace pixelroot32::audio {
         switch (profile) {
             case SoundProfile::Legacy:
             case SoundProfile::Nes:
-            case SoundProfile::Hybrid:
+            case SoundProfile::Famicom:
                 break;
             default:
                 return;  // unknown value: leave the current profile alone
@@ -1976,7 +1998,7 @@ namespace pixelroot32::audio {
         // accessor would report a pitch the core is not playing. Deriving Hz
         // from the increment the core actually uses keeps the readout honest.
         // The branch is on the profile, not on `PR32_APU_HAS_FPU`: on an FPU
-        // target `Nes`/`Hybrid` render the integer core too (S3, L8.3).
+        // target `Nes`/`Famicom` render the integer core too (S3, L8.3).
         // NOISE has no phase increment (its pitch is the LFSR period, which
         // `getVoiceNoisePeriodForTesting` reports), so it keeps the float.
         if (voices[slot].type == WaveType::NOISE || sampleRate <= 0) {
@@ -3779,7 +3801,7 @@ namespace pixelroot32::audio {
     // stage resolves `MixerCurve` from `profile_` once per block (S4), so it
     // has no per-voice field to write here and cannot be half-applied.
     //
-    // E0 left this body empty because `Nes` and `Hybrid` were exact aliases.
+    // E0 left this body empty because `Nes` and `Famicom` were exact aliases.
     // E1 gives it its real assignments: the envelope curve (S2), the noise
     // character (S5) and the stepped PULSE duty (S6).
     void ApuCore::applyProfileCharacter(int slot,
@@ -3864,7 +3886,7 @@ namespace pixelroot32::audio {
             }
         }
 
-        // S6 / D-3 tiers 1-3: PULSE duty. `Nes`/`Hybrid` arm the NES step
+        // S6 / D-3 tiers 1-3: PULSE duty. `Nes`/`Famicom` arm the NES step
         // nearest the note's own `duty`; `Legacy` keeps the continuous
         // comparison. The writer is PULSE-only by construction — the index is
         // read by the pulse generator alone, but resolving it for the other
@@ -4568,11 +4590,13 @@ namespace pixelroot32::audio {
         const bool nesWeighted =
             (profileMixerCurve(profile_) == MixerCurve::NesWeighted);
 
-        // E2/S4: the mipmap read is `Hybrid` character, resolved once per block
-        // like the mixer curve rather than tested against `profile_` inside the
-        // sample loop. `Legacy` and `Nes` keep `generateSawSampleQ15`, the ideal
-        // ramp; `Nes` keeps its aliasing on purpose (P4).
-        const bool sawWavetable = (profile_ == SoundProfile::Hybrid);
+        // E2/S4: the band-limited mipmap read is DORMANT (see the note above
+        // `generateBandLimitedSawSampleQ15`): no profile selects it, so every
+        // profile keeps `generateSawSampleQ15`, the ideal ramp, with its
+        // aliasing on purpose (P4). The flag stays a block-constant so the
+        // read keeps compiling and an opt-in can be wired here later; being a
+        // compile-time false, the dead branch costs nothing.
+        const bool sawWavetable = kBandLimitedSaw;
 
         // S4/S5: everything the mix does to a voice that is CONSTANT for the
         // whole block is folded into one Q15 gain here, once per voice, instead
@@ -4592,7 +4616,7 @@ namespace pixelroot32::audio {
         // 256-LSB steps of `sum`, so a sample sitting on a step boundary can
         // move by that LUT's own step (~100 LSB down where its slope is
         // steepest) instead of by 1. Measured against the previous tree:
-        // `Legacy` byte-identical, and `Nes`/`Hybrid` peak and RMS within
+        // `Legacy` byte-identical, and `Nes`/`Famicom` peak and RMS within
         // 0.002 % with a worst single-sample delta of 101 LSB on the two scenes
         // that mix a TRIANGLE voice (the pulse weight is Q12 unity, so the
         // committed goldens, a pulse-only track, are byte-identical).
@@ -4614,7 +4638,7 @@ namespace pixelroot32::audio {
         // one and never leaves this function.
         int32_t volQ15[MAX_VOICES];
         int32_t mixGainQ15[MAX_VOICES];
-        // E2/T4: the `Hybrid` SAW read state, resolved here once per voice
+        // E2/T4: the band-limited SAW read state (dormant), resolved here once per voice
         // instead of once per sample. Only the SAW branch below reads an entry,
         // and `type` cannot change between this fold and that branch (see the
         // note above about `initVoiceFromEvent`), so the other slots are left
@@ -4708,8 +4732,8 @@ namespace pixelroot32::audio {
                 } else if (auto gen = WAVE_GENERATORS_Q15[static_cast<int>(ch.type)]) {
                     // SAW: function pointer lookup. (TRIANGLE handled above,
                     // PULSE handled above, NOISE / SINE handled above.)
-                    // E2/S4: `Hybrid` reads the band-limited mipmap instead; the
-                    // other profiles reach the same ideal ramp as before.
+                    // E2/S4: the band-limited mipmap read is dormant; every
+                    // profile reaches the ideal ramp.
                     s = sawWavetable ? generateBandLimitedSawSampleQ15(ch, sawReadBand[c])
                                      : gen(ch);
                 } else {
@@ -4904,7 +4928,7 @@ namespace pixelroot32::audio {
                 }
             }
 
-            // E2/S1: the output stage is profile character. `Nes`/`Hybrid`
+            // E2/S1: the output stage is profile character. `Nes`/`Famicom`
             // run the shared three-stage chain (HPF 90 -> HPF 440 -> LPF) on
             // the summed mix; `Legacy` keeps the historical single-pole HPF
             // byte for byte, on every build. Which one runs was resolved on

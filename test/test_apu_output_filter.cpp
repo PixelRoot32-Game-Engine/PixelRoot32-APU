@@ -1,10 +1,11 @@
 /**
  * @file test_apu_output_filter.cpp
- * @brief E2/S1-S3, S8: output filter chain of the `Nes` / `Hybrid` profiles.
+ * @brief E2/S1-S3, S8: output filter chains of the `Nes` / `Famicom` profiles.
  *
- * The chain is HPF 1st order at 90 Hz -> HPF 1st order at 440 Hz -> LPF 2nd
- * order Butterworth at `min(14 kHz, 0.45 * fs)`, applied once to the summed
- * mix. It is profile character, so it is exercised through PRODUCTION code:
+ * `Nes` runs HPF 1st order at 90 Hz -> HPF 1st order at 440 Hz -> LPF 2nd
+ * order Butterworth at `min(14 kHz, 0.45 * fs)`; `Famicom` runs one HPF 1st
+ * order at 37 Hz -> the same LPF (the 440 Hz section is bypassed). Either
+ * chain is applied once to the summed mix. It is profile character, so it is exercised through PRODUCTION code:
  * every case feeds a buffer through `ApuCore::processOutputStageForTesting`,
  * which runs the same `applyOutputStage` the integer render loop calls. No
  * case here re-implements the filter math; the only reference arithmetic is
@@ -12,7 +13,10 @@
  *
  * Coverage:
  *   - S2 response: 20 Hz .. 0.45 * fs, log-spaced, against the cascade
- *     computed in double, within +-1 dB, at 8 000 / 22 050 / 44 100 / 48 000.
+ *     computed in double, within +-1 dB, at 8 000 / 22 050 / 44 100 / 48 000,
+ *     for both chains.
+ *   - Famicom low end: at 65 / 110 Hz `Famicom` stays within 1.5 dB of unity
+ *     while `Nes` loses more than 15 / 10 dB (the reason the profile exists).
  *   - S3 stability: full-scale alternating and DC runs at each rate, chain
  *     active and inactive, with the recursion state pinned to its bound.
  *   - S8 precedence: `setHpfCutoffHz()` outranks the profile, `reset()`
@@ -47,6 +51,8 @@ constexpr double kPi = 3.14159265358979323846;
 // itself.
 constexpr double kHpf1Hz = 90.0;
 constexpr double kHpf2Hz = 440.0;
+// `Famicom`: one coupling high-pass, no second section.
+constexpr double kFamicomHpfHz = 37.0;
 constexpr double kLpfMaxHz = 14000.0;
 // Audit P3 risk (iii): 0.45 * fs at 8 kHz is 3.6 kHz and would gut the
 // passband, so the LPF engages only when 0.45 * fs >= 6 kHz.
@@ -76,15 +82,19 @@ constexpr int32_t kProductBoundQ15 = 65535;
 struct Theory {
     double r1 = 0.0;
     double r2 = 0.0;
+    bool hpf2 = true;  ///< false: the second section is bypassed (`Famicom`)
     bool lpf = false;
     double b0 = 0.0, b1 = 0.0, b2 = 0.0, a1 = 0.0, a2 = 0.0;
 };
 
 /// @brief Ideal cascade at `fs` (same policy the profile implements).
-Theory makeTheory(double fs) {
+///
+/// `hpf2Hz <= 0` states a chain with one high-pass only.
+Theory makeTheory(double fs, double hpf1Hz = kHpf1Hz, double hpf2Hz = kHpf2Hz) {
     Theory t;
-    t.r1 = std::exp(-2.0 * kPi * kHpf1Hz / fs);
-    t.r2 = std::exp(-2.0 * kPi * kHpf2Hz / fs);
+    t.r1 = std::exp(-2.0 * kPi * hpf1Hz / fs);
+    t.hpf2 = (hpf2Hz > 0.0);
+    t.r2 = t.hpf2 ? std::exp(-2.0 * kPi * hpf2Hz / fs) : 0.0;
     const double fc45 = 0.45 * fs;
     t.lpf = (fc45 >= kLpfEnableMin45FsHz);
     if (t.lpf) {
@@ -112,7 +122,10 @@ double hpfMag(double r, double w) {
 
 /// @brief |H| of the whole cascade at angular frequency `w`.
 double theoryMag(const Theory& t, double w) {
-    double m = hpfMag(t.r1, w) * hpfMag(t.r2, w);
+    double m = hpfMag(t.r1, w);
+    if (t.hpf2) {
+        m *= hpfMag(t.r2, w);
+    }
     if (t.lpf) {
         const double cw = std::cos(w);
         const double sw = std::sin(w);
@@ -184,13 +197,15 @@ double measureGain(ApuCore& apu, int fs, double f) {
 }
 
 /// @brief S2: worst |measured - theory| in dB over 20 Hz .. 0.45 * fs.
-double assert_response_at_rate(int fs) {
+double assert_response_at_rate(int fs, SoundProfile profile = SoundProfile::Nes) {
     ApuCore apu;
     apu.init(fs);
-    apu.setSoundProfile(SoundProfile::Nes);
+    apu.setSoundProfile(profile);
     TEST_ASSERT_TRUE(apu.isOutputFilterChainActiveForTesting());
 
-    const Theory theory = makeTheory(static_cast<double>(fs));
+    const Theory theory = (profile == SoundProfile::Famicom)
+        ? makeTheory(static_cast<double>(fs), kFamicomHpfHz, 0.0)
+        : makeTheory(static_cast<double>(fs));
     TEST_ASSERT_EQUAL_INT(theory.lpf ? 1 : 0,
                           apu.isOutputFilterLpfActiveForTesting() ? 1 : 0);
 
@@ -224,7 +239,8 @@ double assert_response_at_rate(int fs) {
         TEST_ASSERT_TRUE_MESSAGE(std::fabs(db) <= kResponseToleranceDb, message);
     }
 
-    std::printf("  response fs=%5d Hz: worst %+.3f dB at %.1f Hz\n",
+    std::printf("  response %-7s fs=%5d Hz: worst %+.3f dB at %.1f Hz\n",
+                (profile == SoundProfile::Famicom) ? "Famicom" : "Nes",
                 fs, worstDb, worstHz);
     return worstDb;
 }
@@ -355,6 +371,55 @@ void test_output_filter_response_48000(void) {
     assert_response_at_rate(48000);
 }
 
+// `Famicom`: one 37 Hz high-pass, then the same LPF policy.
+void test_output_filter_famicom_response_8000(void) {
+    assert_response_at_rate(8000, SoundProfile::Famicom);
+}
+
+void test_output_filter_famicom_response_22050(void) {
+    assert_response_at_rate(22050, SoundProfile::Famicom);
+}
+
+void test_output_filter_famicom_response_44100(void) {
+    assert_response_at_rate(44100, SoundProfile::Famicom);
+}
+
+void test_output_filter_famicom_response_48000(void) {
+    assert_response_at_rate(48000, SoundProfile::Famicom);
+}
+
+// The reason `Famicom` exists: the bass and kick fundamentals the `Nes` chain
+// removes survive its single coupling high-pass. Measured on the production
+// stage at the two frequencies the analysis quoted (65 Hz kick body, 110 Hz
+// bass): `Nes` loses ~20 / ~14 dB there, `Famicom` about 1.2 / 0.5 dB.
+void test_output_filter_famicom_keeps_the_low_end(void) {
+    constexpr int fs = 44100;
+    ApuCore nes;
+    nes.init(fs);
+    nes.setSoundProfile(SoundProfile::Nes);
+    ApuCore famicom;
+    famicom.init(fs);
+    famicom.setSoundProfile(SoundProfile::Famicom);
+    TEST_ASSERT_TRUE(famicom.isOutputFilterChainActiveForTesting());
+
+    struct Probe {
+        double hz;
+        double nesBelowDb;  ///< `Nes` must lose MORE than this
+    };
+    const Probe probes[] = {{65.0, -15.0}, {110.0, -10.0}};
+    for (const Probe& p : probes) {
+        const double nesDb = 20.0 * std::log10(measureGain(nes, fs, p.hz));
+        const double famicomDb = 20.0 * std::log10(measureGain(famicom, fs, p.hz));
+        char message[160] = {};
+        std::snprintf(message, sizeof(message),
+                      "%.0f Hz: Nes %+.2f dB, Famicom %+.2f dB", p.hz, nesDb,
+                      famicomDb);
+        std::printf("  low end %s\n", message);
+        TEST_ASSERT_TRUE_MESSAGE(std::fabs(famicomDb) <= 1.5, message);
+        TEST_ASSERT_TRUE_MESSAGE(nesDb < p.nesBelowDb, message);
+    }
+}
+
 // =============================================================================
 // S3 - stability
 // =============================================================================
@@ -424,6 +489,20 @@ void test_output_filter_override_precedes_profile(void) {
     apu.reset();
     TEST_ASSERT_TRUE(apu.isOutputFilterChainActiveForTesting());
     TEST_ASSERT_TRUE(apu.getHpfCutoffHzForTesting() < 0.0f);
+
+    // The override outranks the `Famicom` chain the same way, in either order.
+    ApuCore famicom;
+    famicom.init(44100);
+    famicom.setHpfCutoffHz(35.0f);
+    famicom.setSoundProfile(SoundProfile::Famicom);
+    TEST_ASSERT_FALSE(famicom.isOutputFilterChainActiveForTesting());
+    std::vector<int16_t> famicomStage = probe;
+    famicom.processOutputStageForTesting(famicomStage.data(),
+                                         static_cast<int>(famicomStage.size()));
+    TEST_ASSERT_EQUAL_MEMORY(expected.data(), famicomStage.data(),
+                             expected.size() * sizeof(int16_t));
+    famicom.reset();
+    TEST_ASSERT_TRUE(famicom.isOutputFilterChainActiveForTesting());
 }
 
 // =============================================================================
@@ -495,6 +574,35 @@ void test_output_filter_activation_and_lpf_policy(void) {
     TEST_ASSERT_TRUE(apu.isOutputFilterLpfActiveForTesting());
     TEST_ASSERT_FLOAT_WITHIN(1.0f, 6000.3f,
                              apu.getOutputFilterLpfCutoffHzForTesting());
+
+    // `Famicom`: one 37 Hz high-pass, the second section bypassed, the same
+    // LPF policy. The bypass is a unity pole (R = 1.0, 32768 in Q15): with the
+    // state cleared on activation, `y = x - x[n-1] + y[n-1]` is then exactly
+    // `y = x`, so the section passes its input through bit for bit.
+    apu.init(44100);
+    apu.setSoundProfile(SoundProfile::Famicom);
+    TEST_ASSERT_TRUE(apu.isOutputFilterChainActiveForTesting());
+    TEST_ASSERT_TRUE(apu.isOutputFilterLpfActiveForTesting());
+    TEST_ASSERT_FLOAT_WITHIN(0.01f, 37.0f,
+                             apu.getOutputFilterHpf1CutoffHzForTesting());
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 0.0f,
+                             apu.getOutputFilterHpf2CutoffHzForTesting());
+    TEST_ASSERT_EQUAL_INT32(32768, apu.getOutputFilterHpf2RQ15ForTesting());
+    TEST_ASSERT_FLOAT_WITHIN(0.01f, 14000.0f,
+                             apu.getOutputFilterLpfCutoffHzForTesting());
+    const double rFamicom = std::exp(-2.0 * kPi * kFamicomHpfHz / 44100.0);
+    TEST_ASSERT_EQUAL_INT32(static_cast<int32_t>(std::lround(rFamicom * 32768.0)),
+                            apu.getOutputFilterHpf1RQ15ForTesting());
+    apu.init(8000);
+    TEST_ASSERT_TRUE(apu.isOutputFilterChainActiveForTesting());
+    TEST_ASSERT_FALSE(apu.isOutputFilterLpfActiveForTesting());
+
+    // Back to `Nes`: its second section is a real 440 Hz pole again.
+    apu.init(44100);
+    apu.setSoundProfile(SoundProfile::Nes);
+    TEST_ASSERT_FLOAT_WITHIN(0.01f, 440.0f,
+                             apu.getOutputFilterHpf2CutoffHzForTesting());
+    TEST_ASSERT_TRUE(apu.getOutputFilterHpf2RQ15ForTesting() < 32768);
 }
 
 // =============================================================================
@@ -505,10 +613,11 @@ void test_output_filter_coefficients_stay_inside_the_product_bound(void) {
     // Every product is an int32 Q15 coefficient times an int16 state. The
     // int32 product only holds while |coefficient| < 2^16, so the bound is
     // asserted over the whole supported rate range rather than assumed.
+    for (SoundProfile profile : {SoundProfile::Nes, SoundProfile::Famicom})
     for (int fs : {8000, 11025, 22050, 32000, 44100, 48000}) {
         ApuCore apu;
         apu.init(fs);
-        apu.setSoundProfile(SoundProfile::Nes);
+        apu.setSoundProfile(profile);
 
         const int32_t coefficients[] = {
             apu.getOutputFilterHpf1RQ15ForTesting(),
@@ -532,6 +641,11 @@ int main(void) {
     RUN_TEST(test_output_filter_response_22050);
     RUN_TEST(test_output_filter_response_44100);
     RUN_TEST(test_output_filter_response_48000);
+    RUN_TEST(test_output_filter_famicom_response_8000);
+    RUN_TEST(test_output_filter_famicom_response_22050);
+    RUN_TEST(test_output_filter_famicom_response_44100);
+    RUN_TEST(test_output_filter_famicom_response_48000);
+    RUN_TEST(test_output_filter_famicom_keeps_the_low_end);
     RUN_TEST(test_output_filter_stability_8000);
     RUN_TEST(test_output_filter_stability_22050);
     RUN_TEST(test_output_filter_stability_44100);

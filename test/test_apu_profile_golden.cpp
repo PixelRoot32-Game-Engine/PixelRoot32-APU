@@ -1,21 +1,22 @@
 /// test_apu_profile_golden.cpp - S7 goldens of the two audible profiles.
 ///
-/// E1 gives `Nes` and `Hybrid` their own character — envelope curve, weighted
-/// mix, unipolar noise on the NES period LUT and stepped PULSE duty — so
-/// neither can share `Legacy`'s fixture any more: each profile is pinned by one
-/// committed render of the canonical track, and `Legacy` keeps its own two
-/// references untouched.
+/// `Nes` and `Famicom` own a character — weighted mix, unipolar noise on the
+/// NES period LUT, stepped PULSE duty and a profile output stage — so neither
+/// can share `Legacy`'s fixture: each profile is pinned by one committed
+/// render of the canonical track, and `Legacy` keeps its own two references
+/// untouched. The two profiles share every voice-side character and differ
+/// only in the output stage (`Nes`: HPF 90 Hz -> HPF 440 Hz -> LPF; `Famicom`:
+/// HPF 37 Hz -> LPF) and its level trim, which is what their fixtures differ
+/// by.
 ///
-/// Two scenes are pinned, not one. The canonical track is PULSE-only, so it
-/// cannot observe E2's band-limited SAW (S4): `Hybrid`'s canonical fixture is
-/// byte-identical before and after the mipmap landed, and the unit suite that
-/// proves the read re-derives it. The second scene
+/// Two scenes are pinned, not one. The second scene
 /// (`apu_wavetable_track.h`) renders four SAW notes — 55 Hz, 220 Hz gliding
 /// through a mipmap level boundary, 880 Hz and 1 760 Hz — through the same
-/// command API, so a committed file now fails end to end when the level
-/// selection, the crossfade or the table read changes. `Nes` keeps the ideal
-/// ramp, so its wavetable fixture is the reference the `Hybrid` one is read
-/// against, not a second copy of it.
+/// command API. It was written for 2.2.x's `Hybrid` band-limited SAW, which is
+/// now dormant (no profile selects it): both profiles render the ideal ramp,
+/// so the scene pins the SAW path and the low end the two output stages treat
+/// differently, and a file fails end to end if a profile starts reading the
+/// mipmap again.
 ///
 /// Both profiles render the integer core by definition (`profileUsesIntegerCore`),
 /// so the two targets that compile this source differ only in the core
@@ -51,17 +52,17 @@ struct ProfileFixture {
     void (*render)(ApuCore&, int16_t*, int);
 };
 
-/// @brief The E1 profile goldens, plus the E2 wavetable goldens that pin the
-/// band-limited SAW the canonical track cannot reach.
+/// @brief The profile goldens, plus the wavetable-scene goldens that pin the
+/// SAW path the PULSE-only canonical track cannot reach.
 static const ProfileFixture kFixtures[] = {
     {"apu_nes_canonical_s16le_44100.pcm", SoundProfile::Nes, "Nes",
      apu_golden::render_canonical},
-    {"apu_hybrid_canonical_s16le_44100.pcm", SoundProfile::Hybrid, "Hybrid",
+    {"apu_famicom_canonical_s16le_44100.pcm", SoundProfile::Famicom, "Famicom",
      apu_golden::render_canonical},
     {"apu_nes_wavetable_s16le_44100.pcm", SoundProfile::Nes, "Nes wavetable",
      apu_golden::render_wavetable},
-    {"apu_hybrid_wavetable_s16le_44100.pcm", SoundProfile::Hybrid, "Hybrid wavetable",
-     apu_golden::render_wavetable},
+    {"apu_famicom_wavetable_s16le_44100.pcm", SoundProfile::Famicom,
+     "Famicom wavetable", apu_golden::render_wavetable},
 };
 
 /// @brief S16 samples per fixture; both scenes render the same length, so the
@@ -164,8 +165,8 @@ void test_apu_profile_golden_nes(void)
     assert_profile_golden(kFixtures[0]);
 }
 
-/// @brief S7: `Hybrid` renders the bytes of its own committed reference.
-void test_apu_profile_golden_hybrid(void)
+/// @brief S7: `Famicom` renders the bytes of its own committed reference.
+void test_apu_profile_golden_famicom(void)
 {
     assert_profile_golden(kFixtures[1]);
 }
@@ -176,8 +177,9 @@ void test_apu_profile_golden_nes_wavetable(void)
     assert_profile_golden(kFixtures[2]);
 }
 
-/// @brief S4/S6/S9: `Hybrid` renders the wavetable scene from the mipmap.
-void test_apu_profile_golden_hybrid_wavetable(void)
+/// @brief S3/S9: `Famicom` renders the wavetable scene with the ideal ramp,
+/// through its own output stage.
+void test_apu_profile_golden_famicom_wavetable(void)
 {
     assert_profile_golden(kFixtures[3]);
 }
@@ -186,8 +188,8 @@ int main(void)
 {
     UNITY_BEGIN();
     RUN_TEST(test_apu_profile_golden_nes);
-    RUN_TEST(test_apu_profile_golden_hybrid);
+    RUN_TEST(test_apu_profile_golden_famicom);
     RUN_TEST(test_apu_profile_golden_nes_wavetable);
-    RUN_TEST(test_apu_profile_golden_hybrid_wavetable);
+    RUN_TEST(test_apu_profile_golden_famicom_wavetable);
     return UNITY_END();
 }

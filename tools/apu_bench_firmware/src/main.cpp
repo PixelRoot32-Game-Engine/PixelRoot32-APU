@@ -374,14 +374,14 @@ void setup()
         {SoundProfile::Nes, "Nes", 22050, 8},
         {SoundProfile::Nes, "Nes", 32000, 1},
         {SoundProfile::Nes, "Nes", 32000, 8},
-        // E2: `Hybrid` is the only profile whose SAW reads the band-limited
-        // tables, so it is the only row that carries BOTH changes (the output
-        // chain and the mipmap read). Measuring only `Nes` would report the
-        // filter as the whole cost.
-        {SoundProfile::Hybrid, "Hybrid", 22050, 1},
-        {SoundProfile::Hybrid, "Hybrid", 22050, 8},
-        {SoundProfile::Hybrid, "Hybrid", 32000, 1},
-        {SoundProfile::Hybrid, "Hybrid", 32000, 8},
+        // `Famicom` shares the `Nes` voice path and differs only in the
+        // output stage (one 37 Hz HPF -> LPF; its second HPF section is a
+        // unity-pole pass-through), so its rows should match `Nes` within
+        // noise. The band-limited SAW read is dormant: no row reaches it.
+        {SoundProfile::Famicom, "Famicom", 22050, 1},
+        {SoundProfile::Famicom, "Famicom", 22050, 8},
+        {SoundProfile::Famicom, "Famicom", 32000, 1},
+        {SoundProfile::Famicom, "Famicom", 32000, 8},
     };
 
     Serial.println("profile,rate,voices,p50_us,p99_us,us_per_sample");

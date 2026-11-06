@@ -210,8 +210,9 @@ struct InstrumentPreset {
      * @brief Shape of this note's ADSR decay and release (E1, S2).
      *
      * `ProfileDefault` (= 0, the default) means "the active sound profile
-     * decides": `Legacy` and `Nes` keep the frozen linear ramp, `Hybrid`
-     * renders the exponential one. Any other value is the note overriding the
+     * decides": `Legacy`, `Nes` and `Famicom` all keep the frozen linear ramp;
+     * only an explicit `EnvelopeCurve::Exponential` renders the exponential
+     * one. Any other value is the note overriding the
      * profile — the third tier of the D-3 precedence table, where the profile
      * wins over the per-voice opt-ins but the note still wins inside its own
      * domain (ADSR is one of those domains).
@@ -219,7 +220,7 @@ struct InstrumentPreset {
      * `ApuCore::applyProfileCharacter` resolves this into the voice's own
      * mirror on every note-on, so the renderer never sees `ProfileDefault`.
      * Under `Legacy` the mirror resolves correctly but the frozen float body
-     * ignores it; only the integer core (which `Nes`/`Hybrid` always select)
+     * ignores it; only the integer core (which `Nes`/`Famicom` always select)
      * applies the curve, per S1.
      *
      * Deliberately the LAST member: every shipped `INSTR_*` preset and every
@@ -231,7 +232,7 @@ struct InstrumentPreset {
     /**
      * @brief Whether this note keeps the NOISE period it authored (E3/A1).
      *
-     * `ProfileDefault` (= 0) means "the profile decides": under `Nes`/`Hybrid`
+     * `ProfileDefault` (= 0) means "the profile decides": under `Nes`/`Famicom`
      * the profile arms the NES period LUT and retunes the voice, which is what
      * a chip-style lead wants. `Note` keeps the note's own `noisePeriod` (or
      * its frequency-derived clock when that is 0) for that note only, without
@@ -250,7 +251,7 @@ struct InstrumentPreset {
     /**
      * @brief Whether this PULSE note keeps the continuous duty generator (E3/A2).
      *
-     * `ProfileDefault` (= 0) means "the profile decides": `Nes`/`Hybrid` snap
+     * `ProfileDefault` (= 0) means "the profile decides": `Nes`/`Famicom` snap
      * the note's `duty` to the nearest NES pattern. `Continuous` keeps
      * `phaseQ32 < dutyCycleQ32` for that note, the same outcome an animated
      * duty already produces, without pinning the slot. PULSE only, and
@@ -418,7 +419,58 @@ constexpr InstrumentPreset INSTR_KICK{
     false,    // noiseLfsrShort – kick is not metallic
     0.0f,      // dutySweep
     0.0f,     // pitchSweepEndHz
-    0.0f      // pitchSweepDurationSec
+    0.0f,     // pitchSweepDurationSec
+    false,    // nesAccurate
+    false,    // noiseShortMode (deprecated alias — keep in sync with noiseLfsrShort)
+    EnvelopeCurve::ProfileDefault,  // envelopeCurve
+    // noisePeriodMode – pin the authored 60-sample period. Under `Nes`/`Famicom`
+    // the profile would otherwise arm NES LUT index 0 (a 1-sample period, white
+    // hiss) and the kick would lose its low body. `Legacy` ignores the mode.
+    NoisePeriodMode::Note
+};
+
+/**
+ * @brief Triangle kick for the NES profiles: a fast downward pitch sweep.
+ *
+ * The NES has no sample-based kick; games drop the TRIANGLE channel from about
+ * 200 Hz to about 50 Hz in a few tens of milliseconds, which reads as a deep,
+ * tonal "thump". This preset does the same with the existing single-segment
+ * pitch sweep: the note starts at its own pitch and glides linearly to
+ * `pitchSweepEndHz` over `pitchSweepDurationSec`, with a near-instant attack
+ * and a short decay into silence (no sustain).
+ *
+ * How to use it:
+ *   - Play it on a TRIANGLE voice, i.e. a `MusicTrack` whose `channelType` is
+ *     `WaveType::TRIANGLE` (the bass slot in a typical arrangement). It is NOT
+ *     percussion in the `duty == 0` sense: `duty` is non-zero on purpose, so it
+ *     is never routed to the NOISE channel.
+ *   - Write it as `makeNote(INSTR_KICK_TRI, Note::G, beats)`: the default
+ *     octave 3 gives G3 = 196 Hz, the start of the sweep. Another note moves
+ *     the start pitch; the end stays at 50 Hz.
+ *   - For the classic NES attack, double it with a short NOISE hit on the same
+ *     step (for example `INSTR_SNARE` or `INSTR_HIHAT`, or `INSTR_KICK` for a
+ *     fuller transient): the triangle carries the body, the noise the click.
+ *
+ * It works under every profile; the NES profiles are the ones it is tuned for.
+ */
+constexpr InstrumentPreset INSTR_KICK_TRI{
+    0.50f,    // baseVolume – the triangle mix weight is lower than PULSE
+    0.5f,     // duty (unused for triangle; non-zero so it is never NOISE percussion)
+    3,        // defaultOctave – G3 = 196 Hz, the sweep's start pitch
+    0.0f,     // defaultDuration (melodic voice: the note's own length gates it)
+    0,        // noisePeriod (unused)
+    0.001f,   // attackTime  – near-instant
+    0.09f,    // decayTime   – short body, silent before a typical 1/8 note ends
+    0.00f,    // sustainLevel– no sustain
+    0.02f,    // releaseTime – anti-click tail if the gate closes mid-decay
+    LfoTarget::NONE,
+    0.0f,     // lfoFrequency
+    0.0f,     // lfoDepth
+    0.0f,     // lfoDelay
+    false,    // noiseLfsrShort (unused)
+    0.0f,     // dutySweep
+    50.0f,    // pitchSweepEndHz – the low end of the thump
+    0.045f    // pitchSweepDurationSec – ~200 Hz -> 50 Hz in 45 ms
 };
 
 constexpr InstrumentPreset INSTR_SNARE{
@@ -440,7 +492,12 @@ constexpr InstrumentPreset INSTR_SNARE{
     0.0f,     // pitchSweepEndHz
     0.0f,     // pitchSweepDurationSec
     false,    // nesAccurate
-    true      // noiseShortMode (deprecated alias, last member — keep in sync)
+    true,     // noiseShortMode (deprecated alias — keep in sync with noiseLfsrShort)
+    EnvelopeCurve::ProfileDefault,  // envelopeCurve
+    // noisePeriodMode – pin the authored 15-sample period, the snare's crack
+    // and body. NES LUT index 0 would turn it into the same 1-sample hiss as
+    // the hi-hat under `Nes`/`Famicom`. `Legacy` ignores the mode.
+    NoisePeriodMode::Note
 };
 
 constexpr InstrumentPreset INSTR_HIHAT{
@@ -462,7 +519,11 @@ constexpr InstrumentPreset INSTR_HIHAT{
     0.0f,     // pitchSweepEndHz
     0.0f,     // pitchSweepDurationSec
     false,    // nesAccurate
-    true      // noiseShortMode (deprecated alias, last member — keep in sync)
+    true      // noiseShortMode (deprecated alias — keep in sync with noiseLfsrShort)
+    // envelopeCurve / noisePeriodMode deliberately left at `ProfileDefault`:
+    // under `Nes`/`Famicom` the hat takes the profile's NES LUT index 0 (the
+    // brightest NES noise period), the authentic bright NES hi-hat. The
+    // authored 12-sample period is what `Legacy` plays.
 };
 
 /**

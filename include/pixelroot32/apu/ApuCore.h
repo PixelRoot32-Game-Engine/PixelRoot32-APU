@@ -34,7 +34,7 @@ namespace pixelroot32::audio {
       *   output:      y * masterVolume * 32767, passed through a single-pole
       *                DC-blocker to remove offset + transient clicks.
       *
-      * `Nes`/`Hybrid` replace the uniform per-channel weighting with
+      * `Nes`/`Famicom` replace the uniform per-channel weighting with
       * `MixerCurve::NesWeighted` (S4): the voices are summed per group and the
       * published NES ratios decide how much each group contributes, with the
       * PULSE group anchored at exactly the level above so the change is
@@ -49,7 +49,7 @@ namespace pixelroot32::audio {
       * contains the 0.4 — see AudioMixerLUT.h.
       *
       * Since the profiles arrived (S3) the selector, not the target, decides
-      * which body runs: `Nes`/`Hybrid` use the integer core on every build, and
+      * which body runs: `Nes`/`Famicom` use the integer core on every build, and
       * `Legacy` falls back to it where the float body is not compiled
       * (`PR32_APU_ENABLE_LEGACY_FLOAT == 0`).
       */
@@ -185,7 +185,7 @@ namespace pixelroot32::audio {
          * `dutyCycle` behaviour, so existing consumers are unaffected.
          *
          * S6: since E1 the sound profile also owns this mode as its DEFAULT —
-         * `Nes` and `Hybrid` arm the step nearest the note's own `duty`, and
+         * `Nes` and `Famicom` arm the step nearest the note's own `duty`, and
          * `Legacy` arms continuous. A call here is a tier-2 override (D-3): it
          * pins the mode for the slot, so the profile does NOT re-arm its own
          * choice on the next note and the note's `duty` no longer selects the
@@ -253,7 +253,7 @@ namespace pixelroot32::audio {
          *
          * S8 (caller precedence): this setter is an explicit statement about
          * the output corner, so it OUTRANKS the sound profile. Once it has
-         * been called, `Nes` and `Hybrid` do NOT install their output filter
+         * been called, `Nes` and `Famicom` do NOT install their output filter
          * chain; the historical single-pole HPF runs at the caller's corner
          * instead — level included, because the profile's fixed gain trim is
          * part of the chain and is suppressed with it. `reset()` clears that
@@ -354,19 +354,25 @@ namespace pixelroot32::audio {
          * ignored rather than clamped, so a corrupt command cannot silently
          * change the sound to a neighbouring profile.
          *
-         * The profile also OWNS the output stage (`Nes` and `Hybrid`, S1):
-         * one shared chain applied to the summed mix, never per voice, in
-         * this order — HPF 1st order at 90 Hz, HPF 1st order at 440 Hz, LPF
-         * 2nd order Butterworth (Q = 1/sqrt(2)) at `min(14000 Hz,
-         * 0.45 * fs)`. Coefficients are derived on a configuration or rate
-         * change, never per sample. `Legacy` keeps the historical single-pole
-         * HPF and is byte-identical on every build.
+         * `Nes` and `Famicom` share every voice-side character (linear
+         * default envelope, NES-weighted mix, unipolar noise on the NES period
+         * LUT, stepped PULSE duty, ideal SAW ramp) and differ ONLY in the
+         * output stage, which the profile OWNS (S1): one shared chain applied
+         * to the summed mix, never per voice. `Nes` models the front-loading
+         * NES — HPF 1st order at 90 Hz, HPF 1st order at 440 Hz, LPF 2nd
+         * order Butterworth (Q = 1/sqrt(2)) at `min(14000 Hz, 0.45 * fs)`.
+         * `Famicom` models the Famicom's single coupling high-pass — HPF 1st
+         * order at 37 Hz, then the same LPF — so the kick and bass
+         * fundamentals the `Nes` chain removes (about -20 dB at 65 Hz) stay
+         * within ~1.2 dB of unity. Coefficients are derived on a configuration
+         * or rate change, never per sample. `Legacy` keeps the historical
+         * single-pole HPF and is byte-identical on every build.
          *
          * The LPF is deliberately NOT engaged below `0.45 * fs >= 6000 Hz`
          * (i.e. `fs >= 13334 Hz`): at 8 000 Hz `0.45 * fs` is 3 600 Hz, which
          * would cut most of the passband and gut the sound instead of
          * approximating the NES's 14 kHz roof. Below that floor the chain is
-         * the two high-passes only, which is a documented property of the
+         * its high-pass section(s) only, which is a documented property of the
          * profile, not a fallback. An explicit `setHpfCutoffHz()` call wins
          * over all of this (S8).
          *
@@ -377,32 +383,34 @@ namespace pixelroot32::audio {
          * because matching RMS alone was tried first and sounded louder than
          * `Legacy` on hardware: the chain's crest factor is 13–14 dB against
          * `Legacy`'s 4.6 dB, so equal RMS lifts every transient by 3–4 dB. On
-         * the canonical track the two profiles are therefore lifted only
-         * **1.10 dB** (`Nes`) and **1.90 dB** (`Hybrid`) after the chain and
-         * before the master bitcrush, which leaves them about 2.2 / 2.4 dB
-         * BELOW `Legacy` in RMS — deliberately, since a crest-weighted match
-         * must never end up louder in RMS than the anchor. `Legacy` is the
+         * the canonical track `Nes` is therefore lifted only **+1.10 dB**,
+         * which leaves it about 2.2 dB BELOW `Legacy` in RMS — deliberately,
+         * since a crest-weighted match must never end up louder in RMS than
+         * the anchor. `Famicom`'s single 37 Hz high-pass keeps the crest
+         * factor near `Legacy`'s (5.8 dB), so it needs a small CUT instead,
+         * **-0.27 dB**, and lands 0.3 dB below `Legacy` in RMS. Both trims are
+         * applied after the chain and before the master bitcrush. `Legacy` is the
          * frozen anchor and stays at unity — it never runs the chain, so it
          * never runs the multiply either. Both the amount and the activation
          * are resolved once per configuration change. The trim is tied to the
          * chain, so an explicit `setHpfCutoffHz()` suppresses it too: that
          * caller asked for the historical one-pole, level included. Headroom
-         * is the price of the chain's transients: with these trims the
-         * canonical peaks are ~37 % of full scale (`Nes`) and ~41 %
-         * (`Hybrid`), against `Legacy`'s 18 %, and a dense mix reaches ~52 %
-         * and ~51 % — under the rail, but with less room than `Legacy`'s ~36 %,
-         * so a consumer mixing by peak should still check its master level.
+         * is the price of the `Nes` chain's transients: with its trim the
+         * canonical peak is ~37 % of full scale, against `Legacy`'s 18 % and
+         * `Famicom`'s ~20 %, and a dense mix reaches ~52 % — under the rail,
+         * but with less room than `Legacy`'s ~36 %, so a consumer mixing by
+         * peak should still check its master level.
          *
-         * SAW is the one waveform whose TIMBRE the profile changes (S4): only
-         * `Hybrid` reads a band-limited table, a mipmap of eight 256-point Q15
-         * octaves selected from the voice's own `f / fs`, crossfaded between
-         * adjacent levels so a glissando has no seam (S6). `Legacy` and `Nes`
-         * both keep the ideal ramp and its aliasing; `Nes` does so on purpose
-         * (P4) — its PULSE character deliberately reproduces the NES's own
-         * artefacts, and the untuned SAW is simply left alone rather than
-         * given a half-NES treatment. SINE is unchanged on every profile:
-         * it is a single harmonic, so band-limiting it would spend flash to
-         * remove an artefact it does not have (L5).
+         * SAW renders the ideal ramp on every profile, aliasing included;
+         * `Nes` and `Famicom` keep it on purpose (P4), since their character
+         * deliberately reproduces the hardware's own artefacts. The
+         * band-limited mipmap read 2.2.x gave `Hybrid` (eight 256-point Q15
+         * octaves, `AudioOscMipLUT.h`) is DORMANT: it still compiles, but no
+         * profile selects it, pending a decision to remove it or expose it as
+         * a per-voice option. SINE is unchanged on every profile (L5).
+         *
+         * `SoundProfile::Hybrid` is a deprecated alias of `Famicom` (same
+         * value, 2), so 2.2.x code keeps compiling with a warning.
          *
          * Thread safety: like `setVoiceNesOptions`, this mutates configuration
          * the renderer reads and is NOT safe to call concurrently with
@@ -413,8 +421,9 @@ namespace pixelroot32::audio {
          * `init()` deliberately leaves it alone: a stream restart must not
          * discard the caller's choice.
          *
-         * @param profile Profile to apply. `Legacy`, `Nes` or `Hybrid`;
-         *                anything else is ignored.
+         * @param profile Profile to apply. `Legacy`, `Nes` or `Famicom`
+         *                (or its deprecated alias `Hybrid`); anything else is
+         *                ignored.
          */
         void setSoundProfile(SoundProfile profile);
 
@@ -773,7 +782,7 @@ namespace pixelroot32::audio {
          */
         uint32_t getVoicePhaseIncQ32ForTesting(int slot) const;
         /**
-         * @brief Test-only: SAW mipmap level the `Hybrid` read selects.
+         * @brief Test-only: SAW mipmap level the dormant band-limited read selects.
          *
          * Exposes the production selector (`level = floor(log2(q)) + 9`,
          * clamped to [0, 7], `q = phaseIncQ32 / 2^32`) so a test can assert it
@@ -1045,7 +1054,7 @@ namespace pixelroot32::audio {
          * to change it and this accessor is the way to observe that.
          *
          * @return `Rational` under `Legacy`, `NesWeighted` under `Nes` and
-         *         `Hybrid`.
+         *         `Famicom`.
          */
         MixerCurve getMixerCurveForTesting() const;
 
@@ -1103,9 +1112,9 @@ namespace pixelroot32::audio {
         /**
          * @brief Test-only: true when the profile chain is installed.
          *
-         * Reports the resolved state the render loop reads: `Nes`/`Hybrid`
+         * Reports the resolved state the render loop reads: `Nes`/`Famicom`
          * with no caller `setHpfCutoffHz` override.
-         * @return true when the render loop runs the three-stage chain.
+         * @return true when the render loop runs the profile chain.
          */
         bool isOutputFilterChainActiveForTesting() const;
 
@@ -1188,7 +1197,7 @@ namespace pixelroot32::audio {
          * @brief Reports whether the active profile renders through the integer core.
          *
          * Derived from the profile selector and the build's float-path switch,
-         * never from `PR32_APU_HAS_FPU`: on an FPU target `Nes`/`Hybrid` still
+         * never from `PR32_APU_HAS_FPU`: on an FPU target `Nes`/`Famicom` still
          * pick the integer body, and with `PR32_APU_ENABLE_LEGACY_FLOAT == 0`
          * `Legacy` falls back to it as well.
          *
@@ -1241,7 +1250,7 @@ namespace pixelroot32::audio {
          * profile once per block (S4), so there is nothing for this function
          * to write for it and nothing that could be half-applied per voice.
          *
-         * E0: `Nes`/`Hybrid` are exact aliases and therefore write nothing —
+         * E0: `Nes` and value 2 were exact aliases and therefore wrote nothing —
          * the note path already leaves those values (S3). E1 fills the body:
          * the envelope curve (S2), the noise character (S5) and the stepped
          * PULSE duty (S6), each as a DEFAULT the note or the voice may pin.
@@ -1305,12 +1314,14 @@ namespace pixelroot32::audio {
          */
         bool hpfCutoffOverridden_ = false;
 
-        // -- Output filter chain, `Nes` / `Hybrid` (E2/S1) ------------------
+        // -- Output filter chain, `Nes` / `Famicom` (E2/S1) -----------------
         //
-        // One shared stage on the summed mix: HPF 90 Hz -> HPF 440 Hz ->
-        // Butterworth LPF. The one-pole above is the `Legacy` stage and keeps
-        // running unchanged when the chain is inactive; the render loop picks
-        // one or the other per sample through `applyOutputStage`.
+        // One shared stage on the summed mix. `Nes`: HPF 90 Hz -> HPF 440 Hz
+        // -> Butterworth LPF. `Famicom`: HPF 37 Hz -> the same LPF, its second
+        // high-pass section bypassed by a unity pole (`kOutputHpfBypassRQ15`).
+        // The one-pole above is the `Legacy` stage and keeps running unchanged
+        // when the chain is inactive; the render loop picks one or the other
+        // per sample through `applyOutputStage`.
         //
         // The two first-order high-passes are DELIBERATELY kept as two
         // sections instead of being merged into one second-order section with
@@ -1330,6 +1341,15 @@ namespace pixelroot32::audio {
         // `int64_t`.
         static constexpr float kOutputHpf1Hz = 90.0f;
         static constexpr float kOutputHpf2Hz = 440.0f;
+        /** `Famicom`'s single coupling high-pass (its first section). */
+        static constexpr float kOutputFamicomHpfHz = 37.0f;
+        /**
+         * Unity pole, Q15: a first-order section with R = 1.0 and cleared
+         * state passes its input through exactly (`y = x - x[n-1] + y[n-1]`
+         * with `y[n-1] == x[n-1]`). How `Famicom` bypasses the second
+         * high-pass without a per-sample branch on the `Nes` path.
+         */
+        static constexpr int32_t kOutputHpfBypassRQ15 = 32768;
         static constexpr float kOutputLpfMaxHz = 14000.0f;
         /** 0.45 * fs floor below which the LPF would gut the passband. */
         static constexpr float kOutputLpfMin45FsHz = 6000.0f;
@@ -1349,6 +1369,8 @@ namespace pixelroot32::audio {
                       "output chain coefficient must stay below 2^16");
         static_assert(kOutputStateQ15Max <= 32768,
                       "output chain state must stay inside the int16 rail");
+        static_assert(kOutputHpfBypassRQ15 <= kOutputCoeffQ15Max,
+                      "the unity bypass pole must respect the product bound");
         static_assert(
             static_cast<int64_t>(kOutputCoeffQ15Max) * kOutputStateQ15Max <=
                 2147483647LL,
@@ -1380,39 +1402,49 @@ namespace pixelroot32::audio {
          *            RMS dBFS   peak dBFS    W
          *   Legacy    -19.70     -15.10    -18.55   (frozen contract; unity)
          *   Nes       -22.98      -9.67    -19.65   -> +1.10 dB -> 37192
-         *   Hybrid    -24.01      -9.69    -20.43   -> +1.90 dB -> 40780
+         *   Famicom   -19.73     -13.91    -18.28   -> -0.27 dB -> 31765
          *
-         * with `gainQ15 = round(10^(dB/20) * 32768)`: the two integers below
-         * are exactly that value for 1.10 dB and 1.90 dB, so a reader can
-         * re-derive them from the dB figures above. Both trims are SMALLER
-         * than the equal-RMS trims that shipped first and were walked back
-         * (+3.28 / +4.31 dB, constants 47786 / 53854); the resulting RMS sits
-         * about 2.2 / 2.4 dB BELOW `Legacy`, which is the intended landing
-         * zone — a crest-weighted match must be quieter in RMS than the
-         * anchor, never louder. The float `Legacy` route reads -20.15 dBFS and
-         * is deliberately NOT matched: touching it would move the frozen path.
+         * with `gainQ15 = round(10^(dB/20) * 32768)`: the integers below are
+         * exactly that value for +1.10 dB and -0.27 dB, so a reader can
+         * re-derive them from the dB figures above. After the trim the
+         * canonical track measures `Nes` -21.88 / -8.58 / W -18.55 and
+         * `Famicom` -20.00 / -14.18 / W -18.55 (RMS / peak / W, dBFS).
+         *
+         * The `Nes` trim is SMALLER than the equal-RMS trim that shipped first
+         * and was walked back (+3.28 dB, constant 47786); its RMS sits about
+         * 2.2 dB BELOW `Legacy`, which is the intended landing zone — a
+         * crest-weighted match must be quieter in RMS than the anchor, never
+         * louder. `Famicom` keeps most of the low end the `Nes` chain removes,
+         * so its crest factor (5.8 dB) stays close to `Legacy`'s and it needs a
+         * slight cut; its RMS lands 0.3 dB below `Legacy`. (2.2.x's `Hybrid`,
+         * the previous value 2, shipped +1.90 dB / 40780 for the `Nes` chain
+         * plus an exponential envelope.) The float `Legacy` route reads
+         * -20.15 dBFS and is deliberately NOT matched: touching it would move
+         * the frozen path.
          *
          * `Legacy` never pays for this. The trim is applied only on the chain
          * branch of the render path, and `Legacy` never takes that branch, so
          * the multiply cannot reach the frozen arithmetic even as a no-op.
          *
          * The product bound is the same class as the coefficients above:
-         * |sample| <= 32767 and the largest trim is 40780, so
-         * 32767 * 40780 = 1 336 238 260 < 2^31 and the product fits `int32_t`.
+         * |sample| <= 32767 and the largest trim is `Nes`'s 37192, so
+         * 32767 * 37192 = 1 218 670 264 < 2^31 and the product fits `int32_t`.
          * The result is clamped to the int16 rail like every other stage
          * output — the trim is the only stage that can push a legal chain
          * output back over it.
          */
         static constexpr int32_t kProfileTrimUnityQ15 = 32768;   ///< 1.0, `Legacy`
         static constexpr int32_t kProfileTrimNesQ15 = 37192;     ///< +1.10 dB
-        static constexpr int32_t kProfileTrimHybridQ15 = 40780;  ///< +1.90 dB
+        static constexpr int32_t kProfileTrimFamicomQ15 = 31765;  ///< -0.27 dB
+        static_assert(kProfileTrimFamicomQ15 <= kProfileTrimNesQ15,
+                      "the product bound below is stated for the largest trim");
         static_assert(
-            static_cast<int64_t>(32767) * kProfileTrimHybridQ15 <= 2147483647LL,
-            "trim * sample must fit int32_t (32767 * 40780 = 1336238260)");
+            static_cast<int64_t>(32767) * kProfileTrimNesQ15 <= 2147483647LL,
+            "trim * sample must fit int32_t (32767 * 37192 = 1218670264)");
 
         /** True when the profile owns the stage and no caller override exists. */
         bool outputFilterActive_ = false;
-        /** False below the 6 kHz floor; the chain is then the two HPFs only. */
+        /** False below the 6 kHz floor; the chain is then its HPF section(s) only. */
         bool outputLpfActive_ = false;
         int32_t outHpf1RQ15_ = 0;
         int32_t outHpf2RQ15_ = 0;
@@ -1468,7 +1500,7 @@ namespace pixelroot32::audio {
         void recomputeHpfCoefficients();
 
         /**
-         * @brief Derive the `Nes` / `Hybrid` output chain from profile and rate.
+         * @brief Derive the `Nes` / `Famicom` output chain from profile and rate.
          *
          * Called by `init` (a configured corner is in Hz, so it follows the
          * rate), by `setSoundProfile` (the profile decides whether the chain

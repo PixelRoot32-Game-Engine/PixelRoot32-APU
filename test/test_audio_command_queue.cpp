@@ -187,7 +187,7 @@ void test_audio_command_queue_sound_profile_round_trip(void) {
     AudioCommandQueue queue;
     AudioCommand cmd;
     cmd.type = AudioCommandType::SET_SOUND_PROFILE;
-    cmd.soundProfile = static_cast<uint8_t>(SoundProfile::Hybrid);
+    cmd.soundProfile = static_cast<uint8_t>(SoundProfile::Famicom);
 
     TEST_ASSERT_TRUE(queue.enqueue(cmd));
     TEST_ASSERT_FALSE(queue.isEmpty());
@@ -196,7 +196,7 @@ void test_audio_command_queue_sound_profile_round_trip(void) {
     TEST_ASSERT_TRUE(queue.dequeue(outCmd));
     TEST_ASSERT_TRUE(queue.isEmpty());
     TEST_ASSERT_EQUAL(AudioCommandType::SET_SOUND_PROFILE, outCmd.type);
-    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(SoundProfile::Hybrid),
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(SoundProfile::Famicom),
                             outCmd.soundProfile);
     // The neighbours inside the reused padding must survive untouched.
     TEST_ASSERT_FALSE(outCmd.nesLengthHalt);
