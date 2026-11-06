@@ -2,6 +2,82 @@
 
 Format: [semver](https://semver.org/). Changes that alter rendered PCM or struct ABI require a major or minor bump with an explicit note.
 
+## [2.3.0] - 2026-11-06
+
+The third profile is now a faithful **Famicom**, the drum presets keep their
+body under the NES profiles, and a triangle kick joins the presets. `Legacy`
+and `Nes` render byte-identical PCM (their four fixtures are unchanged); value
+2 sounds different, and that change is listed first.
+
+### Changed
+
+- **`SoundProfile::Famicom` replaces `Hybrid` (behaviour change for value 2).**
+  `Famicom` is value **2**, the value 2.2.x called `Hybrid`, so a serialised
+  `2` keeps working. It has the `Nes` character — linear default envelope plus
+  the 4-bit `nesEnvelope`, ideal SAW ramp, stepped NES duty, unipolar noise on
+  the NES period LUT, `NesWeighted` mix — and differs from `Nes` **only in the
+  output stage**: the Famicom's single coupling high-pass, **HPF 37 Hz → LPF**
+  (`min(14 kHz, 0.45·fs)`), instead of `Nes`'s HPF 90 Hz → HPF 440 Hz → LPF.
+  At 65 Hz `Nes` measures −21.1 dB and `Famicom` −1.2 dB, so bass and kick
+  fundamentals survive. The second high-pass section is bypassed with a unity
+  pole, so `Nes` pays nothing and stays byte-identical (`docs/ABI.md` §6).
+  - **Level trim**: recalibrated on the same crest-weighted rule
+    (`W = 0.75·RMS + 0.25·peak`, matched to `Legacy` on the canonical track):
+    **−0.27 dB** (`kProfileTrimFamicomQ15` = **31765**), W within 0.001 dB of
+    `Legacy`. The `Nes` trim was re-measured and stays +1.10 dB (`37192`).
+  - **Fixtures**: `apu_famicom_canonical_s16le_44100.pcm` (`090B32D8…607700`)
+    and `apu_famicom_wavetable_s16le_44100.pcm` (`C65E60D9…BA54A0`) replace
+    the two `apu_hybrid_*` files, which were deleted. The two `Legacy` and the
+    two `Nes` fixtures did not move (`docs/ABI.md` §9.2).
+  - **For existing `Hybrid` users**: value 2 no longer decays exponentially
+    (the default envelope is linear), SAW is the ideal ramp instead of the
+    band-limited mipmap read, the output stage keeps the low end instead of
+    cutting it at 90/440 Hz, and the level trim drops from +1.90 dB (`40780`)
+    to −0.27 dB, so the same content sounds fuller in the bass and quieter in
+    peak (canonical-track peak 13 370 → 6 401).
+- **Drum noise period under `Nes`/`Famicom`.** `INSTR_KICK` and `INSTR_SNARE`
+  now set `noisePeriodMode = NoisePeriodMode::Note`, so they keep their
+  authored 60- and 15-sample periods instead of collapsing to the 1-sample
+  hiss of NES LUT index 0. `INSTR_HIHAT` stays on `ProfileDefault` and takes
+  LUT index 0, the bright NES hi-hat. Inert under `Legacy`. No fixture moved
+  (neither committed scene plays a drum).
+
+### Deprecated
+
+- **`SoundProfile::Hybrid`** is a `[[deprecated]]` alias of `Famicom` (same
+  value 2): existing code compiles with a warning. The library's own sources
+  no longer name it.
+
+### Added
+
+- **`INSTR_KICK_TRI`**: a triangle kick for the NES profiles, placed right
+  after `INSTR_KICK`. Played on a TRIANGLE voice, it glides linearly from
+  196 Hz (`makeNote(INSTR_KICK_TRI, Note::G, beats)`, octave 3) to 50 Hz in
+  45 ms with a near-instant attack, a 0.09 s decay and no sustain. Uses the
+  existing pitch sweep; no core change (`docs/ABI.md` §7).
+
+### Dormant
+
+- **Band-limited SAW.** 2.2.x's `Hybrid` was its only user; no profile selects
+  it now. The mipmap tables (`AudioOscMipLUT.h`) and the level selector still
+  compile and are still tested (`test_apu_wavetable_spectral`,
+  `test_apu_famicom_saw`), and still cost flash, pending a decision to remove
+  them or expose the read as a per-voice option.
+
+### Migration
+
+- Replace `SoundProfile::Hybrid` with `SoundProfile::Famicom` to silence the
+  deprecation warning; no other code change is needed and stored values stay
+  `2`.
+- Content tuned for 2.2.x's `Hybrid` should be re-checked by ear: decays are
+  linear, the low end is louder relative to the rest, and the master level is
+  lower. To keep the old NES output stage, switch to `Nes`; there is no
+  profile with the exponential envelope any more, but a note can still request
+  it with `InstrumentPreset::envelopeCurve = EnvelopeCurve::Exponential`.
+- Tools: `tools/golden_gen` takes `--profile famicom` (`hybrid` is accepted as
+  an alias); `tools/apu_bench_firmware` and `tools/profiles_ab` name the
+  profile `Famicom`.
+
 ## [2.2.0] - 2026-10-28
 
 ### Added
