@@ -166,11 +166,27 @@ Since E3 the note can keep its own period: `InstrumentPreset::noisePeriodMode = 
 
 `noisePeriodMode = Note` does not change polarity: the `Nes`/`Famicom` unipolar gate stays profile character (and its −3.649 dB against `Legacy` is the published noise weight, not a lost level). Pin `VoiceNesOptions::noiseUnipolar` on the voice to keep bipolar noise.
 
-| Preset | noisePeriod | Character |
+**Drum period policy (2.3.0).** The shipped drums now use that request selectively. `INSTR_KICK` and `INSTR_SNARE` set `noisePeriodMode = NoisePeriodMode::Note`, so under `Nes` and `Famicom` they keep their authored 60- and 15-sample periods instead of the LUT's 1-sample hiss, and the kick keeps its low body and the snare its crack. `INSTR_HIHAT` stays on `ProfileDefault`, so under `Nes` and `Famicom` it takes the profile's NES LUT index 0, the brightest NES noise period and the authentic bright NES hi-hat. Under `Legacy` none of this changes anything: the mode is inert there and all three drums play their authored period, byte for byte as before. The two new fields are appended positionally (`envelopeCurve`, then `noisePeriodMode`), and the deprecated `noiseShortMode` alias stays in sync with `noiseLfsrShort`.
+
+| Preset | noisePeriod | `noisePeriodMode` | Period under `Nes`/`Famicom` | Character |
+|---|---|---|---|---|
+| `INSTR_KICK` | 60 | `Note` | 60 (authored) | deep, with body |
+| `INSTR_SNARE` | 15 | `Note` | 15 (authored) | bright, snap |
+| `INSTR_HIHAT` | 12 | `ProfileDefault` | NES LUT index 0 | metallic (short mode); bright NES hat |
+
+### Triangle kick: `INSTR_KICK_TRI` (2.3.0)
+
+The NES has no sampled kick; games drop the TRIANGLE channel quickly in pitch, which reads as a deep tonal thump. `INSTR_KICK_TRI` does that with the existing single-segment pitch sweep and needs no core change:
+
+| Field | Value | Why |
 |---|---|---|
-| `INSTR_KICK` | 60 | deep, with body |
-| `INSTR_SNARE` | 15 | bright, snap |
-| `INSTR_HIHAT` | 12 | metallic (short mode) |
+| `baseVolume` | 0.50 | the TRIANGLE mix weight is lower than PULSE |
+| `duty` | 0.5 | unused by TRIANGLE; non-zero so the preset is never treated as `duty == 0` NOISE percussion |
+| `defaultOctave` | 3 | `makeNote(INSTR_KICK_TRI, Note::G, beats)` starts at G3 = 196 Hz |
+| `attackTime` / `decayTime` / `sustainLevel` / `releaseTime` | 0.001 / 0.09 / 0 / 0.02 s | near-instant attack, short body, no sustain: silent about 0.1 s after the hit |
+| `pitchSweepEndHz` / `pitchSweepDurationSec` | 50 Hz / 0.045 s | linear glide ~200 Hz → 50 Hz in 45 ms |
+
+Play it on a TRIANGLE voice — a `MusicTrack` with `channelType = WaveType::TRIANGLE`, typically the bass track. The sequencer only applies a preset's pitch sweep to PULSE and TRIANGLE notes, and the sweep starts from the note's own pitch, so another note moves the start while the end stays at 50 Hz. For the classic NES attack, double it with a short NOISE hit on the same step (`INSTR_SNARE`, `INSTR_HIHAT`, or `INSTR_KICK` for a fuller transient): the triangle carries the body, the noise the click. It renders under every profile; the NES profiles are the ones it is tuned for.
 
 ## 8. Music Transport
 
@@ -189,10 +205,10 @@ Measured 2026-11-06 on the Famicom-profile branch (`cmake -S . -B build -G "MinG
 
 | Target | Cases | What it covers |
 |---|---|---|
-| `test_apu_core` | 224 | Core behaviour on the float core (as selected by the default profile) |
-| `test_apu_core_integer` | 224 | The same source against the integer core (`PR32_APU_HAS_FPU=0`) |
+| `test_apu_core` | 229 | Core behaviour on the float core (as selected by the default profile) |
+| `test_apu_core_integer` | 229 | The same source against the integer core (`PR32_APU_HAS_FPU=0`) |
 | `test_audio_command_queue` | 10 | SPSC queue, capacity and the `AudioCommand` ABI pins |
-| `test_audio_music_types` | 35 | Music types, `InstrumentPreset` layout, shipped presets |
+| `test_audio_music_types` | 36 | Music types, `InstrumentPreset` layout, shipped presets |
 | `test_apu_mirror` | 37 | Tool Suite parity, byte-for-byte against the float golden |
 | `test_apu_output_filter` | 17 | Output chains of `Nes` and `Famicom`: measured response, the `Famicom` low end against `Nes`, full-scale stability, `setHpfCutoffHz` precedence, `Legacy` one-pole, Q15 product bound |
 | `test_apu_output_filter_integer` | 17 | The same suite where `Legacy` has no float body (`PR32_APU_ENABLE_LEGACY_FLOAT=0`) |
@@ -205,7 +221,7 @@ Measured 2026-11-06 on the Famicom-profile branch (`cmake -S . -B build -G "MinG
 | `test_apu_profile_golden` | 4 | `Nes` and `Famicom` against their canonical and wavetable goldens (FPU build with the float body off) |
 | `test_apu_profile_golden_no_fpu` | 4 | The same four goldens from a build with no FPU at all |
 | `test_library_link` | 4 | Public symbols exist in the shipped artifact (links, no `UNIT_TEST`) |
-| **Total** | **605** | 0 failures, 0 ignored, exit code 0 in all sixteen |
+| **Total** | **616** | 0 failures, 0 ignored, exit code 0 in all sixteen |
 
 The five continuous-duty cases added by the full-scale fix (`test_pulse_duty_full_scale_*`, `test_pulse_duty_zero_never_goes_positive`, `test_pulse_duty_interior_value_unchanged`) live in `test/test_apu_core.cpp`, so both core targets run them; that is the 205 → 210 step on the two rows above.
 
@@ -250,6 +266,8 @@ The cost pass that followed it is **not** bit-exact, and only one row moved. `Hy
 | `apu_hybrid_wavetable` | −22.994 / 10 351 | −18.679 / 17 011 | **−21.095 / 12 881** |
 
 **The `Famicom` trim (2.3.0).** Same rule, re-measured on the canonical track with the `Famicom` trim temporarily at unity: `Legacy` (integer route) RMS −19.697 / peak −15.104 / **W −18.549** dBFS; `Famicom` RMS −19.731 / peak −13.913 (6 604) / **W −18.276** dBFS. The 37 Hz high-pass keeps the crest factor at **5.8 dB**, close to `Legacy`'s 4.6 dB, so the match is a slight **cut**: −0.273 dB, rounded to **−0.27 dB** → `round(10^(−0.27/20) × 32768)` = **31765** (`kProfileTrimFamicomQ15`). After the trim: RMS **−20.002**, peak **−14.184** (6 401, 19.5 % of full scale), **W −18.548** (+0.001 dB against `Legacy`), RMS 0.31 dB below `Legacy` as the rule requires. The wavetable file measures RMS −21.110, peak 10 024. `Nes` was not re-measured for the trim in this change (its fixtures are byte-identical): W −18.554 (−0.005 dB).
+
+**Drum period policy and `INSTR_KICK_TRI` (2.3.0): no fixture moved, no trim moved.** Neither committed scene plays a drum or a TRIANGLE note (the canonical track is `INSTR_PULSE_LEAD` only, the wavetable scene is SAW only), so pinning the kick and snare periods and adding the triangle kick cannot reach any fixture: all six SHA-256 values above were re-checked unchanged after the preset change. `test_apu_profile_level` was re-run afterwards and printed the same figures as before it, to the third decimal: `Legacy` W −18.549, `Nes` W **−18.554** (−0.005 dB, inside the 0.1 dB rule, so `kProfileTrimNesQ15` stays 37192) and `Famicom` W **−18.548** (+0.001 dB, `kProfileTrimFamicomQ15` stays 31765). The drum behaviour itself is pinned by `test_apu_core` (`drum_*` and `triangle_kick_sweeps_down_and_decays_to_silence`), not by a golden.
 
 Both `Legacy` rows are untouched through both attempts — `apu_mirror_canonical` stays `7FF568A5…5DE9` and `apu_integer_core_canonical` stays `F59501D6…3902D` — which is the byte-level proof that the multiply is unreachable from the frozen path: the trim is applied on the chain branch of the render path only, and `Legacy` never takes it. `test_apu_profile_level` pins the relationship instead of the bytes: it renders the canonical track under all three profiles and requires each profile's crest-weighted loudness within **±0.5 dB** of `Legacy`, plus RMS not above `Legacy` by more than 0.5 dB, with every peak strictly below the int16 rail. Verified on 2026-10-28.
 

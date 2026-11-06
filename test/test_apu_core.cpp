@@ -7509,8 +7509,10 @@ void note_character_modes_are_appended_and_zero(void) {
                           (int)positional.noisePeriodMode);
     TEST_ASSERT_EQUAL_INT((int)PulseDutyMode::ProfileDefault,
                           (int)positional.pulseDutyMode);
+    // `INSTR_HIHAT` is the shipped drum that still leaves the period to the
+    // profile (the kick and the snare pin theirs, see the drum tests below).
     TEST_ASSERT_EQUAL_INT((int)NoisePeriodMode::ProfileDefault,
-                          (int)INSTR_KICK.noisePeriodMode);
+                          (int)INSTR_HIHAT.noisePeriodMode);
     TEST_ASSERT_EQUAL_INT((int)PulseDutyMode::ProfileDefault,
                           (int)INSTR_PULSE_LEAD.pulseDutyMode);
 }
@@ -7568,14 +7570,15 @@ void noise_period_mode_note_keeps_the_authored_period_under_nes(void) {
 }
 
 // S2: the default keeps 2.1.0's behaviour exactly — the profile arms the LUT and
-// retunes the period away from the note's own value.
+// retunes the period away from the note's own value. `INSTR_HIHAT` is used
+// because it is the shipped drum that keeps `ProfileDefault`.
 void noise_period_mode_default_still_arms_the_nes_lut(void) {
     ApuCore apu;
     apu.init(44100);
     apu.reset();
     apu.setSoundProfile(SoundProfile::Nes);
 
-    InstrumentPreset preset = INSTR_KICK;  // noisePeriodMode left at the default
+    InstrumentPreset preset = INSTR_HIHAT;  // noisePeriodMode left at the default
 
     int16_t buffer[64] = {0};
     const int slot = playNoiseNoteWithPreset(apu, buffer, preset, preset.noisePeriod);
@@ -7606,13 +7609,147 @@ void noise_period_mode_note_does_not_leak_to_the_next_note(void) {
     TEST_ASSERT_TRUE(apu.submitCommand(stop));
     apu.generateSamples(buffer, 64);
 
-    InstrumentPreset plain = INSTR_SNARE;  // profile default again
+    InstrumentPreset plain = INSTR_HIHAT;  // profile default again
     const int slot2 = playNoiseNoteWithPreset(apu, buffer, plain, plain.noisePeriod);
 
     TEST_ASSERT_EQUAL_UINT8_MESSAGE(0, apu.getVoiceNesNoiseLutIndexForTesting(slot2),
         "the note-level request must not survive into the next note");
     TEST_ASSERT_EQUAL_UINT32(nes_apu::nesNoisePeriodToSamples(0, 44100),
                              apu.getVoiceNoisePeriodForTesting(slot2));
+}
+
+// -----------------------------------------------------------------------------
+// Drum period policy (apu-famicom-profile S4): the shipped kick and snare pin
+// their authored NOISE period under the NES profiles, the hi-hat takes the
+// profile LUT. Driven through the sequencer, the path a game actually uses.
+// -----------------------------------------------------------------------------
+
+struct DrumProbe {
+    uint32_t periodSamples;
+    uint8_t lutIndex;
+};
+
+// Plays one sequencer percussion hit of `preset` under `profile` and reads back
+// the NOISE voice it landed on.
+static DrumProbe probeSequencerDrum(SoundProfile profile, const InstrumentPreset& preset) {
+    ApuCore apu;
+    apu.init(44100);
+    apu.reset();
+    apu.setSoundProfile(profile);
+
+    const MusicNote notes[] = {makeNote(preset, Note::Rest, 1.0f)};
+    const MusicTrack track{notes, 1, false, WaveType::NOISE, 0.5f};
+
+    AudioCommand play{};
+    play.type = AudioCommandType::MUSIC_PLAY;
+    play.track = &track;
+    TEST_ASSERT_TRUE(apu.submitCommand(play));
+
+    int16_t buffer[64] = {0};
+    apu.generateSamples(buffer, 64);
+
+    for (int s = ApuCore::SFX_VOICE_BASE; s < ApuCore::MAX_VOICES; ++s) {
+        if (apu.isVoiceEnabledForTesting(s)) {
+            return DrumProbe{apu.getVoiceNoisePeriodForTesting(s),
+                             apu.getVoiceNesNoiseLutIndexForTesting(s)};
+        }
+    }
+    TEST_FAIL_MESSAGE("the drum hit did not land on an SFX slot");
+    return DrumProbe{0u, 0u};
+}
+
+void drum_kick_keeps_its_authored_period_under_nes_profiles(void) {
+    TEST_ASSERT_EQUAL_INT((int)NoisePeriodMode::Note, (int)INSTR_KICK.noisePeriodMode);
+    const SoundProfile profiles[] = {SoundProfile::Nes, SoundProfile::Famicom};
+    for (SoundProfile profile : profiles) {
+        const DrumProbe probe = probeSequencerDrum(profile, INSTR_KICK);
+        TEST_ASSERT_EQUAL_UINT8_MESSAGE(255, probe.lutIndex,
+            "the kick must leave the selector off the NES LUT");
+        TEST_ASSERT_EQUAL_UINT32_MESSAGE(60u, probe.periodSamples,
+            "the kick's authored 60-sample period must survive the profile");
+    }
+}
+
+void drum_snare_keeps_its_authored_period_under_nes_profiles(void) {
+    TEST_ASSERT_EQUAL_INT((int)NoisePeriodMode::Note, (int)INSTR_SNARE.noisePeriodMode);
+    const SoundProfile profiles[] = {SoundProfile::Nes, SoundProfile::Famicom};
+    for (SoundProfile profile : profiles) {
+        const DrumProbe probe = probeSequencerDrum(profile, INSTR_SNARE);
+        TEST_ASSERT_EQUAL_UINT8_MESSAGE(255, probe.lutIndex,
+            "the snare must leave the selector off the NES LUT");
+        TEST_ASSERT_EQUAL_UINT32_MESSAGE(15u, probe.periodSamples,
+            "the snare's authored 15-sample period must survive the profile");
+    }
+}
+
+// L6: the hi-hat stays on the profile LUT, index 0 — the bright, authentic NES
+// hat — instead of its authored 12-sample period.
+void drum_hihat_takes_the_profile_lut_index_0_under_nes_profiles(void) {
+    TEST_ASSERT_EQUAL_INT((int)NoisePeriodMode::ProfileDefault,
+                          (int)INSTR_HIHAT.noisePeriodMode);
+    const SoundProfile profiles[] = {SoundProfile::Nes, SoundProfile::Famicom};
+    for (SoundProfile profile : profiles) {
+        const DrumProbe probe = probeSequencerDrum(profile, INSTR_HIHAT);
+        TEST_ASSERT_EQUAL_UINT8(0, probe.lutIndex);
+        TEST_ASSERT_EQUAL_UINT32(nes_apu::nesNoisePeriodToSamples(0, 44100),
+                                 probe.periodSamples);
+    }
+}
+
+// `Legacy` ignores the mode: every drum keeps its authored period, exactly as
+// before the presets opted in.
+void drum_periods_are_unchanged_under_legacy(void) {
+    TEST_ASSERT_EQUAL_UINT32(60u, probeSequencerDrum(SoundProfile::Legacy, INSTR_KICK).periodSamples);
+    TEST_ASSERT_EQUAL_UINT32(15u, probeSequencerDrum(SoundProfile::Legacy, INSTR_SNARE).periodSamples);
+    TEST_ASSERT_EQUAL_UINT32(12u, probeSequencerDrum(SoundProfile::Legacy, INSTR_HIHAT).periodSamples);
+}
+
+// -----------------------------------------------------------------------------
+// INSTR_KICK_TRI (apu-famicom-profile S5): a TRIANGLE kick that sweeps its pitch
+// from ~200 Hz down to ~50 Hz in ~45 ms, then decays to silence.
+// -----------------------------------------------------------------------------
+
+void triangle_kick_sweeps_down_and_decays_to_silence(void) {
+    const SoundProfile profiles[] = {SoundProfile::Legacy, SoundProfile::Nes,
+                                     SoundProfile::Famicom};
+    for (SoundProfile profile : profiles) {
+        ApuCore apu;
+        apu.init(44100);
+        apu.reset();
+        apu.setSoundProfile(profile);
+
+        const MusicNote notes[] = {makeNote(INSTR_KICK_TRI, Note::G, 1.0f)};
+        const MusicTrack track{notes, 1, false, WaveType::TRIANGLE, 0.5f};
+        AudioCommand play{};
+        play.type = AudioCommandType::MUSIC_PLAY;
+        play.track = &track;
+        TEST_ASSERT_TRUE(apu.submitCommand(play));
+
+        int16_t buffer[2048] = {0};
+        apu.generateSamples(buffer, 32);
+
+        // It plays on the melodic TRIANGLE voice of the track, not on NOISE.
+        const int slot = apu.getTrackVoiceSlotForTesting(0);
+        TEST_ASSERT_TRUE_MESSAGE(slot >= 0, "the triangle kick must own the track voice");
+        TEST_ASSERT_TRUE(apu.getActiveVoiceStageForTesting(WaveType::TRIANGLE)
+                         != EnvelopeState::Stage::OFF);
+        TEST_ASSERT_EQUAL_INT(0, count_enabled_sfx_voices(apu));
+
+        // Start: G3 = 196 Hz, 32 samples (0.7 ms) into a 45 ms sweep.
+        TEST_ASSERT_FLOAT_WITHIN(8.0f, 196.0f, apu.getVoiceFrequencyForTesting(slot));
+
+        // End of the sweep (45 ms = 1985 samples, render 2205 = 50 ms in total).
+        apu.generateSamples(buffer, 2048);
+        apu.generateSamples(buffer, 2205 - 32 - 2048);
+        TEST_ASSERT_FLOAT_WITHIN(2.0f, 50.0f, apu.getVoiceFrequencyForTesting(slot));
+
+        // attack 1 ms + decay 90 ms with sustain 0: silent by 0.1 s, long before
+        // the one-beat gate (0.4 s at the default 150 BPM) closes.
+        apu.generateSamples(buffer, 2048);
+        apu.generateSamples(buffer, 4410 - 2205 - 2048);
+        TEST_ASSERT_EQUAL_INT32_MESSAGE(0, apu.getVoiceEnvelopeLevelQ15ForTesting(slot),
+            "the triangle kick must decay to silence within 0.1 s");
+    }
 }
 
 // S3: under a NES-derived profile, a note that asks for continuous duty keeps
@@ -8211,6 +8348,11 @@ int main(int argc, char** argv) {
     RUN_TEST(noise_period_mode_note_keeps_the_authored_period_under_nes);
     RUN_TEST(noise_period_mode_default_still_arms_the_nes_lut);
     RUN_TEST(noise_period_mode_note_does_not_leak_to_the_next_note);
+    RUN_TEST(drum_kick_keeps_its_authored_period_under_nes_profiles);
+    RUN_TEST(drum_snare_keeps_its_authored_period_under_nes_profiles);
+    RUN_TEST(drum_hihat_takes_the_profile_lut_index_0_under_nes_profiles);
+    RUN_TEST(drum_periods_are_unchanged_under_legacy);
+    RUN_TEST(triangle_kick_sweeps_down_and_decays_to_silence);
     RUN_TEST(pulse_duty_mode_continuous_keeps_the_generator_under_famicom);
     RUN_TEST(pulse_duty_mode_default_snaps_the_continuous_away);
     RUN_TEST(note_character_modes_are_inert_under_legacy);

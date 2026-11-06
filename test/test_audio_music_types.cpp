@@ -488,7 +488,7 @@ void test_shipped_presets_keep_deprecated_alias_in_sync(void)
         INSTR_PULSE_LEAD, INSTR_TRIANGLE_LEAD, INSTR_TRIANGLE_PAD,
         INSTR_PULSE_PAD,  INSTR_PULSE_HARMONY, INSTR_TRIANGLE_BASS,
         INSTR_PULSE_BASS, INSTR_KICK,          INSTR_SNARE,
-        INSTR_HIHAT
+        INSTR_HIHAT,      INSTR_KICK_TRI
     };
 
     for (const InstrumentPreset& p : presets) {
@@ -500,6 +500,22 @@ void test_shipped_presets_keep_deprecated_alias_in_sync(void)
     // satisfy the loop above.
     TEST_ASSERT_TRUE(INSTR_SNARE.noiseShortMode);
     TEST_ASSERT_TRUE(INSTR_HIHAT.noiseShortMode);
+}
+
+// apu-famicom-profile S5: the triangle kick is a melodic TRIANGLE preset with a
+// downward pitch sweep, never NOISE percussion, and its default note starts
+// near 200 Hz.
+void test_triangle_kick_preset_shape(void)
+{
+    TEST_ASSERT_TRUE_MESSAGE(INSTR_KICK_TRI.duty != 0.0f,
+        "duty == 0 would route the triangle kick to the NOISE channel");
+    const MusicNote note = makeNote(INSTR_KICK_TRI, Note::G, 1.0f);
+    TEST_ASSERT_FLOAT_WITHIN(10.0f, 200.0f, noteToFrequency(note.note, note.octave));
+    TEST_ASSERT_FLOAT_WITHIN(5.0f, 50.0f, INSTR_KICK_TRI.pitchSweepEndHz);
+    TEST_ASSERT_TRUE(INSTR_KICK_TRI.pitchSweepDurationSec >= 0.040f);
+    TEST_ASSERT_TRUE(INSTR_KICK_TRI.pitchSweepDurationSec <= 0.050f);
+    TEST_ASSERT_EQUAL_FLOAT(0.0f, INSTR_KICK_TRI.sustainLevel);
+    TEST_ASSERT_TRUE(INSTR_KICK_TRI.attackTime <= 0.002f);
 }
 
 int main(int argc, char **argv) {
@@ -555,6 +571,7 @@ int main(int argc, char **argv) {
     RUN_TEST(test_noise_lfsr_short_default_value);
     RUN_TEST(test_instrument_preset_positional_layout_matches_published_abi);
     RUN_TEST(test_shipped_presets_keep_deprecated_alias_in_sync);
+    RUN_TEST(test_triangle_kick_preset_shape);
 
     return UNITY_END();
 }
