@@ -2,10 +2,10 @@
  * @file test_apu_profile_level.cpp
  * @brief E2 level parity on a crest-weighted loudness metric.
  *
- * The `Nes`/`Hybrid` output chain removes low-mid energy and spikes on every
- * edge, so on the canonical track it left the two profiles 3.28 dB and 4.31 dB
- * below `Legacy` in RMS. The listener's requirement is that a `Legacy` -> `Nes`
- * -> `Hybrid` switch changes the character, not the perceived level.
+ * The `Nes`/`Famicom` output chains remove low-mid energy and spike on every
+ * edge, so on the canonical track they leave both profiles below `Legacy` in
+ * RMS before any trim. The listener's requirement is that a `Legacy` -> `Nes`
+ * -> `Famicom` switch changes the character, not the perceived level.
  *
  * THE METRIC IS THE POINT OF THIS SUITE, and it has already been wrong once.
  * The first trim matched RAW RMS and shipped; on hardware the user reported the
@@ -92,9 +92,9 @@ struct Level {
 constexpr SoundProfile kProfiles[3] = {
     SoundProfile::Legacy,
     SoundProfile::Nes,
-    SoundProfile::Hybrid,
+    SoundProfile::Famicom,
 };
-const char* const kNames[3] = {"Legacy", "Nes", "Hybrid"};
+const char* const kNames[3] = {"Legacy", "Nes", "Famicom"};
 
 /// One canonical-track render per profile. File scope because 22 050 S16
 /// samples per profile is 44 100 B each; three of those do not belong on the

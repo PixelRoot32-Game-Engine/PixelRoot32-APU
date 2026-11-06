@@ -28,11 +28,12 @@ recorded before the scene option existed has to keep rendering the same bytes,
 so `--scene canonical` is byte-for-byte the pre-option behaviour and no
 existing fixture may move.
 
-`wavetable` exists because the canonical track is PULSE-only. E2's band-limited
-SAW (S4) is `Hybrid`-only and invisible to a pulse track, so `Hybrid`'s
-canonical fixture is identical before and after the mipmap landed; the only
-thing that pinned it was a unit test whose reference re-derives the read. The
-wavetable scene renders four SAW notes through the same public command API:
+`wavetable` exists because the canonical track is PULSE-only. It was written
+for 2.2.x's `Hybrid` profile, whose band-limited SAW (E2/S4) a pulse track could
+not see. That read is now dormant — no profile selects it, and `Famicom` (value
+2, which replaced `Hybrid`) renders the ideal ramp like `Nes` — so the scene now
+pins the SAW path end to end and fails if a profile starts reading the mipmap
+again. It renders four SAW notes through the same public command API:
 
 | Note | Start | Renders | Mipmap level |
 |---|---|---|---|
@@ -41,12 +42,12 @@ wavetable scene renders four SAW notes through the same public command API:
 | 880 Hz, 0.1 s | sample 9 702 | `9702..14993` | 3 |
 | 1 760 Hz, 0.1 s | sample 14 994 | `14994..22049` | 4 |
 
-The glide is the S6 case: a linear pitch envelope crosses the 344.5 Hz and
-689.0 Hz band edges inside one note, which is the seam the crossfade exists to
-remove. The instrument is flat (one-sample attack, no decay, sustain 1.0, no
-release) so `Nes` and `Hybrid` differ in this scene only by the SAW generator —
-same mix weight, same output chain, no envelope-curve difference to confuse the
-comparison.
+The glide crosses the 344.5 Hz and 689.0 Hz band edges inside one note, which
+was the seam the dormant crossfade removed. The instrument is flat (one-sample
+attack, no decay, sustain 1.0, no release), so `Nes` and `Famicom` differ in
+this scene only by the output stage (`Nes`: HPF 90 Hz -> HPF 440 Hz -> LPF;
+`Famicom`: HPF 37 Hz -> LPF) and its level trim — the 55 Hz note is where the
+two stages differ most.
 
 ## The three builds
 
@@ -59,7 +60,7 @@ comparison.
 All three are built from the `PR32_APU_BUILD_TESTS` block of `CMakeLists.txt`, so
 a single `cmake --build build` leaves them ready next to the suites.
 
-`Nes` and `Hybrid` always render the integer core, so all three builds must emit
+`Nes` and `Famicom` always render the integer core, so all three builds must emit
 the same bytes for either scene and either profile. `run.py` exercises that for
 the canonical scene; for the wavetable scene, compare the three renders by hash
 (the regeneration commands below do exactly that by hand).
@@ -96,20 +97,26 @@ cmake --build build --target apu_golden_gen apu_golden_gen_nofpu apu_golden_gen_
 `run.py` is the recommended path: it performs those steps plus the three checks.
 A direct render compares nothing.
 
-Regenerating the wavetable fixtures (only when E2's SAW definition changes
+Regenerating the profile fixtures (only when a profile's definition changes
 intentionally, and never to make a red test green):
 
 ```bash
 cmake --build build --target apu_golden_gen_nofpu
-./build/apu_golden_gen_nofpu --profile nes    --scene wavetable \
+./build/apu_golden_gen_nofpu --profile nes     \
+    --out test/golden/fixtures/apu_nes_canonical_s16le_44100.pcm
+./build/apu_golden_gen_nofpu --profile famicom \
+    --out test/golden/fixtures/apu_famicom_canonical_s16le_44100.pcm
+./build/apu_golden_gen_nofpu --profile nes     --scene wavetable \
     --out test/golden/fixtures/apu_nes_wavetable_s16le_44100.pcm
-./build/apu_golden_gen_nofpu --profile hybrid --scene wavetable \
-    --out test/golden/fixtures/apu_hybrid_wavetable_s16le_44100.pcm
+./build/apu_golden_gen_nofpu --profile famicom --scene wavetable \
+    --out test/golden/fixtures/apu_famicom_wavetable_s16le_44100.pcm
 ```
 
-`Nes` and `Hybrid` both run the integer core, so `apu_golden_gen` and
-`apu_golden_gen_integer` must reproduce those two files exactly; a difference
-means a build dependency survived in the integer core.
+`--profile hybrid` is still accepted as an alias of `famicom`, matching the
+deprecated `SoundProfile::Hybrid`. `Nes` and `Famicom` both run the integer
+core, so `apu_golden_gen` and `apu_golden_gen_integer` must reproduce those
+files exactly; a difference means a build dependency survived in the integer
+core.
 
 ## Relation to `test_apu_integer_golden`
 
@@ -121,9 +128,11 @@ out and in the second it does not exist. That is what makes the two targets asse
 the same file without either of them depending on a profile name.
 
 E1 also added `test_apu_profile_golden`, which pins one canonical fixture per
-audible profile (`apu_nes_canonical_...pcm`, `apu_hybrid_canonical_...pcm`), and
-E2 added the wavetable pair (`apu_nes_wavetable_...pcm`,
-`apu_hybrid_wavetable_...pcm`) so both targets also cover the band-limited SAW.
+audible profile (`apu_nes_canonical_...pcm`, `apu_famicom_canonical_...pcm`),
+and E2 added the wavetable pair (`apu_nes_wavetable_...pcm`,
+`apu_famicom_wavetable_...pcm`) so both targets also cover the SAW path. The
+`apu_famicom_*` files replaced 2.2.x's `apu_hybrid_*` pair when value 2 became
+`Famicom`.
 The canonical fixtures were rendered from `--scene canonical` (the default) and
 the wavetable ones from `--scene wavetable`; all four are regenerated only when a
 phase changes that profile's definition, never to make a red test green.

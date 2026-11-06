@@ -63,7 +63,7 @@ if(PR32_APU_BUILD_TESTS)
     # mirror; the fixture lives in test/golden/fixtures/)
     pr32_apu_add_test(test_apu_mirror)
 
-    # E2/S1-S3, S8: the `Nes`/`Hybrid` output filter chain — measured response
+    # E2/S1-S3, S8: the `Nes`/`Famicom` output filter chains — measured response
     # against the theoretical cascade, full-scale stability, the caller's
     # `setHpfCutoffHz` override, and the historical one-pole of `Legacy`.
     # Built twice: the default (float `Legacy`) and the build where `Legacy`
@@ -86,16 +86,17 @@ if(PR32_APU_BUILD_TESTS)
     # the renderer here, so no golden moves.
     pr32_apu_add_test(test_apu_wavetable_spectral)
 
-    # E2/T3 (S4, S6): the `Hybrid` SAW reads those tables — level from the
-    # voice's own phase increment, adjacent levels crossfaded — while `Legacy`
-    # and `Nes` keep the ideal ramp and SINE stays on `SINE_LUT_Q15`. Built with
-    # the float `Legacy` body off, because "Legacy equals the ideal ramp
-    # exactly" is a statement about the integer core the other two profiles use.
-    pr32_apu_add_test(test_apu_hybrid_wavetable
+    # S3 (Famicom profile): the band-limited SAW read is dormant — every
+    # profile, `Famicom` included, renders the ideal ramp, SINE stays on
+    # `SINE_LUT_Q15`, and the dormant level selector still answers the band
+    # rule. Built with the float `Legacy` body off, because "Legacy equals the
+    # ideal ramp exactly" is a statement about the integer core the other two
+    # profiles use.
+    pr32_apu_add_test(test_apu_famicom_saw
         EXTRA_DEFS PR32_APU_ENABLE_LEGACY_FLOAT=0)
 
     # E2 level parity: the fixed per-profile trim must make a `Legacy` ->
-    # `Nes` -> `Hybrid` switch level-neutral on the canonical track, measured
+    # `Nes` -> `Famicom` switch level-neutral on the canonical track, measured
     # by rendering all three, not by reading a fixture. Built with the float
     # `Legacy` body off so the anchor renders through the same integer core the
     # trim lives in — the like-for-like route (the float route is 0.45 dB away
@@ -146,7 +147,7 @@ if(PR32_APU_BUILD_TESTS)
              WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test)
 
     # S7: one golden per audible profile, each compiled twice for the same
-    # reason as the integer fixture above. `Nes` and `Hybrid` always render the
+    # reason as the integer fixture above. `Nes` and `Famicom` always render the
     # integer core, so the two targets differ only in the build around it (FPU
     # with the float body switched off, and no FPU at all) and must agree byte
     # for byte; `Legacy` keeps its two committed references untouched.

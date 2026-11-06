@@ -32,7 +32,7 @@ using namespace pixelroot32::audio;
 // UNIT_TEST=1, so what is pinned here is the 13 368 B test-build size (the
 // test counters). 13 368 rounds up to 13 376, the pin below.
 //
-// E2/S1 added the `Nes`/`Hybrid` output filter chain state (+80 B): two
+// E2/S1 added the `Nes`/`Famicom` output filter chain state (+80 B): two
 // high-pass poles, five Butterworth coefficients in Q15 int32 (the LPF's b1
 // does not fit int16) and eight recursion registers. It does not fit the old
 // 48 B of slack, so the pin moves with the exact byte counts in the message
@@ -5720,8 +5720,8 @@ void test_sound_profile_round_trips(void) {
 
     apu.setSoundProfile(SoundProfile::Nes);
     TEST_ASSERT_EQUAL_INT((int)SoundProfile::Nes, (int)apu.getSoundProfile());
-    apu.setSoundProfile(SoundProfile::Hybrid);
-    TEST_ASSERT_EQUAL_INT((int)SoundProfile::Hybrid, (int)apu.getSoundProfile());
+    apu.setSoundProfile(SoundProfile::Famicom);
+    TEST_ASSERT_EQUAL_INT((int)SoundProfile::Famicom, (int)apu.getSoundProfile());
     apu.setSoundProfile(SoundProfile::Legacy);
     TEST_ASSERT_EQUAL_INT((int)SoundProfile::Legacy, (int)apu.getSoundProfile());
 }
@@ -5761,10 +5761,10 @@ void test_sound_profile_command_applies_on_render(void) {
 // keep what the caller selected.
 void test_sound_profile_survives_init(void) {
     ApuCore apu;
-    apu.setSoundProfile(SoundProfile::Hybrid);
+    apu.setSoundProfile(SoundProfile::Famicom);
     apu.init(48000);
 
-    TEST_ASSERT_EQUAL_INT((int)SoundProfile::Hybrid, (int)apu.getSoundProfile());
+    TEST_ASSERT_EQUAL_INT((int)SoundProfile::Famicom, (int)apu.getSoundProfile());
 }
 
 // =============================================================================
@@ -5773,11 +5773,11 @@ void test_sound_profile_survives_init(void) {
 //
 // Both suite binaries run this file, so every case below has to hold whichever
 // core the build contains: `test_apu_core` has the float body, while
-// `test_apu_core_integer` is built with PR32_APU_HAS_FPU=0. `Nes` and `Hybrid`
+// `test_apu_core_integer` is built with PR32_APU_HAS_FPU=0. `Nes` and `Famicom`
 // select the integer core in both builds (S3), so a case may say what those two
-// profiles sound like without knowing which core the build compiled. Since E1
-// they are no longer aliases of `Legacy` — `Hybrid` carries the exponential
-// envelope — and the cases below pin what each one renders.
+// profiles sound like without knowing which core the build compiled. They are
+// not aliases of `Legacy`; they share the NES character and differ only in the
+// output stage, and the cases below pin what each one renders.
 
 // Queues one looping SINE note. Split from the render calls so the caller can
 // put a `setSoundProfile` call between two blocks: a profile change cannot land
@@ -5823,18 +5823,19 @@ static int32_t maxAdjacentStep(const int16_t* pcm, int from, int to) {
 // E1 extends the same case instead of adding a sibling: the character the
 // profile writes is now visible (the envelope curve), so the ordering claim is
 // checked twice — once structurally (the counter) and once by observing a value
-// only the last step can produce. Run under `Hybrid`, whose exponential curve
-// differs from everything the note path leaves behind.
+// only the last step can produce. Run under `Famicom` with an exponential note
+// curve, which differs from everything the safe-state block leaves behind.
 void profile_apply_runs_after_nes_accurate_init(void) {
     ApuCore apu;
     apu.init(44100);
     apu.reset();
-    apu.setSoundProfile(SoundProfile::Hybrid);
+    apu.setSoundProfile(SoundProfile::Famicom);
 
     TEST_ASSERT_EQUAL_UINT32(0, apu.getProfileApplyCountForTesting());
 
     InstrumentPreset preset = INSTR_PULSE_LEAD;
     preset.nesAccurate = true;
+    preset.envelopeCurve = EnvelopeCurve::Exponential;
 
     int16_t buffer[256] = {0};
     const int slot = playPresetNote(apu, buffer, WaveType::PULSE, preset);
@@ -5842,7 +5843,7 @@ void profile_apply_runs_after_nes_accurate_init(void) {
     // Ordering: the profile did not undo the safe state the note left behind.
     assertNesSafeCommon(apu, slot);
     // S2: `initNesSafe` cleared every NES sub-unit above and still did not
-    // erase the profile's curve, which is what "applied last" has to mean.
+    // erase the resolved curve, which is what "applied last" has to mean.
     TEST_ASSERT_EQUAL_INT((int)EnvelopeCurve::Exponential,
                           (int)apu.getVoiceEnvelopeCurveForTesting(slot));
 
@@ -5863,33 +5864,33 @@ void profile_apply_runs_after_nes_accurate_init(void) {
                           (int)apu.getVoiceEnvelopeCurveForTesting(slot2));
 }
 
-// S3, E1 contract change. E0 pinned `Nes` == `Hybrid` byte for byte because
-// neither profile had any character yet. E1 gives `Hybrid` the exponential
-// envelope, so that aliasing is broken on purpose and the assertion that goes
-// with it is replaced by the two claims underneath it:
+// S2 (Famicom profile): `Famicom` is the `Nes` character with a different
+// output stage. E1-E2 gave value 2 (then `Hybrid`) an exponential default
+// envelope and a band-limited SAW; both are gone, so the claims are:
 //
-//   * `Nes` still renders the `Legacy` curve — its own character is the 4-bit
-//     `nesEnvelope` at 240 Hz, which is not wired in T1 (T3/T4 complete it).
-//     The committed integer golden is what pins its bytes; here we pin that it
-//     resolves to `Linear` and therefore renders the same bytes as an explicit
-//     linear override, while an exponential override does change them.
-//   * `Hybrid` defaults to `Exponential`, and the exponential is exactly the
-//     curve it renders: same bytes as an explicit exponential override,
-//     different bytes from a linear one.
-//
-// The E0 claim that is still true is kept: both profiles run the same integer
-// core, so forcing the same curve on both makes their bytes identical again.
+//   * both profiles resolve `ProfileDefault` to `Linear`, i.e. the default
+//     renders the same bytes as an explicit linear override, while an
+//     exponential override does change them;
+//   * with the output stage out of the way (the S8 caller override, which
+//     also drops the trim), `Nes` and `Famicom` render byte-identical PCM:
+//     every voice-side character is shared;
+//   * with the stage in place they differ, because the stage is the one
+//     thing that is not shared.
 static void renderCurveProbe(SoundProfile profile, EnvelopeCurve curve,
-                             int16_t* out, int samples) {
+                             int16_t* out, int samples,
+                             bool bypassOutputStage = false) {
     ApuCore apu;
     apu.init(44100);
     apu.reset();
     apu.setSoundProfile(profile);
+    if (bypassOutputStage) {
+        apu.setHpfCutoffHz(0.0f);
+    }
 
     // Every parameter of the note is identical across probes; only the profile
     // and the preset's curve change, so a byte difference can only come from
-    // the curve. `INSTR_PULSE_LEAD` decays (0.18 s) and releases (0.22 s), so
-    // both curved stages are exercised inside the window.
+    // the curve or the stage. `INSTR_PULSE_LEAD` decays (0.18 s) and releases
+    // (0.22 s), so both curved stages are exercised inside the window.
     InstrumentPreset preset = INSTR_PULSE_LEAD;
     preset.envelopeCurve = curve;
 
@@ -5918,134 +5919,66 @@ static int32_t trimForProfile(SoundProfile profile) {
     return apu.getProfileTrimQ15ForTesting();
 }
 
-void profile_nes_and_hybrid_differ_only_by_the_envelope_curve(void) {
+void profile_famicom_shares_the_nes_character(void) {
     constexpr int kSamples = 4096;
     static int16_t nesDefault[kSamples];
-    static int16_t hybridDefault[kSamples];
-    static int16_t nesLinear[kSamples];
-    static int16_t hybridLinear[kSamples];
-    static int16_t nesExponential[kSamples];
+    static int16_t famicomDefault[kSamples];
+    static int16_t famicomLinear[kSamples];
+    static int16_t famicomExponential[kSamples];
+    static int16_t nesBypassed[kSamples];
+    static int16_t famicomBypassed[kSamples];
 
     renderCurveProbe(SoundProfile::Nes, EnvelopeCurve::ProfileDefault, nesDefault, kSamples);
-    renderCurveProbe(SoundProfile::Hybrid, EnvelopeCurve::ProfileDefault, hybridDefault, kSamples);
-    renderCurveProbe(SoundProfile::Nes, EnvelopeCurve::Linear, nesLinear, kSamples);
-    renderCurveProbe(SoundProfile::Hybrid, EnvelopeCurve::Linear, hybridLinear, kSamples);
-    renderCurveProbe(SoundProfile::Nes, EnvelopeCurve::Exponential, nesExponential, kSamples);
+    renderCurveProbe(SoundProfile::Famicom, EnvelopeCurve::ProfileDefault, famicomDefault, kSamples);
+    renderCurveProbe(SoundProfile::Famicom, EnvelopeCurve::Linear, famicomLinear, kSamples);
+    renderCurveProbe(SoundProfile::Famicom, EnvelopeCurve::Exponential, famicomExponential, kSamples);
+    renderCurveProbe(SoundProfile::Nes, EnvelopeCurve::ProfileDefault, nesBypassed, kSamples, true);
+    renderCurveProbe(SoundProfile::Famicom, EnvelopeCurve::ProfileDefault, famicomBypassed, kSamples, true);
 
-    // Guard against comparing two silent buffers: two equal silences prove
-    // nothing about the core, only that nothing rendered.
-    TEST_ASSERT_TRUE(peakMagnitude(nesDefault, kSamples) > 1000);
-    TEST_ASSERT_TRUE(peakMagnitude(hybridDefault, kSamples) > 1000);
+    // Guard against comparing two silent buffers.
+    TEST_ASSERT_TRUE(peakMagnitude(famicomDefault, kSamples) > 1000);
+    TEST_ASSERT_TRUE(peakMagnitude(nesBypassed, kSamples) > 1000);
 
-    // E1: the defaults are no longer aliases. `Hybrid`'s exponential is the
-    // only difference in T1, so the curve is what has to show up here.
+    // The default envelope is the linear one, and the curve still matters.
+    TEST_ASSERT_EQUAL_INT_MESSAGE(0,
+        std::memcmp(famicomDefault, famicomLinear, sizeof(famicomLinear)),
+        "Famicom's default envelope must be the linear curve");
+    TEST_ASSERT_TRUE(std::memcmp(famicomDefault, famicomExponential,
+                                 sizeof(famicomExponential)) != 0);
+
+    // Same voice character: identical bytes once the stage is bypassed.
+    TEST_ASSERT_EQUAL_INT_MESSAGE(0,
+        std::memcmp(nesBypassed, famicomBypassed, sizeof(nesBypassed)),
+        "Nes and Famicom must share every voice-side character");
+
+    // Different output stage: the profiles still sound different.
     TEST_ASSERT_TRUE_MESSAGE(
-        std::memcmp(nesDefault, hybridDefault, sizeof(nesDefault)) != 0,
-        "E1: Hybrid must no longer render the same bytes as Nes");
+        std::memcmp(nesDefault, famicomDefault, sizeof(nesDefault)) != 0,
+        "the Famicom output stage must differ from the Nes one");
+}
 
-    // E2 changed what "same curve" means here. Bytes stopped matching when each
-    // audible profile got its own fixed level trim (`ApuCore.h`), so the same
-    // curve no longer produces the same samples. What still holds is the
-    // stronger claim: the two renders share one shape, and the trim ratio is the
-    // ONLY difference between them.
-    //
-    // The gains are READ from the core, never copied: the trim has already been
-    // retuned once on listening evidence, and a hand-copied constant only turns
-    // that into a silent stale assertion.
-    const int32_t kNesTrimQ15 = trimForProfile(SoundProfile::Nes);
-    const int32_t kHybridTrimQ15 = trimForProfile(SoundProfile::Hybrid);
+// S1 (Famicom profile): `Hybrid` is a deprecated alias of `Famicom`. This is
+// the ONE place in the library's own sources that names it, to prove the
+// alias still compiles, carries value 2 and selects the same profile.
+void sound_profile_hybrid_is_a_deprecated_alias_of_famicom(void) {
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
+    const SoundProfile alias = SoundProfile::Hybrid;
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
+    TEST_ASSERT_EQUAL_INT((int)SoundProfile::Famicom, (int)alias);
+    TEST_ASSERT_EQUAL_UINT8(2, static_cast<uint8_t>(alias));
 
-    // Quantisation bound, derived rather than tuned. The renderer truncates
-    // once per profile (`out = (raw * gain) >> 15`, toward zero), so comparing
-    // the two renders carries one truncation on each side, and the Nes-side
-    // error reaches the Hybrid scale multiplied by 53854/47786 = 1.127. The
-    // total is 1.127 + 1 < 2.127 LSB, so two integers further apart than 2 LSB
-    // cannot have come from the same underlying sample. The division below must
-    // truncate toward zero the same way the renderer does, which is plain
-    // integer division - `lround` would be a different operation and would
-    // hide a rounding change in the stage.
-    int32_t worstTrimDeviationLsb = 0;
-    for (int i = 0; i < kSamples; ++i) {
-        const int32_t expected = static_cast<int32_t>(
-            static_cast<int64_t>(nesLinear[i]) * kHybridTrimQ15 / kNesTrimQ15);
-        const int32_t deviation = static_cast<int32_t>(hybridLinear[i]) - expected;
-        const int32_t magnitude = (deviation < 0) ? -deviation : deviation;
-        if (magnitude > worstTrimDeviationLsb) {
-            worstTrimDeviationLsb = magnitude;
-        }
-        char message[192] = {};
-        std::snprintf(message, sizeof(message),
-                      "sample %d: Nes %d scales to %d, Hybrid renders %d "
-                      "(limit +-2 LSB)",
-                      i, static_cast<int>(nesLinear[i]), static_cast<int>(expected),
-                      static_cast<int>(hybridLinear[i]));
-        TEST_ASSERT_INT32_WITHIN_MESSAGE(2, expected,
-                                         static_cast<int32_t>(hybridLinear[i]),
-                                         message);
-    }
-
-    // The peak must move by exactly the trim ratio; 0.5 % is wide enough for
-    // one LSB of quantisation on a peak of a few thousand and narrow enough
-    // that a different gain cannot pass.
-    const double peakRatio =
-        static_cast<double>(peakMagnitude(hybridLinear, kSamples)) /
-        static_cast<double>(peakMagnitude(nesLinear, kSamples));
-    const double trimRatio =
-        static_cast<double>(kHybridTrimQ15) / static_cast<double>(kNesTrimQ15);
-    char ratioMessage[160] = {};
-    std::snprintf(ratioMessage, sizeof(ratioMessage),
-                  "peak ratio %.6f vs trim ratio %.6f (limit 0.5 %%)", peakRatio,
-                  trimRatio);
-    TEST_ASSERT_TRUE_MESSAGE(std::fabs(peakRatio / trimRatio - 1.0) <= 0.005,
-                             ratioMessage);
-
-    // Shape: a zero crossing of the Nes render is still a zero crossing of the
-    // Hybrid render. The allowance is |sample| <= 2 on either side of the
-    // crossing - the same quantisation bound as above - because a sample that
-    // close to zero can legitimately change sign under a x1.127 gain without
-    // the waveform moving. A crossing at a larger amplitude cannot flip.
-    constexpr int kTrimRoundingLsb = 2;
-    int sharedCrossings = 0;
-    for (int i = 1; i < kSamples; ++i) {
-        const int32_t prev = nesLinear[i - 1];
-        const int32_t cur = nesLinear[i];
-        const bool nesCrosses = (prev > 0 && cur < 0) || (prev < 0 && cur > 0);
-        if (!nesCrosses) {
-            continue;
-        }
-        const int32_t prevMagnitude = (prev < 0) ? -prev : prev;
-        const int32_t curMagnitude = (cur < 0) ? -cur : cur;
-        if (prevMagnitude <= kTrimRoundingLsb || curMagnitude <= kTrimRoundingLsb) {
-            continue;  // exempted: the trim's rounding can flip a near-zero sign
-        }
-        const bool hybridCrosses =
-            (hybridLinear[i - 1] > 0 && hybridLinear[i] < 0) ||
-            (hybridLinear[i - 1] < 0 && hybridLinear[i] > 0);
-        char message[192] = {};
-        std::snprintf(message, sizeof(message),
-                      "zero crossing lost at sample %d (Nes %d -> %d, Hybrid %d -> %d)",
-                      i, static_cast<int>(prev), static_cast<int>(cur),
-                      static_cast<int>(hybridLinear[i - 1]),
-                      static_cast<int>(hybridLinear[i]));
-        TEST_ASSERT_TRUE_MESSAGE(hybridCrosses, message);
-        ++sharedCrossings;
-    }
-    TEST_ASSERT_TRUE_MESSAGE(sharedCrossings > 0,
-                             "no zero crossing left to compare: the shape check "
-                             "would be vacuous");
-    std::printf("  curve probe: worst trim deviation %d LSB, %d shared zero "
-                "crossings, peak ratio %.6f (trim ratio %.6f)\n",
-                static_cast<int>(worstTrimDeviationLsb), sharedCrossings, peakRatio,
-                trimRatio);
-
-    // `Nes` in T1 renders the `Legacy` curve: its default is byte-identical to
-    // an explicit linear override, and an exponential override *would* move it
-    // (which is what keeps the equality above from being vacuous).
-    TEST_ASSERT_EQUAL_INT(0, std::memcmp(nesDefault, nesLinear, sizeof(nesLinear)));
-    TEST_ASSERT_TRUE(std::memcmp(nesDefault, nesExponential, sizeof(nesExponential)) != 0);
-
-    // `Hybrid`'s default IS the exponential curve, not something in between.
-    TEST_ASSERT_TRUE(std::memcmp(hybridDefault, hybridLinear, sizeof(hybridLinear)) != 0);
+    ApuCore apu;
+    apu.init(44100);
+    apu.reset();
+    apu.setSoundProfile(alias);
+    TEST_ASSERT_EQUAL_INT((int)SoundProfile::Famicom, (int)apu.getSoundProfile());
+    TEST_ASSERT_EQUAL_INT32(trimForProfile(SoundProfile::Famicom),
+                            apu.getProfileTrimQ15ForTesting());
 }
 
 // S6: the measurable no-click criterion. 0.5 s at 44100 Hz, profile switched
@@ -6214,15 +6147,15 @@ void profile_envelope_curve_precedence_matches_d3(void) {
         {SoundProfile::Legacy, EnvelopeCurve::Exponential, false,
          EnvelopeCurve::Exponential,
          "a note overrides the Legacy default"},
-        {SoundProfile::Hybrid, EnvelopeCurve::ProfileDefault, false,
-         EnvelopeCurve::Exponential,
-         "Hybrid default is exponential"},
-        {SoundProfile::Hybrid, EnvelopeCurve::Linear, false,
+        {SoundProfile::Famicom, EnvelopeCurve::ProfileDefault, false,
          EnvelopeCurve::Linear,
-         "a note overrides the Hybrid default"},
-        {SoundProfile::Hybrid, EnvelopeCurve::ProfileDefault, true,
+         "Famicom default is linear, like Nes"},
+        {SoundProfile::Famicom, EnvelopeCurve::Exponential, false,
          EnvelopeCurve::Exponential,
-         "nesAccurate must not erase the profile character"},
+         "a note overrides the Famicom default"},
+        {SoundProfile::Famicom, EnvelopeCurve::ProfileDefault, true,
+         EnvelopeCurve::Linear,
+         "nesAccurate must not change Famicom either"},
         {SoundProfile::Nes, EnvelopeCurve::ProfileDefault, false,
          EnvelopeCurve::Linear,
          "Nes keeps the Legacy curve until its 4-bit envelope lands"},
@@ -6309,9 +6242,10 @@ void envelope_exponential_decay_reaches_minus_60_db_at_the_stage_end(void) {
     ApuCore apu;
     apu.init(44100);
     apu.reset();
-    apu.setSoundProfile(SoundProfile::Hybrid);
+    apu.setSoundProfile(SoundProfile::Famicom);
 
     InstrumentPreset preset = INSTR_PULSE_LEAD;
+    preset.envelopeCurve = EnvelopeCurve::Exponential;  // no profile defaults to it
     preset.attackTime = 0.0f;      // one sample: the decay starts at full scale
     preset.decayTime = 0.1f;       // kEnvelopeDecaySamples
     preset.sustainLevel = 0.0f;    // −60 dB of full scale is the stage's target
@@ -6378,9 +6312,10 @@ void envelope_exponential_release_reaches_minus_60_db_at_the_stage_end(void) {
     ApuCore apu;
     apu.init(44100);
     apu.reset();
-    apu.setSoundProfile(SoundProfile::Hybrid);
+    apu.setSoundProfile(SoundProfile::Famicom);
 
     InstrumentPreset preset = INSTR_PULSE_LEAD;
+    preset.envelopeCurve = EnvelopeCurve::Exponential;  // no profile defaults to it
     preset.attackTime = 0.0f;
     preset.decayTime = 0.0f;       // attack -> sustain directly
     preset.sustainLevel = 0.5f;    // the release starts at 16384
@@ -6430,9 +6365,10 @@ void envelope_exponential_short_stage_keeps_the_linear_ramp(void) {
     ApuCore apu;
     apu.init(44100);
     apu.reset();
-    apu.setSoundProfile(SoundProfile::Hybrid);
+    apu.setSoundProfile(SoundProfile::Famicom);
 
     InstrumentPreset preset = INSTR_PULSE_LEAD;
+    preset.envelopeCurve = EnvelopeCurve::Exponential;  // no profile defaults to it
     preset.attackTime = 0.0f;
     preset.decayTime = 0.002f;     // 88 samples, far below the 1356 step span
     preset.sustainLevel = 0.0f;
@@ -6467,21 +6403,22 @@ void envelope_exponential_short_stage_keeps_the_linear_ramp(void) {
 }
 
 // The defect this correction fixes, measured where it was audible: the canonical
-// track's lead under `Hybrid`. `INSTR_PULSE_LEAD` decays for 0.18 s (7938
+// track's lead under `Famicom` (2.2.x measured it under `Hybrid`, whose default
+// curve was the exponential one; the note-level shape is pinned above). `INSTR_PULSE_LEAD` decays for 0.18 s (7938
 // samples) down to a 0.88 sustain, so the mix must never fall silent inside that
 // window. The broken cut silenced the note for ~145 ms of every note and then
 // jumped back up to the sustain level.
-void profile_hybrid_canonical_note_never_falls_silent_before_decay_ends(void) {
+void profile_famicom_canonical_note_never_falls_silent_before_decay_ends(void) {
     constexpr int kNoteSamples = 11025;  // 0.25 s of the first note at 120 bpm
     constexpr int kDecayEnd = 7938;      // 0.18 s of DECAY
-    static int16_t hybrid[kNoteSamples];
+    static int16_t famicom[kNoteSamples];
 
     ApuCore apu;
     apu.init(44100);
-    apu.setSoundProfile(SoundProfile::Hybrid);
+    apu.setSoundProfile(SoundProfile::Famicom);
     // render_canonical() resets and re-initialises the core, which is fine: the
     // profile is configuration, so init() keeps it.
-    apu_golden::render_canonical(apu, hybrid, kNoteSamples);
+    apu_golden::render_canonical(apu, famicom, kNoteSamples);
 
     // Past the attack ramp, inside the decay window: the longest run of exact
     // zeros. A pulse wave at 440 Hz alternates every ~50 samples, so a run this
@@ -6489,7 +6426,7 @@ void profile_hybrid_canonical_note_never_falls_silent_before_decay_ends(void) {
     int run = 0;
     int longest = 0;
     for (int i = 128; i < kDecayEnd; ++i) {
-        if (hybrid[i] == 0) {
+        if (famicom[i] == 0) {
             ++run;
             if (run > longest) longest = run;
         } else {
@@ -6500,7 +6437,7 @@ void profile_hybrid_canonical_note_never_falls_silent_before_decay_ends(void) {
                              "the envelope fell silent inside its decay stage");
 
     // And it is still sounding when the decay ends (sustain 0.88).
-    TEST_ASSERT_TRUE(peakMagnitude(hybrid + kDecayEnd - 1024, 1024) > 1000);
+    TEST_ASSERT_TRUE(peakMagnitude(famicom + kDecayEnd - 1024, 1024) > 1000);
 }
 
 // =============================================================================
@@ -6777,14 +6714,14 @@ void mixer_curve_is_owned_by_the_profile(void) {
 
     apu.setSoundProfile(SoundProfile::Nes);
     TEST_ASSERT_EQUAL_INT((int)MixerCurve::NesWeighted, (int)apu.getMixerCurveForTesting());
-    apu.setSoundProfile(SoundProfile::Hybrid);
+    apu.setSoundProfile(SoundProfile::Famicom);
     TEST_ASSERT_EQUAL_INT((int)MixerCurve::NesWeighted, (int)apu.getMixerCurveForTesting());
     apu.setSoundProfile(SoundProfile::Legacy);
     TEST_ASSERT_EQUAL_INT((int)MixerCurve::Rational, (int)apu.getMixerCurveForTesting());
 
     // A stream restart must not discard the caller's choice, the same contract
     // the profile itself has (S4).
-    apu.setSoundProfile(SoundProfile::Hybrid);
+    apu.setSoundProfile(SoundProfile::Famicom);
     apu.init(22050);
     TEST_ASSERT_EQUAL_INT((int)MixerCurve::NesWeighted, (int)apu.getMixerCurveForTesting());
 }
@@ -6994,14 +6931,14 @@ void noise_unipolar_level_is_compensated(void) {
 }
 
 // S5 period + gate, D-3 tier 1: the profile supplies both defaults. `Nes` and
-// `Hybrid` arm the canonical `$400E = $00` entry — index 0 of
+// `Famicom` arm the canonical `$400E = $00` entry — index 0 of
 // `nes_apu::kNesNoisePeriodLutNtsc` — so the note's own 1000 Hz clock (44
 // samples) does not decide the period; `Legacy` keeps both the bipolar gate and
 // the frequency-derived period.
 void profile_defaults_arm_the_nes_noise_character(void) {
     int16_t buffer[256] = {0};
 
-    const SoundProfile nesProfiles[2] = {SoundProfile::Nes, SoundProfile::Hybrid};
+    const SoundProfile nesProfiles[2] = {SoundProfile::Nes, SoundProfile::Famicom};
     for (int i = 0; i < 2; ++i) {
         ApuCore apu;
         apu.init(44100);
@@ -7340,9 +7277,9 @@ void duty_snapping_selects_the_nearest_nes_step(void) {
     }
 
     // Both NES-derived profiles share the rule, and neither one is a guess.
-    DutyProbe hybrid;
-    probeDutyVoice(SoundProfile::Hybrid, WaveType::PULSE, 0.25f, -1, hybrid);
-    TEST_ASSERT_EQUAL_UINT8(1, hybrid.index);
+    DutyProbe famicom;
+    probeDutyVoice(SoundProfile::Famicom, WaveType::PULSE, 0.25f, -1, famicom);
+    TEST_ASSERT_EQUAL_UINT8(1, famicom.index);
 }
 
 // S6 / D-3 tier 2: `setVoicePulseDutyMode` pins the pattern for the slot, and
@@ -7680,15 +7617,15 @@ void noise_period_mode_note_does_not_leak_to_the_next_note(void) {
 
 // S3: under a NES-derived profile, a note that asks for continuous duty keeps
 // the `phaseQ32 < dutyCycleQ32` generator instead of a 4-step pattern.
-void pulse_duty_mode_continuous_keeps_the_generator_under_hybrid(void) {
+void pulse_duty_mode_continuous_keeps_the_generator_under_famicom(void) {
     DutyProbe continuous;
-    probeDutyVoice(SoundProfile::Hybrid, WaveType::PULSE, 0.3f, -1, continuous,
+    probeDutyVoice(SoundProfile::Famicom, WaveType::PULSE, 0.3f, -1, continuous,
                    PulseDutyMode::Continuous);
     TEST_ASSERT_EQUAL_UINT8_MESSAGE(255, continuous.index,
         "a continuous-duty note must resolve the 255 sentinel");
 
     DutyProbe snapped;
-    probeDutyVoice(SoundProfile::Hybrid, WaveType::PULSE, 0.3f, -1, snapped);
+    probeDutyVoice(SoundProfile::Famicom, WaveType::PULSE, 0.3f, -1, snapped);
     TEST_ASSERT_EQUAL_UINT8_MESSAGE(1, snapped.index,
         "the same note without the mode must snap to the 25 % step");
     TEST_ASSERT_TRUE_MESSAGE(
@@ -7777,7 +7714,7 @@ static int firstEnabledSfxSlot(const ApuCore& apu) {
 // free slot — the case that would silently pass if the note-on skip were
 // deleted.
 void noise_period_mode_note_beats_an_already_armed_lut(void) {
-    const SoundProfile profiles[2] = { SoundProfile::Nes, SoundProfile::Hybrid };
+    const SoundProfile profiles[2] = { SoundProfile::Nes, SoundProfile::Famicom };
     for (SoundProfile profile : profiles) {
         ApuCore apu;
         apu.init(44100);
@@ -7830,7 +7767,7 @@ void noise_period_mode_note_beats_an_already_armed_lut(void) {
 // S2.1 (second clause): with `noisePeriod == 0` the pinned note keeps its
 // frequency-derived clock instead of the LUT's one-sample period.
 void noise_period_mode_note_keeps_the_frequency_derived_period(void) {
-    const SoundProfile profiles[2] = { SoundProfile::Nes, SoundProfile::Hybrid };
+    const SoundProfile profiles[2] = { SoundProfile::Nes, SoundProfile::Famicom };
     const uint32_t expected = (uint32_t)(44100.0f / 1000.0f);  // 44 samples
     TEST_ASSERT_EQUAL_UINT32(44u, expected);                   // guard the constant
 
@@ -7882,7 +7819,7 @@ void noise_period_mode_note_yields_to_a_voice_pin(void) {
 // voice auto-disables, so the slot is reused without a reset that would clear a
 // leaked override) gets the profile's step again.
 void pulse_duty_mode_continuous_does_not_leak_into_the_next_note(void) {
-    const SoundProfile profiles[2] = { SoundProfile::Nes, SoundProfile::Hybrid };
+    const SoundProfile profiles[2] = { SoundProfile::Nes, SoundProfile::Famicom };
     for (SoundProfile profile : profiles) {
         ApuCore apu;
         apu.init(44100);
@@ -8231,7 +8168,8 @@ int main(int argc, char** argv) {
     RUN_TEST(test_sound_profile_survives_init);
 
     // S3 / S5 / S6: core dispatch, profile character and the hot switch
-    RUN_TEST(profile_nes_and_hybrid_differ_only_by_the_envelope_curve);
+    RUN_TEST(profile_famicom_shares_the_nes_character);
+    RUN_TEST(sound_profile_hybrid_is_a_deprecated_alias_of_famicom);
     RUN_TEST(profile_apply_runs_after_nes_accurate_init);
     RUN_TEST(profile_hot_switch_does_not_click);
     RUN_TEST(profile_accessors_follow_the_active_core);
@@ -8243,7 +8181,7 @@ int main(int argc, char** argv) {
     RUN_TEST(envelope_exponential_decay_reaches_minus_60_db_at_the_stage_end);
     RUN_TEST(envelope_exponential_release_reaches_minus_60_db_at_the_stage_end);
     RUN_TEST(envelope_exponential_short_stage_keeps_the_linear_ramp);
-    RUN_TEST(profile_hybrid_canonical_note_never_falls_silent_before_decay_ends);
+    RUN_TEST(profile_famicom_canonical_note_never_falls_silent_before_decay_ends);
 
     // S4: mixer curve and the NES-weighted groups (E1/T2)
     RUN_TEST(mixer_curve_is_owned_by_the_profile);
@@ -8273,7 +8211,7 @@ int main(int argc, char** argv) {
     RUN_TEST(noise_period_mode_note_keeps_the_authored_period_under_nes);
     RUN_TEST(noise_period_mode_default_still_arms_the_nes_lut);
     RUN_TEST(noise_period_mode_note_does_not_leak_to_the_next_note);
-    RUN_TEST(pulse_duty_mode_continuous_keeps_the_generator_under_hybrid);
+    RUN_TEST(pulse_duty_mode_continuous_keeps_the_generator_under_famicom);
     RUN_TEST(pulse_duty_mode_default_snaps_the_continuous_away);
     RUN_TEST(note_character_modes_are_inert_under_legacy);
 
