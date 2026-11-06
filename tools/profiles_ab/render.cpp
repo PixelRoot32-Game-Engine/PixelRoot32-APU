@@ -1,7 +1,7 @@
 /// profiles_ab render — raw S16LE render of the blind A/B track under one
 /// sound profile.
 ///
-/// S9.4 asks for the SAME track rendered through `Nes`, `Hybrid` and `Legacy`
+/// S9.4 asks for the SAME track rendered through `Nes`, `Famicom` and `Legacy`
 /// so a listener can say which is which. This binary renders one profile and
 /// writes raw S16LE; `run.py` owns everything a blind comparison needs and that
 /// C++ has no business doing here: the RIFF/WAV header, the RMS measurement and
@@ -15,8 +15,10 @@
 ///   - TRIANGLE bass (S4 weights the triangle 13 % above a pulse);
 ///   - NOISE percussion from the shipped kick/snare/hat presets (S5 makes the
 ///     noise unipolar and puts it on the NES period LUT).
-/// The envelope difference (S2) is audible on every one of those voices:
-/// `Hybrid` decays and releases exponentially, `Nes` and `Legacy` linearly.
+/// `Nes` and `Famicom` share all of that character and differ only in the
+/// output stage: `Nes` runs HPF 90 Hz -> HPF 440 Hz -> LPF, `Famicom` a single
+/// HPF at 37 Hz -> LPF, so the TRIANGLE bass and the kick keep their low end
+/// under `Famicom`.
 ///
 /// It writes only the file given by `--out`, so `run.py` can keep every
 /// intermediate outside the repository.
@@ -88,8 +90,9 @@ bool resolveProfile(const char* name, SoundProfile& out)
         out = SoundProfile::Nes;
         return true;
     }
-    if (std::strcmp(name, "hybrid") == 0) {
-        out = SoundProfile::Hybrid;
+    // `hybrid` is the 2.2.x name of value 2, kept as an alias of `famicom`.
+    if (std::strcmp(name, "famicom") == 0 || std::strcmp(name, "hybrid") == 0) {
+        out = SoundProfile::Famicom;
         return true;
     }
     return false;
@@ -98,7 +101,7 @@ bool resolveProfile(const char* name, SoundProfile& out)
 void usage()
 {
     std::fprintf(stderr,
-                 "usage: apu_profiles_ab --profile <legacy|nes|hybrid> "
+                 "usage: apu_profiles_ab --profile <legacy|nes|famicom> "
                  "--out <path>\n"
                  "  --profile  sound profile to render with (required)\n"
                  "  --out      output file, raw S16LE mono PCM (required)\n");
@@ -312,7 +315,7 @@ int main(int argc, char** argv)
     SoundProfile profile{};
     if (!resolveProfile(profileName, profile)) {
         std::fprintf(stderr,
-                     "error: unknown profile '%s' (expected legacy, nes or hybrid)\n",
+                     "error: unknown profile '%s' (expected legacy, nes or famicom)\n",
                      profileName);
         usage();
         return 1;

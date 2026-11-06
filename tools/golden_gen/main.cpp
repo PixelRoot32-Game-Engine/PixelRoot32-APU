@@ -53,8 +53,10 @@ bool resolveProfile(const char* name, SoundProfile& out)
         out = SoundProfile::Nes;
         return true;
     }
-    if (std::strcmp(name, "hybrid") == 0) {
-        out = SoundProfile::Hybrid;
+    // `hybrid` is the 2.2.x name of value 2, kept as a CLI alias of `famicom`
+    // the same way the library keeps `SoundProfile::Hybrid`.
+    if (std::strcmp(name, "famicom") == 0 || std::strcmp(name, "hybrid") == 0) {
+        out = SoundProfile::Famicom;
         return true;
     }
     return false;
@@ -82,9 +84,10 @@ bool resolveScene(const char* name, GoldenScene& out)
 void usage()
 {
     std::fprintf(stderr,
-                 "usage: apu_golden_gen --profile <legacy|nes|hybrid> --out <path>"
+                 "usage: apu_golden_gen --profile <legacy|nes|famicom> --out <path>"
                  " [--scene <canonical|wavetable>]\n"
-                 "  --profile  sound profile to render with (required)\n"
+                 "  --profile  sound profile to render with (required);\n"
+                 "             'hybrid' is accepted as an alias of 'famicom'\n"
                  "  --out      output file, raw S16LE PCM (required)\n"
                  "  --scene    scene to render (default canonical)\n");
 }
@@ -144,7 +147,7 @@ int main(int argc, char** argv)
     SoundProfile profile{};
     if (!resolveProfile(profileName, profile)) {
         std::fprintf(stderr,
-                     "error: unknown profile '%s' (expected legacy, nes or hybrid)\n",
+                     "error: unknown profile '%s' (expected legacy, nes or famicom)\n",
                      profileName);
         usage();
         return 1;

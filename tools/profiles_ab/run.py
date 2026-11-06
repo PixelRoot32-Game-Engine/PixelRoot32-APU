@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """S9.4 -- blind A/B material: the same track through the three profiles.
 
-Renders one excerpt of the same music under `Nes`, `Hybrid` and `Legacy`, then
+Renders one excerpt of the same music under `Nes`, `Famicom` and `Legacy`, then
 writes three 16-bit mono 44 100 Hz WAV files whose RMS is identical. The files
 are named `a.wav`, `b.wav`, `c.wav`; the mapping lives in a separate `key.txt`,
 so a listener can play the three files without knowing which profile each one
@@ -50,8 +50,8 @@ EXPECTED_SAMPLES = BODY_SAMPLES + TAIL_SAMPLES
 
 # Blinded order. Deliberately not the enumerator order, and never printed next
 # to the audio: the listener reads key.txt only after answering.
-FILE_FOR_PROFILE = {"hybrid": "a.wav", "legacy": "b.wav", "nes": "c.wav"}
-PROFILES = ("hybrid", "legacy", "nes")
+FILE_FOR_PROFILE = {"famicom": "a.wav", "legacy": "b.wav", "nes": "c.wav"}
+PROFILES = ("famicom", "legacy", "nes")
 
 
 def find_compiler():

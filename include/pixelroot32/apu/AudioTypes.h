@@ -144,7 +144,7 @@ namespace pixelroot32::audio {
      * @enum NoisePeriodMode
      * @brief Whether a note keeps the NOISE period it authored (E3/A1).
      *
-     * `Nes` and `Hybrid` arm the NES period LUT (index 0, `$400E = $00`), which
+     * `Nes` and `Famicom` arm the NES period LUT (index 0, `$400E = $00`), which
      * retunes the LFSR clock and therefore discards the note's own
      * `noisePeriod`. That is the right default for a chip-style lead, and the
      * wrong one for a curated drum kit: a kick authored with a 60-sample period
@@ -176,7 +176,7 @@ namespace pixelroot32::audio {
      * @enum PulseDutyMode
      * @brief Whether a PULSE note keeps the continuous duty generator (E3/A2).
      *
-     * `Nes` and `Hybrid` snap a static duty to the nearest of the four NES
+     * `Nes` and `Famicom` snap a static duty to the nearest of the four NES
      * patterns (12.5 / 25 / 50 / 75 %). Rounding 30 % to 25 % is what the
      * hardware can express, but it makes a value the tool can already author
      * unsayable under a profile.
@@ -655,7 +655,7 @@ namespace pixelroot32::audio {
          * generator; set this per voice via `ApuCore::setVoicePulseDutyMode`.
          *
          * S6: from E1 on this is also the field the sound profile writes.
-         * `Nes` and `Hybrid` arm a step (0..3) chosen from the note's own
+         * `Nes` and `Famicom` arm a step (0..3) chosen from the note's own
          * `duty`, and `Legacy` arms 255, so the value here is the RESOLVED mode
          * the renderer reads rather than a caller-only opt-in. A voice-level
          * write pins it (`pulseDutyOverridden`) and the profile then leaves it
@@ -706,7 +706,7 @@ namespace pixelroot32::audio {
          *        envelope level instead of between -level and +level.
          *
          * S5/P9. This is the resolved value the renderer reads: the sound
-         * profile supplies it as a DEFAULT (`Nes`/`Hybrid` arm it, `Legacy`
+         * profile supplies it as a DEFAULT (`Nes`/`Famicom` arm it, `Legacy`
          * leaves it off) and a voice may override it (D-3 tier 2), which is
          * what `noiseUnipolarOverridden` marks. On, a voice emits only 0 and
          * non-negative levels — the NES behaviour, whose DC the output DC
@@ -849,7 +849,7 @@ namespace pixelroot32::audio {
         /**
          * @brief Set once the caller pinned the PULSE duty mode of the slot.
          *
-         * S6 / D-3 tier 2. `Nes` and `Hybrid` arm stepped duty by default
+         * S6 / D-3 tier 2. `Nes` and `Famicom` arm stepped duty by default
          * (0..3, chosen from the note's own `duty`), so without this bit the
          * profile would re-arm its own step on every note-on and
          * `setVoicePulseDutyMode` could never outlive the note it was written
@@ -1079,7 +1079,7 @@ namespace pixelroot32::audio {
          *
          * Writing this struct also pins the mode against the profile's default,
          * so `255` here means "this slot keeps the continuous generator" even
-         * under `Nes`/`Hybrid` — see `AudioChannel::pulseDutyOverridden`.
+         * under `Nes`/`Famicom` — see `AudioChannel::pulseDutyOverridden`.
          */
         uint8_t pulseDutyIndex = 255;
         /** M8 noise period: 0..15 select a LUT entry, 255 = from frequency. */
@@ -1089,7 +1089,7 @@ namespace pixelroot32::audio {
          * instead of between -level and +level.
          *
          * Unlike `noiseLfsrShort` (per NOTE), this IS a per-SLOT mode, like the
-         * selectors above: the profile arms it by default for `Nes`/`Hybrid`
+         * selectors above: the profile arms it by default for `Nes`/`Famicom`
          * and a write here pins it against that default (D-3 tier 2), so the
          * choice survives the next note on the slot. `false` therefore means
          * "bipolar noise", not "let the profile decide" — that value only
@@ -1104,11 +1104,23 @@ namespace pixelroot32::audio {
      * @brief Named character sets applied to every voice.
      *
      * `Legacy` is the frozen compatibility contract: it reproduces the 2.0.0
-     * sound. `Nes` and `Hybrid` select profile-owned character from E1 onwards
-     * (envelope curve, weighted mix, unipolar noise, stepped duty); the profile
-     * table in `docs/ABI.md` says what each one owns at a given phase.
+     * sound. `Nes` and `Famicom` select profile-owned character (linear
+     * envelope, weighted mix, unipolar noise, stepped duty) and differ only in
+     * the output stage: `Nes` runs HPF 90 Hz -> HPF 440 Hz -> LPF 14 kHz (the
+     * front-loading NES), `Famicom` HPF 37 Hz -> LPF 14 kHz (the Famicom's
+     * single coupling high-pass). The profile table in `docs/ABI.md` says what
+     * each one owns.
+     *
+     * `Hybrid` is the 2.2.x name of value 2. It is kept as a deprecated alias
+     * of `Famicom` so existing code keeps compiling (with a warning); the wire
+     * value stays 2, so a serialised `Hybrid` selects `Famicom`.
      */
-    enum class SoundProfile : uint8_t { Legacy = 0, Nes = 1, Hybrid = 2 };
+    enum class SoundProfile : uint8_t {
+        Legacy = 0,
+        Nes = 1,
+        Famicom = 2,
+        Hybrid [[deprecated("use SoundProfile::Famicom")]] = 2
+    };
 
     enum class AudioCommandType : uint8_t {
         PLAY_EVENT,
