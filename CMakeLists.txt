@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(pixelroot32-apu VERSION 2.3.0 LANGUAGES C CXX)
+project(pixelroot32-apu VERSION 2.4.0 LANGUAGES C CXX)
 
 # The test files have pre-existing narrowing conversions in brace-init
 # (committed before M7). Suppress this warning so the test build doesn't
@@ -77,6 +77,40 @@ if(PR32_APU_BUILD_TESTS)
         include test test/support)
     target_link_libraries(test_apu_output_filter_integer PRIVATE pr32_apu_unity)
     add_test(NAME test_apu_output_filter_integer COMMAND test_apu_output_filter_integer
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test)
+
+    # 2.4.0: per-voice and output peak meters. The tap lives in BOTH render
+    # loops (the frozen float `Legacy` body and the integer core), so the same
+    # source is built twice for the same reason as the output-filter suite
+    # above: "the meters describe the block" has to hold on the body a no-FPU
+    # board runs, not only on the one this host compiles.
+    pr32_apu_add_test(test_apu_voice_meters)
+    add_executable(test_apu_voice_meters_integer test/test_apu_voice_meters.cpp src/ApuCore.cpp)
+    target_compile_definitions(test_apu_voice_meters_integer PRIVATE
+        UNIT_TEST=1 PR32_APU_ENABLE_LEGACY_FLOAT=0)
+    target_include_directories(test_apu_voice_meters_integer PRIVATE
+        include test test/support)
+    target_link_libraries(test_apu_voice_meters_integer PRIVATE pr32_apu_unity)
+    add_test(NAME test_apu_voice_meters_integer COMMAND test_apu_voice_meters_integer
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test)
+
+    # 2.4.0: the meter contracts a consumer relies on, pinned independently of
+    # the suite above: outputPeak equals the peak of the buffer the caller
+    # receives (post volume, curve, filter and bitcrush), voicePeak is that
+    # voice and not the mix, the NES group weight is inside the per-voice
+    # value, `setPostMixMono` runs after the tap, extreme slots answer zero,
+    # and reading the meters does not perturb the PCM. Also built twice, for
+    # the same reason as its sibling.
+    pr32_apu_add_test(test_apu_voice_meters_placement)
+    add_executable(test_apu_voice_meters_placement_integer
+        test/test_apu_voice_meters_placement.cpp src/ApuCore.cpp)
+    target_compile_definitions(test_apu_voice_meters_placement_integer PRIVATE
+        UNIT_TEST=1 PR32_APU_ENABLE_LEGACY_FLOAT=0)
+    target_include_directories(test_apu_voice_meters_placement_integer PRIVATE
+        include test test/support)
+    target_link_libraries(test_apu_voice_meters_placement_integer PRIVATE pr32_apu_unity)
+    add_test(NAME test_apu_voice_meters_placement_integer
+             COMMAND test_apu_voice_meters_placement_integer
              WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test)
 
     # E2/S4, S5 (and the S6 groundwork): the generated SAW mipmap tables are

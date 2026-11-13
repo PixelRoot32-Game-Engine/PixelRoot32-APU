@@ -1321,6 +1321,11 @@ namespace pixelroot32::audio {
             voices[i].type = WaveType::PULSE;
         }
         clearMusicTrackVoiceState();
+        // 2.4.0: no block has been rendered yet, so nothing is metered. The
+        // in-class initializers already say this; it is restated through the
+        // single publisher so there is one definition of "meter reads zero".
+        int32_t silentPeaks[MAX_VOICES] = {};
+        publishMeterPeaks(silentPeaks, 0);
     }
 
     void ApuCore::init(int sr) {
@@ -1867,6 +1872,12 @@ namespace pixelroot32::audio {
         softClipMode_ = SoftClipMode::Rational;  // Hito 4 M11
         currentPeak = 0.0f;
         samplesSinceLog = 0;
+        // 2.4.0: the meters describe the last rendered block, and this call
+        // removes the block they describe, so both go to zero with it.
+        {
+            int32_t silentPeaks[MAX_VOICES] = {};
+            publishMeterPeaks(silentPeaks, 0);
+        }
         audioTimeSamples = 0;
         for (size_t i = 0; i < MAX_MUSIC_TRACKS; ++i) {
             tracks[i] = nullptr;
@@ -4438,6 +4449,40 @@ namespace pixelroot32::audio {
         }
     }
 
+    // ------------------------------------------------------------------
+    // Peak metering (2.4.0)
+    // ------------------------------------------------------------------
+    void ApuCore::publishMeterPeaks(const int32_t* voicePeaksQ15,
+                                    int32_t outputPeakQ15) {
+        // One relaxed store per value, once per block. Relaxed is enough
+        // because each value stands alone: a reader wants "how loud was the
+        // last block", not a snapshot that agrees with the other eight. The
+        // alternative — a seq_cst fence around the block — would put a barrier
+        // in the render loop to buy a guarantee nothing here needs.
+        for (int slot = 0; slot < MAX_VOICES; ++slot) {
+            int32_t peak = voicePeaksQ15[slot];
+            if (peak < 0) peak = 0;            // defensive: magnitudes only
+            if (peak > 32767) peak = 32767;    // full scale is the ceiling
+            voicePeakQ15_[slot].store((uint16_t)peak, std::memory_order_relaxed);
+        }
+        if (outputPeakQ15 < 0) outputPeakQ15 = 0;
+        if (outputPeakQ15 > 32767) outputPeakQ15 = 32767;
+        outputPeakQ15_.store((uint16_t)outputPeakQ15, std::memory_order_relaxed);
+    }
+
+    float ApuCore::voicePeak(int slot) const {
+        if (slot < 0 || slot >= MAX_VOICES) return 0.0f;
+        const uint16_t raw = voicePeakQ15_[slot].load(std::memory_order_relaxed);
+        // 32767 is exactly 1.0f, so the division needs no extra clamp; the
+        // comparison is there to keep the arithmetic away from the rail case.
+        return (raw >= 32767u) ? 1.0f : ((float)raw / 32767.0f);
+    }
+
+    float ApuCore::outputPeak() const {
+        const uint16_t raw = outputPeakQ15_.load(std::memory_order_relaxed);
+        return (raw >= 32767u) ? 1.0f : ((float)raw / 32767.0f);
+    }
+
 #if PR32_APU_ENABLE_LEGACY_FLOAT
     // S1: the frozen `Legacy` float body. Only the mechanical extraction that
     // gave it a name is allowed to touch it — no sound fix, no optimization.
@@ -4460,6 +4505,12 @@ namespace pixelroot32::audio {
         const double apuCyclesPerSample =
             (sampleRate > 0) ? (nes_apu::kNesApuHzNtsc / (double)sampleRate) : 0.0;
 
+        // 2.4.0 meter taps. Block-local maxima, published once after the loop:
+        // a comparison per voice and one per output sample, which is the work
+        // the mix peak (`currentPeak`) already pays here.
+        float voicePeakFullScale[MAX_VOICES] = {};
+        int32_t outputPeakAbs = 0;
+
         for (int i = 0; i < length; ++i) {
             // Hito 2 M3: tick the NES frame counter before voice mixing so
             // any future sub-units (M4-M7) see a consistent clock state.
@@ -4467,7 +4518,19 @@ namespace pixelroot32::audio {
             float acc = 0.0f;
             for (int c = 0; c < MAX_VOICES; ++c) {
                 if (voices[c].enabled) {
-                    acc += generateSampleForVoice(voices[c]) * MIXER_SCALE;
+                    // 2.4.0: the SAME expression as before, named so the
+                    // meter can observe it. `voiceSample` is the voice's own
+                    // contribution — waveform x volume x envelope x tremolo —
+                    // before `MIXER_SCALE` and before the sum, which is what
+                    // makes four tracks read four values. Arithmetic, operand
+                    // order and rounding are untouched: the golden PCM must
+                    // not move.
+                    const float voiceSample = generateSampleForVoice(voices[c]);
+                    acc += voiceSample * MIXER_SCALE;
+                    const float voiceAbs = std::fabs(voiceSample);
+                    if (voiceAbs > voicePeakFullScale[c]) {
+                        voicePeakFullScale[c] = voiceAbs;
+                    }
                 }
             }
             acc *= masterVolume;
@@ -4515,7 +4578,24 @@ namespace pixelroot32::audio {
             if (finalSample > 32767.0f) finalSample = 32767.0f;
             if (finalSample < -32768.0f) finalSample = -32768.0f;
             stream[i] = apply_master_bitcrush((int16_t)finalSample, masterBitcrushBits_);
+
+            // 2.4.0: the output meter taps the sample that actually lands in
+            // the buffer — post-volume, post-shaping, post-filter, post-bits —
+            // so saturation reads full scale rather than the pre-clamp value.
+            const int32_t outputAbs = (stream[i] < 0) ? -(int32_t)stream[i]
+                                                      : (int32_t)stream[i];
+            if (outputAbs > outputPeakAbs) outputPeakAbs = outputAbs;
         }
+
+        // One publication per block; the reader never sees a partial block.
+        int32_t voicePeakQ15[MAX_VOICES];
+        for (int c = 0; c < MAX_VOICES; ++c) {
+            // Round to nearest of 32767, then let the publisher clamp: a
+            // voice can legitimately exceed full scale (unipolar noise).
+            const float scaled = voicePeakFullScale[c] * 32767.0f + 0.5f;
+            voicePeakQ15[c] = (scaled >= 32767.0f) ? 32767 : (int32_t)scaled;
+        }
+        publishMeterPeaks(voicePeakQ15, outputPeakAbs);
     }
 #endif
 
@@ -4671,6 +4751,12 @@ namespace pixelroot32::audio {
         // line of arithmetic changes — only where the words live.
         OutputStageStateQ15 outStage = captureOutputStageState();
 
+        // 2.4.0 meter taps: block-local maxima in Q15, published once at the
+        // end of the block. Zero-initialized here, so a slot that is disabled
+        // (or never visited) publishes 0.0 instead of a stale block's value.
+        int32_t meterVoicePeakQ15[MAX_VOICES] = {};
+        int32_t meterOutputPeak = 0;
+
         for (int i = 0; i < length; ++i) {
             // Hito 2 M3: tick the NES frame counter before voice mixing.
             tickNesFrameCounter(apuCyclesPerSample);
@@ -4773,6 +4859,19 @@ namespace pixelroot32::audio {
                 // 0.4 into its own mapping, and the computed curves apply it
                 // once explicitly. Scaling here as well applied 0.4 twice and
                 // left the outer 60% of the table unreachable.
+
+                // 2.4.0 meter tap: `sv` IS this voice's contribution to the
+                // mix — waveform x volume x envelope x tremolo, with the
+                // block-constant mix weight (NES group weight, unipolar x2)
+                // already inside `mixGainQ15`. Taken before the summation so a
+                // meter never reports the mix, and before the group buckets
+                // the weighted curve used to sum. It can exceed the int16 rail
+                // (unipolar noise is x2), which the publisher clamps.
+                const int32_t absVoice = (sv < 0) ? -sv : sv;
+                if (absVoice > meterVoicePeakQ15[c]) {
+                    meterVoicePeakQ15[c] = absVoice;
+                }
+
                 sum += sv;
 
                 // Duty stepped + pitch envelope (shared age; integer pitch path).
@@ -4969,11 +5068,18 @@ namespace pixelroot32::audio {
 
             const int32_t absSample = (stream[i] < 0) ? -(int32_t)stream[i] : (int32_t)stream[i];
             if ((float)absSample > currentPeak) currentPeak = (float)absSample;
+            // 2.4.0: same sample, same point — the output meter is the final
+            // buffer value (post-filter, post-trim, post-bitcrush), not the
+            // pre-clamp stage output above.
+            if (absSample > meterOutputPeak) meterOutputPeak = absSample;
         }
 
         // Persist the stage the loop ended on. Every return path out of the
         // loop is the loop's own exit, so this cannot be skipped.
         restoreOutputStageState(outStage);
+
+        // One publication per block.
+        publishMeterPeaks(meterVoicePeakQ15, meterOutputPeak);
 
         // Sync per-channel float volume back from Q15 so the next block
         // (and the FPU fallback if ever invoked) sees up-to-date state.
