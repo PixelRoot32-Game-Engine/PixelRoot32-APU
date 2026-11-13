@@ -710,10 +710,12 @@ namespace pixelroot32::audio {
          * (attack/release) meter applies its own smoothing to these samples.
          *
          * Threading: the audio thread writes, any thread may read. The value
-         * is published once per block into a lock-free
-         * `std::atomic<uint16_t>` (relaxed order); a read never blocks the
-         * render path, allocates, formats or takes a lock. Before the first
-         * rendered block, and after `reset()`, every slot reads 0.0f.
+         * is published once per block into a relaxed `std::atomic<uint16_t>`;
+         * the read allocates nothing, formats nothing and takes no lock of its
+         * own. On a target whose ISA has no lock-free atomics (the ESP32-C3's
+         * rv32imc) the load and the store route through the toolchain's atomic
+         * library, once per block and per value. Before the first rendered
+         * block, and after `reset()`, every slot reads 0.0f.
          *
          * Reading several slots can straddle a block boundary: each value
          * stands alone ("how loud was the last block"), so a reader that needs
@@ -1728,12 +1730,17 @@ namespace pixelroot32::audio {
         // -- Peak meters (2.4.0) ------------------------------------------
         // Published once per rendered block by `publishMeterPeaks`, read at
         // any time from any thread. `uint16_t` holds |sample| in 0..32767
-        // (1/32767 of full scale) and an aligned 16-bit load or store is a
-        // single instruction on every target this library runs on — unlike
-        // `std::atomic<float>`, which Xtensa would have to guard with a lock.
-        static_assert(std::atomic<uint16_t>::is_always_lock_free,
-                      "peak meters must be lock-free: the audio thread "
-                      "publishes them and the UI thread reads them");
+        // (1/32767 of full scale), which is all the resolution the int16
+        // buffer they describe can carry.
+        //
+        // Relaxed `std::atomic` is the contract, not lock-freedom. On the
+        // Xtensa targets an aligned 16-bit atomic is a single load/store, but
+        // the ESP32-C3's rv32imc ISA has no lock-free atomics at any width
+        // (`is_always_lock_free` is false for 8, 16, 32 and 64 bits there), so
+        // the same code routes through the toolchain's atomic library. That is
+        // correct and bounded — nine stores per rendered block, the same
+        // mechanism the existing cross-thread flags use — and a lock-freedom
+        // assert here breaks the C3 build (2.4.1).
         std::atomic<uint16_t> voicePeakQ15_[MAX_VOICES]{};
         std::atomic<uint16_t> outputPeakQ15_{0};
 

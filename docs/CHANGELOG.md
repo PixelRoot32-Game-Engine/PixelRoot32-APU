@@ -2,6 +2,18 @@
 
 Format: [semver](https://semver.org/). Changes that alter rendered PCM or struct ABI require a major or minor bump with an explicit note.
 
+## [2.4.1] - 2026-11-13
+
+**2.4.0 does not compile for the ESP32-C3.** Its peak meters carried a
+`static_assert(std::atomic<uint16_t>::is_always_lock_free)`, and the C3's
+`rv32imc` ISA has no lock-free atomics at any width, so every firmware build
+for that board failed at `ApuCore.h`. The assertion is gone and the meters keep
+the same storage, the same ABI and the same behaviour; only the comment and the
+documentation now say what actually holds. The host and Xtensa builds were never
+affected, and the Tool Suite (which pins the tag) is unaffected on desktop.
+
+Nothing else changes: no PCM, no struct size, no API.
+
 ## [2.4.0] - 2026-11-13
 
 Peak metering for hosts that draw level meters (the Tool Suite's mixer and SFX
@@ -18,8 +30,8 @@ editor). The rendered PCM is untouched: every golden fixture stays byte-identica
   contribution. `outputPeak` measures the bytes the caller receives: after master
   volume, the shaping curve, the profile's output filter and the bitcrush, so a
   saturating mix reads exactly 1.0. Both are published once per block into
-  lock-free `std::atomic<uint16_t>`; the audio thread writes, any thread reads,
-  and nothing allocates, locks or formats in the render path. The values describe
+  relaxed `std::atomic<uint16_t>`; the audio thread writes, any thread reads,
+  and nothing allocates or formats in the render path. The values describe
   the latest block only — no hold, no decay — so a ballistic meter is the
   consumer's job. Before the first block, and after `reset()`, both read 0.0f.
 
@@ -31,8 +43,9 @@ editor). The rendered PCM is untouched: every golden fixture stays byte-identica
   from 13 368 to **13 392 B**, so the `static_assert` pin in `test_apu_core`
   moves to `<= 13392` (`docs/ABI.md` §9.4). Nine independently readable
   cross-thread values cannot fit the 8 B of slack the old pin left, and packing
-  them into one 64-bit word would stop being lock-free on the 32-bit targets this
-  library ships for.
+  them into one word would make the audio thread's single write and the UI's
+  read share a read-modify-write of the same word, so one meter could tear
+  another's value.
 
 ## [2.3.0] - 2026-11-06
 
