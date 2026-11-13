@@ -34,7 +34,7 @@ Both bodies now live in the same binary and a runtime **`SoundProfile`** selects
 ### PlatformIO (Game Engine)
 
 ```ini
-lib_deps = <git-url-or-path>/PixelRoot32-APU#v2.3.0
+lib_deps = <git-url-or-path>/PixelRoot32-APU#v2.4.0
 ```
 
 ```cpp
@@ -44,7 +44,7 @@ lib_deps = <git-url-or-path>/PixelRoot32-APU#v2.3.0
 ### CMake (Tool Suite / desktop)
 
 ```cmake
-add_subdirectory(PixelRoot32-APU)   # or FetchContent with GIT_TAG v2.3.0
+add_subdirectory(PixelRoot32-APU)   # or FetchContent with GIT_TAG v2.4.0
 target_link_libraries(my_app PRIVATE PixelRoot32::APU)
 ```
 
@@ -75,7 +75,7 @@ cd build && ctest --output-on-failure    # run ctest from build/, not the repo r
 
 On a Windows host with MSYS2 MinGW and no `nmake`, CMake picks a generator it cannot run; there the configure line is `cmake -S . -B build -G "MinGW Makefiles" --fresh -DPR32_APU_BUILD_TESTS=ON`.
 
-**Measured on 2026-11-06: 616 cases across 16 targets**, `0 Failures 0 Ignored` in every one, `100% tests passed out of 16`. These are Unity's own summary lines, taken by running each binary from `test/`:
+**Measured on 2026-11-13: 640 cases across 20 targets**, `0 Failures 0 Ignored` in every one, `100% tests passed out of 20`. These are Unity's own summary lines, taken by running each binary from `test/`:
 
 | Target | Cases | Suite |
 |---|---|---|
@@ -86,6 +86,10 @@ On a Windows host with MSYS2 MinGW and no `nmake`, CMake picks a generator it ca
 | `test_apu_mirror` | 37 | Tool Suite parity, byte-for-byte against the float golden |
 | `test_apu_output_filter` | 17 | `Nes`/`Famicom` output chains: measured response, the `Famicom` low end against `Nes`, full-scale stability, `setHpfCutoffHz` precedence, `Legacy` one-pole, Q15 product bound |
 | `test_apu_output_filter_integer` | 17 | The same source where `Legacy` has no float body (`PR32_APU_ENABLE_LEGACY_FLOAT=0`) |
+| `test_apu_voice_meters` | 6 | `voicePeak`/`outputPeak`: per-slot tap vs the summed mix, volume ordering, `reset()`/silence, out-of-range slots, per-block semantics, full-scale clamp |
+| `test_apu_voice_meters_integer` | 6 | The same source where `Legacy` has no float body (`PR32_APU_ENABLE_LEGACY_FLOAT=0`) |
+| `test_apu_voice_meters_placement` | 6 | The meter contracts a consumer relies on: `outputPeak` equals the peak of the received buffer, `voicePeak` is not the mix, the NES group weight is inside the per-voice value, `setPostMixMono` runs after the tap, extreme slots answer zero, reads do not perturb the PCM |
+| `test_apu_voice_meters_placement_integer` | 6 | The same source where `Legacy` has no float body (`PR32_APU_ENABLE_LEGACY_FLOAT=0`) |
 | `test_apu_wavetable_spectral` | 5 | The committed SAW mipmap: band limit per level, seam-free tables, the alias sweep |
 | `test_apu_famicom_saw` | 3 | Every profile renders the ideal SAW ramp, SINE stays inert, the dormant mipmap level selector still answers the band rule |
 | `test_apu_profile_level` | 4 | Crest-weighted loudness parity across profiles, and RMS never above `Legacy` |
@@ -95,9 +99,9 @@ On a Windows host with MSYS2 MinGW and no `nmake`, CMake picks a generator it ca
 | `test_apu_profile_golden` | 4 | `Nes` and `Famicom` against their canonical and wavetable goldens (FPU build, float body off) |
 | `test_apu_profile_golden_no_fpu` | 4 | The same four goldens on the no-FPU build |
 | `test_library_link` | 4 | The public surface links from the shipped artifact (no `UNIT_TEST`) |
-| **Total** | **616** | |
+| **Total** | **640** | |
 
-Four pairs of targets compile the same test source with a different core configuration, which is why the case count is larger than the number of distinct behaviours. `test_apu_mirror` and the four `*_golden*` targets compare rendered PCM against the six immutable fixtures in `test/golden/fixtures/`.
+Six pairs of targets compile the same test source with a different core configuration, which is why the case count is larger than the number of distinct behaviours. `test_apu_mirror` and the four `*_golden*` targets compare rendered PCM against the six immutable fixtures in `test/golden/fixtures/`.
 
 ## Tools
 

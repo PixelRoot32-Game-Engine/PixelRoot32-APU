@@ -37,9 +37,16 @@ using namespace pixelroot32::audio;
 // does not fit int16) and eight recursion registers. It does not fit the old
 // 48 B of slack, so the pin moves with the exact byte counts in the message
 // instead of any unrelated state being trimmed.
-static_assert(sizeof(ApuCore) <= 13376,
-              "ApuCore must stay within the 13 376 B pin (UNIT_TEST build: "
-              "13 368 B, production: 13 344 B; E2 output-filter state +80 B)");
+//
+// 2.4.0 adds the peak meters: +24 B (eight `std::atomic<uint16_t>` voice
+// values and one output value; 18 B of members, 24 B of struct extent),
+// production 13 344 -> 13 368, test build 13 368 -> 13 392. Nine independently
+// readable cross-thread values do not fit the 8 B of slack that was left, so
+// the pin moves again rather than the meters being packed lossily (docs/ABI.md
+// §9.4).
+static_assert(sizeof(ApuCore) <= 13392,
+              "ApuCore must stay within the 13 392 B pin (UNIT_TEST build: "
+              "13 392 B, production: 13 368 B; 2.4.0 peak meters +24 B)");
 
 // Required Unity setup/teardown
 void setUp(void) {

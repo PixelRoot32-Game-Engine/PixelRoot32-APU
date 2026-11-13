@@ -2,6 +2,38 @@
 
 Format: [semver](https://semver.org/). Changes that alter rendered PCM or struct ABI require a major or minor bump with an explicit note.
 
+## [2.4.0] - 2026-11-13
+
+Peak metering for hosts that draw level meters (the Tool Suite's mixer and SFX
+editor). The rendered PCM is untouched: every golden fixture stays byte-identical.
+
+### Added
+
+- **Per-voice and output peak meters.** `ApuCore::voicePeak(int slot)` and
+  `ApuCore::outputPeak()` return the peak magnitude of the most recently
+  rendered block, normalized to `[0.0, 1.0]`. `voicePeak` measures one voice's
+  own contribution — its waveform times its volume, envelope and tremolo, before
+  the summing and before `MIXER_SCALE` — so four tracks at four volumes read four
+  values; under `Nes`/`Famicom` the published group weight is part of that
+  contribution. `outputPeak` measures the bytes the caller receives: after master
+  volume, the shaping curve, the profile's output filter and the bitcrush, so a
+  saturating mix reads exactly 1.0. Both are published once per block into
+  lock-free `std::atomic<uint16_t>`; the audio thread writes, any thread reads,
+  and nothing allocates, locks or formats in the render path. The values describe
+  the latest block only — no hold, no decay — so a ballistic meter is the
+  consumer's job. Before the first block, and after `reset()`, both read 0.0f.
+
+### ABI (size)
+
+- **`sizeof(ApuCore)` grows by 24 B**: eight `std::atomic<uint16_t>` voice values
+  plus one for the output (18 B of members, 24 B of struct extent). The host
+  production build goes from 13 344 to **13 368 B** and the `UNIT_TEST` build
+  from 13 368 to **13 392 B**, so the `static_assert` pin in `test_apu_core`
+  moves to `<= 13392` (`docs/ABI.md` §9.4). Nine independently readable
+  cross-thread values cannot fit the 8 B of slack the old pin left, and packing
+  them into one 64-bit word would stop being lock-free on the 32-bit targets this
+  library ships for.
+
 ## [2.3.0] - 2026-11-06
 
 The third profile is now a faithful **Famicom**, the drum presets keep their

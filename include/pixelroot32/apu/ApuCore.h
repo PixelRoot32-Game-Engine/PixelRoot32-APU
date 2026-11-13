@@ -680,6 +680,72 @@ namespace pixelroot32::audio {
          */
         void getAndResetProfileStats(ProfileEntry* out, uint8_t& count);
 
+        // -- Peak metering (read-only queries; cross-thread) ----------------
+        /**
+         * @brief Peak amplitude of one voice's own contribution to the last
+         *        rendered block, normalized to [0.0, 1.0].
+         *
+         * The value is the largest |sample| that slot produced while the block
+         * was rendered, taken at the point the voice enters the mix: its own
+         * waveform times its volume, envelope and tremolo, BEFORE the summing,
+         * the master volume, the shaping curve, the output filter and the
+         * bitcrush. Four tracks at four different volumes therefore read four
+         * different values, whatever the sum does; with a single full-volume
+         * square the meter reads ~1.0 while `outputPeak` sits far below it.
+         *
+         * Under `Nes`/`Famicom` the published `MixerCurve::NesWeighted` group
+         * weight is part of that contribution — it is folded into the voice's
+         * per-block mix gain, so it is part of what the voice adds to the sum.
+         * Slots of the same group compare directly, slots of different groups
+         * carry their published weight; `Legacy` weights every voice equally.
+         *
+         * Normalization: `|sample| / 32767`, clamped to 1.0, so a full-scale
+         * square at full volume reads ~1.0 and a UI can map the number
+         * straight to a bar length.
+         *
+         * Block semantics: the value describes the MOST RECENT rendered block
+         * and is published once per block. There is no hold, no decay and no
+         * smoothing — a silent block publishes 0.0f, i.e. a stopped voice
+         * stops metering on the next block. A consumer that wants a ballistic
+         * (attack/release) meter applies its own smoothing to these samples.
+         *
+         * Threading: the audio thread writes, any thread may read. The value
+         * is published once per block into a lock-free
+         * `std::atomic<uint16_t>` (relaxed order); a read never blocks the
+         * render path, allocates, formats or takes a lock. Before the first
+         * rendered block, and after `reset()`, every slot reads 0.0f.
+         *
+         * Reading several slots can straddle a block boundary: each value
+         * stands alone ("how loud was the last block"), so a reader that needs
+         * one coherent snapshot of all eight accepts a one-block skew, which no
+         * level meter can show.
+         *
+         * @param slot Voice index [0, MAX_VOICES); out-of-range returns 0.0f.
+         * @return Peak in [0.0, 1.0].
+         */
+        float voicePeak(int slot) const;
+
+        /**
+         * @brief Peak amplitude of the final output over the last rendered
+         *        block, normalized to [0.0, 1.0].
+         *
+         * Measured on the samples the caller receives: after the master
+         * volume, the shaping curve (`SoftClipMode`), the profile's output
+         * filter chain / DC blocker and the master bitcrush — at the value
+         * that actually lands in the buffer, so a saturating mix reads exactly
+         * 1.0 instead of a pre-clamp overshoot. `setPostMixMono` runs after
+         * the tap: it is the consumer's hook on the finished buffer, not part
+         * of the core's output, and its own edits are not metered.
+         *
+         * Same block semantics, normalization and threading contract as
+         * `voicePeak`: one relaxed atomic store per block, no hold or decay,
+         * safe to read from any thread at any time, 0.0f before the first
+         * rendered block and after `reset()`.
+         *
+         * @return Peak in [0.0, 1.0].
+         */
+        float outputPeak() const;
+
 #if defined(UNIT_TEST)
         // -- Test diagnostics (native_test only; stripped in firmware builds) --
         /**
@@ -1237,6 +1303,24 @@ namespace pixelroot32::audio {
 #endif
 
         /**
+         * @brief Publishes one block's meter maxima for the reader side.
+         *
+         * Called exactly once per rendered block, from the end of each render
+         * body (`renderFloatLegacy` and `renderIntegerCore`) — never per
+         * sample, never from the post-mix hook. The values are raw magnitudes
+         * in int16 units; this clamps them to [0, 32767] and stores them
+         * relaxed, which is the whole cross-thread contract of `voicePeak` and
+         * `outputPeak`. No allocation, no lock, no formatting.
+         *
+         * @param voicePeaksQ15 One maximum per voice slot, |sample| in
+         *                      0..32767; anything above clamps, because the
+         *                      unipolar noise compensation and the NES group
+         *                      weights can push a voice past the int16 rail.
+         * @param outputPeakQ15 Maximum |sample| of the final output.
+         */
+        void publishMeterPeaks(const int32_t* voicePeaksQ15, int32_t outputPeakQ15);
+
+        /**
          * @brief Applies the active profile's character to one voice.
          *
          * S5: the only place a profile writes character — envelope curve, mix
@@ -1640,6 +1724,18 @@ namespace pixelroot32::audio {
         // -- Legacy diagnostics (keep for non-profiling builds) ----------
         float currentPeak = 0.0f;
         uint64_t samplesSinceLog = 0;
+
+        // -- Peak meters (2.4.0) ------------------------------------------
+        // Published once per rendered block by `publishMeterPeaks`, read at
+        // any time from any thread. `uint16_t` holds |sample| in 0..32767
+        // (1/32767 of full scale) and an aligned 16-bit load or store is a
+        // single instruction on every target this library runs on — unlike
+        // `std::atomic<float>`, which Xtensa would have to guard with a lock.
+        static_assert(std::atomic<uint16_t>::is_always_lock_free,
+                      "peak meters must be lock-free: the audio thread "
+                      "publishes them and the UI thread reads them");
+        std::atomic<uint16_t> voicePeakQ15_[MAX_VOICES]{};
+        std::atomic<uint16_t> outputPeakQ15_{0};
 
         // -- Timing -------------------------------------------------------
         uint64_t audioTimeSamples = 0;
