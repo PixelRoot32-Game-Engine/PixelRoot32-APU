@@ -2,6 +2,79 @@
 
 Format: [semver](https://semver.org/). Changes that alter rendered PCM or struct ABI require a major or minor bump with an explicit note.
 
+## [2.5.0] - 2026-11-14
+
+A percussion hit fired by the music sequencer now reaches its own track's
+meter. The rendered PCM is untouched: every golden fixture stays byte-identical
+and all 20 suites pass.
+
+### Added
+
+- **Sequencer percussion hits are credited to their track's peak.** A DrumKit
+  track's hits are percussion (`Note::Rest` + a noise preset with `duty == 0`)
+  and play on the shared SFX/percussion subpool (slots 4-7, or an idle music
+  slot when that pool is saturated) — never on the track's fixed slot. So
+  `voicePeak(track)` published silence for a drum track while the drums were
+  clearly audible in `outputPeak()`. `playSequencerPercussionHit()` now records
+  the voice the hit landed on per track, and `publishMeterPeaks()` publishes the
+  louder of the track's own voice and that voice for the block the hit fired in,
+  then clears the mapping. One peak per hit: the meter's release is the host's
+  ballistics, as for every other value.
+- The voice allocator is unchanged: percussion still lives in the
+  SFX/percussion subpool, and no melodic slot is claimed.
+
+### Changed
+
+- `sizeof(ApuCore)` grows 8 B (the 4 B mapping plus alignment): 13 368 → 13 376 B
+  production, 13 392 → 13 400 B with `UNIT_TEST`. The pin in `test_apu_core`
+  moves with it and `docs/ABI.md` §9.4 records the figures. No public struct
+  changes shape.
+
+## [2.4.1] - 2026-11-13
+
+**2.4.0 does not compile for the ESP32-C3.** Its peak meters carried a
+`static_assert(std::atomic<uint16_t>::is_always_lock_free)`, and the C3's
+`rv32imc` ISA has no lock-free atomics at any width, so every firmware build
+for that board failed at `ApuCore.h`. The assertion is gone and the meters keep
+the same storage, the same ABI and the same behaviour; only the comment and the
+documentation now say what actually holds. The host and Xtensa builds were never
+affected, and the Tool Suite (which pins the tag) is unaffected on desktop.
+
+Nothing else changes: no PCM, no struct size, no API.
+
+## [2.4.0] - 2026-11-13
+
+Peak metering for hosts that draw level meters (the Tool Suite's mixer and SFX
+editor). The rendered PCM is untouched: every golden fixture stays byte-identical.
+
+### Added
+
+- **Per-voice and output peak meters.** `ApuCore::voicePeak(int slot)` and
+  `ApuCore::outputPeak()` return the peak magnitude of the most recently
+  rendered block, normalized to `[0.0, 1.0]`. `voicePeak` measures one voice's
+  own contribution — its waveform times its volume, envelope and tremolo, before
+  the summing and before `MIXER_SCALE` — so four tracks at four volumes read four
+  values; under `Nes`/`Famicom` the published group weight is part of that
+  contribution. `outputPeak` measures the bytes the caller receives: after master
+  volume, the shaping curve, the profile's output filter and the bitcrush, so a
+  saturating mix reads exactly 1.0. Both are published once per block into
+  relaxed `std::atomic<uint16_t>`; the audio thread writes, any thread reads,
+  and nothing allocates or formats in the render path. The values describe
+  the latest block only — no hold, no decay — so a ballistic meter is the
+  consumer's job. Before the first block, and after `reset()`, both read 0.0f.
+
+### ABI (size)
+
+- **`sizeof(ApuCore)` grows by 24 B**: eight `std::atomic<uint16_t>` voice values
+  plus one for the output (18 B of members, 24 B of struct extent). The host
+  production build goes from 13 344 to **13 368 B** and the `UNIT_TEST` build
+  from 13 368 to **13 392 B**, so the `static_assert` pin in `test_apu_core`
+  moves to `<= 13392` (`docs/ABI.md` §9.4). Nine independently readable
+  cross-thread values cannot fit the 8 B of slack the old pin left, and packing
+  them into one word would make the audio thread's single write and the UI's
+  read share a read-modify-write of the same word, so one meter could tear
+  another's value.
+
 ## [2.3.0] - 2026-11-06
 
 The third profile is now a faithful **Famicom**, the drum presets keep their

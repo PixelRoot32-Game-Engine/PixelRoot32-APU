@@ -37,9 +37,23 @@ using namespace pixelroot32::audio;
 // does not fit int16) and eight recursion registers. It does not fit the old
 // 48 B of slack, so the pin moves with the exact byte counts in the message
 // instead of any unrelated state being trimmed.
-static_assert(sizeof(ApuCore) <= 13376,
-              "ApuCore must stay within the 13 376 B pin (UNIT_TEST build: "
-              "13 368 B, production: 13 344 B; E2 output-filter state +80 B)");
+//
+// 2.4.0 adds the peak meters: +24 B (eight `std::atomic<uint16_t>` voice
+// values and one output value; 18 B of members, 24 B of struct extent),
+// production 13 344 -> 13 368, test build 13 368 -> 13 392. Nine independently
+// readable cross-thread values do not fit the 8 B of slack that was left, so
+// the pin moves again rather than the meters being packed lossily (docs/ABI.md
+// §9.4).
+// 2.5.0 adds the per-track percussion meter mapping: `int8_t[4]`, one slot
+// per music track (-1 for none). The member is 4 B, the struct extent grows
+// 8 B (alignment), production 13 368 -> 13 376, test build 13 392 -> 13 400.
+// It credits a sequencer percussion hit to the track that fired it, because the
+// hit plays on the shared SFX/percussion subpool and the track's own meter
+// would otherwise read silence (docs/ABI.md §9.4).
+static_assert(sizeof(ApuCore) <= 13400,
+              "ApuCore must stay within the 13 400 B pin (UNIT_TEST build: "
+              "13 400 B, production: 13 376 B; 2.5.0 track percussion meter "
+              "+8 B)");
 
 // Required Unity setup/teardown
 void setUp(void) {
@@ -1120,8 +1134,76 @@ void test_apu_core_percussion_never_steals_live_melodic_voice(void) {
     TEST_ASSERT_TRUE(apu.isVoiceEnabledForTesting(1));
 }
 
-void test_apu_core_sequencer_tempo_factor_short_notes_keeps_playing(void) {
+// A DrumKit track's meter must follow its percussion hits. A hit plays on the
+// shared SFX/percussion subpool (slots 4-7, or an idle music slot when that
+// pool is full), never on the track's own fixed slot, so without per-track
+// attribution the track publishes 0 while the drums are audible in the mix
+// (2.5.0: the Tool Suite's mixer showed an empty Drums meter).
+void test_apu_core_percussion_hit_publishes_on_the_track_meter(void) {
     ApuCore apu;
+    apu.init(44100);
+
+    static const MusicNote kDrumHit[] = {makeNote(INSTR_KICK, Note::Rest, 1.0f)};
+    static const MusicTrack kDrumTrack{kDrumHit, 1, false, WaveType::NOISE, 0.5f};
+    static const MusicNote kSilent[] = {{Note::Rest, 4, 16.0f, 0.0f, nullptr}};
+    static const MusicTrack kSilentTrack{kSilent, 1, false, WaveType::PULSE, 0.5f};
+
+    AudioCommand play{};
+    play.type = AudioCommandType::MUSIC_PLAY;
+    play.track = &kSilentTrack;      // trackIdx 0
+    play.subTrackCount = 3;
+    play.subTracks[0] = &kSilentTrack;  // trackIdx 1
+    play.subTracks[1] = &kSilentTrack;  // trackIdx 2
+    play.subTracks[2] = &kDrumTrack;    // trackIdx 3 -> music slot 3
+    apu.submitCommand(play);
+
+    int16_t buffer[512];
+    apu.generateSamples(buffer, 256);
+
+    // The hit is audible in the mix...
+    TEST_ASSERT_TRUE(apu.outputPeak() > 0.01f);
+    // ...and credited to its own track's meter even though it is not that
+    // track's voice...
+    TEST_ASSERT_GREATER_THAN_FLOAT(0.01f,
+                                   apu.voicePeak(ApuCore::MUSIC_VOICE_BASE + 3));
+    // ...while it stays percussion, not a melodic gate on the track's slot.
+    TEST_ASSERT_FALSE(apu.isMusicTrackVoiceActiveForTesting(3));
+    // The other three tracks heard nothing and must not borrow the hit.
+    for (int track = 0; track < 3; ++track) {
+        TEST_ASSERT_EQUAL_FLOAT(0.0f,
+                                apu.voicePeak(ApuCore::MUSIC_VOICE_BASE + track));
+    }
+}
+
+// The credit is one block long: the hit publishes as one peak and the meter's
+// own ballistics own the release, so a stale mapping cannot hold a track at a
+// level that is no longer playing.
+void test_apu_core_percussion_meter_credit_lasts_one_block(void) {
+    ApuCore apu;
+    apu.init(44100);
+
+    static const MusicNote kDrumHit[] = {makeNote(INSTR_KICK, Note::Rest, 1.0f)};
+    static const MusicTrack kDrumTrack{kDrumHit, 1, false, WaveType::NOISE, 0.5f};
+    static const MusicNote kSilent[] = {{Note::Rest, 4, 16.0f, 0.0f, nullptr}};
+    static const MusicTrack kSilentTrack{kSilent, 1, false, WaveType::PULSE, 0.5f};
+
+    AudioCommand play{};
+    play.type = AudioCommandType::MUSIC_PLAY;
+    play.track = &kSilentTrack;
+    play.subTrackCount = 1;
+    play.subTracks[0] = &kDrumTrack;  // trackIdx 1 -> music slot 1
+    apu.submitCommand(play);
+
+    int16_t buffer[512];
+    apu.generateSamples(buffer, 256);
+    TEST_ASSERT_GREATER_THAN_FLOAT(0.01f,
+                                   apu.voicePeak(ApuCore::MUSIC_VOICE_BASE + 1));
+
+    apu.generateSamples(buffer, 256);
+    TEST_ASSERT_EQUAL_FLOAT(0.0f, apu.voicePeak(ApuCore::MUSIC_VOICE_BASE + 1));
+}
+
+void test_apu_core_sequencer_tempo_factor_short_notes_keeps_playing(void) {    ApuCore apu;
     apu.init(44100);
 
     // Space-invaders-style SI_HR: 0.25-beat notes (1 tick at tempoFactor 1.0).
@@ -8138,6 +8220,8 @@ int main(int argc, char** argv) {
     RUN_TEST(test_apu_core_sequencer_percussion_shares_sfx_pool_with_play_event);
     RUN_TEST(test_apu_core_percussion_borrows_idle_music_slot);
     RUN_TEST(test_apu_core_percussion_never_steals_live_melodic_voice);
+    RUN_TEST(test_apu_core_percussion_hit_publishes_on_the_track_meter);
+    RUN_TEST(test_apu_core_percussion_meter_credit_lasts_one_block);
     RUN_TEST(test_apu_core_sequencer_tempo_factor_short_notes_keeps_playing);
     RUN_TEST(test_apu_core_melodic_noise_on_track_three_uses_music_slot);
     RUN_TEST(test_apu_core_melodic_tail_overlaps_next_beat);
