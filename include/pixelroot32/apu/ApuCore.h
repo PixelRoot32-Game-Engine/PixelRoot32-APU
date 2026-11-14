@@ -1250,7 +1250,21 @@ namespace pixelroot32::audio {
         /** Rebuild a track's note index / next-tick state for an absolute target tick. */
         void resyncTrackSequencerToTick(size_t track_index, uint64_t target_tick);
         void executePlayEvent(const AudioEvent& event, uint64_t gate_samples = 0);
-        void playSequencerPercussionHit(const AudioEvent& event);
+        /**
+         * @brief Plays one sequencer percussion hit and remembers its voice.
+         *
+         * A percussion hit is not a melodic note: it plays on the shared
+         * SFX/percussion subpool (slots 4-7, or an idle music slot when that
+         * pool is saturated), never on the track's own fixed slot. The voice it
+         * landed on is recorded per track so `publishMeterPeaks` can credit the
+         * hit to that track's meter: without it a DrumKit track reads silent in
+         * every per-track meter while it is clearly audible in the mix
+         * (2.5.0).
+         *
+         * @param track_index Sequencer track that fired the hit.
+         * @param event      Drum event (NOISE, percussion preset).
+         */
+        void playSequencerPercussionHit(size_t track_index, const AudioEvent& event);
         void initVoiceFromEvent(Voice* voice, const AudioEvent& event, uint64_t gate_samples,
                                 bool music_sequencer_legato = false);
         void beginReleaseOnMusicTrack(size_t track_index);
@@ -1775,6 +1789,19 @@ namespace pixelroot32::audio {
 
         /** True while a track's melodic gate is active (for scoped Rest note-off). */
         bool track_voice_active_[MAX_MUSIC_TRACKS] = {};
+
+        /**
+         * Voice slot that carried each music track's most recent sequencer
+         * percussion hit in the block being published, or -1 for none.
+         *
+         * A drum hit plays on the shared SFX/percussion subpool, so the track's
+         * fixed slot renders nothing and its meter would read silence. The
+         * mapping is written on note-on, merged into that track's published
+         * peak at the end of the same block, and cleared there: the hit shows
+         * as one peak and the UI's ballistics own the release (2.5.0).
+         * `clearMusicTrackVoiceState()` resets every entry to -1.
+         */
+        int8_t percussion_voice_for_track_[MAX_MUSIC_TRACKS];
 
         // -- Post-mix hook -------------------------------------------------
         void (*postMixMono_)(int16_t* mono, int length, void* user) = nullptr;

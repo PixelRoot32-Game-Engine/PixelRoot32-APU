@@ -2937,6 +2937,9 @@ namespace pixelroot32::audio {
     void ApuCore::clearMusicTrackVoiceState() {
         for (size_t i = 0; i < MAX_MUSIC_TRACKS; ++i) {
             track_voice_active_[i] = false;
+            // -1, not 0: "no percussion voice" must never alias slot 0, or a
+            // DrumKit track would publish another track's level as its own.
+            percussion_voice_for_track_[i] = -1;
         }
     }
 
@@ -3378,7 +3381,7 @@ namespace pixelroot32::audio {
                         event.sweepDurationSec = note.preset->pitchSweepDurationSec;
                     }
                     if (isPercussionHit) {
-                        playSequencerPercussionHit(event);
+                        playSequencerPercussionHit(trackIdx, event);
                     } else {
                         Voice* voice = musicVoiceForTrack(trackIdx);
                         if (voice != nullptr) {
@@ -3934,10 +3937,23 @@ namespace pixelroot32::audio {
 #endif
     }
 
-    void ApuCore::playSequencerPercussionHit(const AudioEvent& event) {
+    void ApuCore::playSequencerPercussionHit(size_t track_index,
+                                             const AudioEvent& event) {
         Voice* ch = findVoiceForPercussionHit();
         if (ch == nullptr) {
             return;
+        }
+        // Remember where the hit landed so this block's meter can credit it to
+        // the track that fired it: the hit never uses the track's own slot, so
+        // without this the per-track meter reads silence for a DrumKit track
+        // (2.5.0). `findVoiceForPercussionHit` may return an SFX slot or a
+        // borrowed idle music slot; both are handled by the slot index.
+        if (track_index < MAX_MUSIC_TRACKS) {
+            const ptrdiff_t slot = ch - voices;
+            percussion_voice_for_track_[track_index] =
+                (slot >= 0 && slot < MAX_VOICES)
+                    ? static_cast<int8_t>(slot)
+                    : static_cast<int8_t>(-1);
         }
         initVoiceFromEvent(ch, event, 0);
     }
@@ -4454,13 +4470,35 @@ namespace pixelroot32::audio {
     // ------------------------------------------------------------------
     void ApuCore::publishMeterPeaks(const int32_t* voicePeaksQ15,
                                     int32_t outputPeakQ15) {
+        // A sequencer percussion hit plays on the SFX/percussion subpool, not on
+        // the track's fixed slot, so the track's own peak would read silence
+        // while the drum is clearly audible in the mix (2.5.0). Credit the hit
+        // to the track that fired it: for this block only, the track's published
+        // peak is the louder of its own voice and the voice the hit landed on.
+        // The mapping is cleared below, so the spike is published once and the
+        // UI's ballistics own the release.
+        int32_t peaks[MAX_VOICES];
+        for (int slot = 0; slot < MAX_VOICES; ++slot) {
+            peaks[slot] = voicePeaksQ15[slot];
+        }
+        for (size_t track = 0; track < MAX_MUSIC_TRACKS; ++track) {
+            const int hit_slot = percussion_voice_for_track_[track];
+            if (hit_slot >= 0 && hit_slot < MAX_VOICES) {
+                const int track_slot = MUSIC_VOICE_BASE + static_cast<int>(track);
+                if (peaks[hit_slot] > peaks[track_slot]) {
+                    peaks[track_slot] = peaks[hit_slot];
+                }
+            }
+            percussion_voice_for_track_[track] = -1;
+        }
+
         // One relaxed store per value, once per block. Relaxed is enough
         // because each value stands alone: a reader wants "how loud was the
         // last block", not a snapshot that agrees with the other eight. The
-        // alternative — a seq_cst fence around the block — would put a barrier
+        // alternative - a seq_cst fence around the block - would put a barrier
         // in the render loop to buy a guarantee nothing here needs.
         for (int slot = 0; slot < MAX_VOICES; ++slot) {
-            int32_t peak = voicePeaksQ15[slot];
+            int32_t peak = peaks[slot];
             if (peak < 0) peak = 0;            // defensive: magnitudes only
             if (peak > 32767) peak = 32767;    // full scale is the ceiling
             voicePeakQ15_[slot].store((uint16_t)peak, std::memory_order_relaxed);

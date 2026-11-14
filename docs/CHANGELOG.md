@@ -2,6 +2,34 @@
 
 Format: [semver](https://semver.org/). Changes that alter rendered PCM or struct ABI require a major or minor bump with an explicit note.
 
+## [2.5.0] - 2026-11-14
+
+A percussion hit fired by the music sequencer now reaches its own track's
+meter. The rendered PCM is untouched: every golden fixture stays byte-identical
+and all 20 suites pass.
+
+### Added
+
+- **Sequencer percussion hits are credited to their track's peak.** A DrumKit
+  track's hits are percussion (`Note::Rest` + a noise preset with `duty == 0`)
+  and play on the shared SFX/percussion subpool (slots 4-7, or an idle music
+  slot when that pool is saturated) — never on the track's fixed slot. So
+  `voicePeak(track)` published silence for a drum track while the drums were
+  clearly audible in `outputPeak()`. `playSequencerPercussionHit()` now records
+  the voice the hit landed on per track, and `publishMeterPeaks()` publishes the
+  louder of the track's own voice and that voice for the block the hit fired in,
+  then clears the mapping. One peak per hit: the meter's release is the host's
+  ballistics, as for every other value.
+- The voice allocator is unchanged: percussion still lives in the
+  SFX/percussion subpool, and no melodic slot is claimed.
+
+### Changed
+
+- `sizeof(ApuCore)` grows 8 B (the 4 B mapping plus alignment): 13 368 → 13 376 B
+  production, 13 392 → 13 400 B with `UNIT_TEST`. The pin in `test_apu_core`
+  moves with it and `docs/ABI.md` §9.4 records the figures. No public struct
+  changes shape.
+
 ## [2.4.1] - 2026-11-13
 
 **2.4.0 does not compile for the ESP32-C3.** Its peak meters carried a
